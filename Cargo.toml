@@ -1,0 +1,15 @@
+[package]
+name = "wgpu_try"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winit = "0.29"
+wgpu = "0.19"
+pollster = "0.3"
+self_cell = "1.0"
+bytemuck = { version = "1.14", features = ["derive"] }
+glam = "0.27"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rand = "0.8"
+noise = "0.8"
