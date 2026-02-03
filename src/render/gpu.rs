@@ -15,9 +15,10 @@ struct SceneUniform {
     use_texture: u32,
     tiles_x: u32,
     debug_faces: u32,
-    _pad0: u32,
+    debug_chunks: u32,
     tile_uv_size: [f32; 2],
-    _pad1: [f32; 2],
+    chunk_size: f32,
+    _pad0: f32,
 }
 
 struct ChunkGpuMesh {
@@ -26,6 +27,8 @@ struct ChunkGpuMesh {
     index_count: u32,
     center: Vec3,
     radius: f32,
+    line_buffer: wgpu::Buffer,
+    line_count: u32,
 }
 
 #[allow(dead_code)]
@@ -35,6 +38,7 @@ struct GpuInner<'a> {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     render_pipeline: wgpu::RenderPipeline,
+    line_pipeline: wgpu::RenderPipeline,
     depth_view: wgpu::TextureView,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -105,9 +109,10 @@ impl Gpu {
                 use_texture: style.use_texture as u32,
                 tiles_x,
                 debug_faces: 0,
-                _pad0: 0,
+                debug_chunks: 0,
                 tile_uv_size,
-                _pad1: [0.0; 2],
+                chunk_size: crate::world::CHUNK_SIZE as f32,
+                _pad0: 0.0,
             };
 
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -212,12 +217,59 @@ impl Gpu {
                 multiview: None,
             });
 
+            let line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("line_shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/lines.wgsl").into()),
+            });
+
+            let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("line_pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &line_shader,
+                    entry_point: "vs_main",
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        }],
+                    }],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth24Plus,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &line_shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+            });
+
             GpuInner {
                 surface,
                 device,
                 queue,
                 config,
                 render_pipeline,
+                line_pipeline,
                 depth_view,
                 uniform_buffer,
                 bind_group,
@@ -242,7 +294,7 @@ impl Gpu {
         });
     }
 
-    pub fn render(&self, camera: &Camera, debug_faces: bool) {
+    pub fn render(&self, camera: &Camera, debug_faces: bool, debug_chunks: bool, draw_radius: i32) {
         self.cell.with_dependent(|_, gpu| {
             let mvp = build_mvp(gpu.config.width, gpu.config.height, camera);
 
@@ -251,9 +303,10 @@ impl Gpu {
                 use_texture: self.style.use_texture as u32,
                 tiles_x: gpu.tiles_x,
                 debug_faces: debug_faces as u32,
-                _pad0: 0,
+                debug_chunks: 0,
                 tile_uv_size: gpu.tile_uv_size,
-                _pad1: [0.0; 2],
+                chunk_size: crate::world::CHUNK_SIZE as f32,
+                _pad0: 0.0,
             };
 
             gpu.queue
@@ -306,15 +359,29 @@ impl Gpu {
                     timestamp_writes: None,
                 });
 
-                rpass.set_pipeline(&gpu.render_pipeline);
                 rpass.set_bind_group(0, &gpu.bind_group, &[]);
+                let draw_radius = draw_radius as f32 * crate::world::CHUNK_SIZE as f32;
+                let draw_radius_sq = draw_radius * draw_radius;
+                rpass.set_pipeline(&gpu.render_pipeline);
                 for chunk in gpu.chunks.values() {
+                    let to_center = chunk.center - camera.position;
+                    if to_center.length_squared() > draw_radius_sq {
+                        continue;
+                    }
                     if !chunk_visible(camera.position, camera.forward, chunk) {
                         continue;
                     }
                     rpass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
                     rpass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     rpass.draw_indexed(0..chunk.index_count, 0, 0..1);
+                }
+
+                if debug_chunks {
+                    rpass.set_pipeline(&gpu.line_pipeline);
+                    for chunk in gpu.chunks.values() {
+                        rpass.set_vertex_buffer(0, chunk.line_buffer.slice(..));
+                        rpass.draw(0..chunk.line_count, 0..1);
+                    }
                 }
             }
 
@@ -346,6 +413,12 @@ impl Gpu {
                 contents: bytemuck::cast_slice(indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
+            let line_vertices = chunk_wireframe_vertices(coord);
+            let line_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("chunk_line_buffer"),
+                contents: bytemuck::cast_slice(&line_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
             gpu.chunks.insert(
                 coord,
                 ChunkGpuMesh {
@@ -354,6 +427,8 @@ impl Gpu {
                     index_count: indices.len() as u32,
                     center,
                     radius,
+                    line_buffer,
+                    line_count: line_vertices.len() as u32,
                 },
             );
         });
@@ -378,6 +453,37 @@ fn build_mvp(width: u32, height: u32, camera: &Camera) -> Mat4 {
     let view = camera.view_matrix();
     let model = Mat4::IDENTITY;
     proj * view * model
+}
+
+fn chunk_wireframe_vertices(coord: IVec3) -> Vec<[f32; 3]> {
+    let half = (crate::world::CHUNK_SIZE / 2) as f32;
+    let min = Vec3::new(
+        coord.x as f32 * crate::world::CHUNK_SIZE as f32 - half,
+        coord.y as f32 * crate::world::CHUNK_SIZE as f32 - half,
+        coord.z as f32 * crate::world::CHUNK_SIZE as f32 - half,
+    );
+    let max = Vec3::new(
+        min.x + crate::world::CHUNK_SIZE as f32,
+        min.y + crate::world::CHUNK_SIZE as f32,
+        min.z + crate::world::CHUNK_SIZE as f32,
+    );
+
+    let p000 = [min.x, min.y, min.z];
+    let p001 = [min.x, min.y, max.z];
+    let p010 = [min.x, max.y, min.z];
+    let p011 = [min.x, max.y, max.z];
+    let p100 = [max.x, min.y, min.z];
+    let p101 = [max.x, min.y, max.z];
+    let p110 = [max.x, max.y, min.z];
+    let p111 = [max.x, max.y, max.z];
+
+    vec![
+        p000, p001, p000, p010, p000, p100,
+        p111, p110, p111, p101, p111, p011,
+        p001, p011, p001, p101,
+        p010, p011, p010, p110,
+        p100, p101, p100, p110,
+    ]
 }
 
 fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
@@ -521,10 +627,7 @@ fn create_dummy_texture(
 fn chunk_visible(camera_pos: Vec3, camera_forward: Vec3, chunk: &ChunkGpuMesh) -> bool {
     let to_center = chunk.center - camera_pos;
     let dist_sq = to_center.length_squared();
-    let height_chunks = (camera_pos.y / crate::world::CHUNK_SIZE as f32).max(0.0).floor();
-    let extra_radius = height_chunks * 2.0 * crate::world::CHUNK_SIZE as f32;
-    let radius = chunk.radius + extra_radius;
-    if dist_sq <= radius * radius {
+    if dist_sq <= chunk.radius * chunk.radius {
         return true;
     }
     let dist = dist_sq.sqrt();
@@ -534,9 +637,8 @@ fn chunk_visible(camera_pos: Vec3, camera_forward: Vec3, chunk: &ChunkGpuMesh) -
     if dot <= 0.0 {
         return false;
     }
-    let base_fov = 45.0_f32.to_radians();
-    let expanded_fov = base_fov + 2.0_f32.to_radians();
-    let half_fov = expanded_fov * 0.5;
-    let margin = (radius / dist).asin();
+    let base_fov = 60.0_f32.to_radians();
+    let half_fov = base_fov * 0.5;
+    let margin = (chunk.radius / dist).asin();
     dot >= (half_fov + margin).cos()
 }

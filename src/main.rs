@@ -1,6 +1,6 @@
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use glam::Vec3;
@@ -27,76 +27,10 @@ use world::worldgen::WorldGen;
 use world::mesher::{generate_chunk_mesh, MeshData};
 
 enum WorkerMsg {
-    Reset(u64),
     Request {
         coord: IVec3,
         step: i32,
-        priority: i32,
-        epoch: u64,
     },
-}
-
-#[derive(Eq, PartialEq)]
-struct Job {
-    priority: i32,
-    step: i32,
-    coord: IVec3,
-    order: u64,
-    epoch: u64,
-}
-
-impl Job {
-    fn new(priority: i32, step: i32, coord: IVec3, order: u64, epoch: u64) -> Self {
-        Self {
-            priority,
-            step,
-            coord,
-            order,
-            epoch,
-        }
-    }
-}
-
-impl Ord for Job {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .priority
-            .cmp(&self.priority)
-            .then_with(|| other.step.cmp(&self.step))
-            .then_with(|| other.order.cmp(&self.order))
-    }
-}
-
-impl PartialOrd for Job {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-fn handle_worker_msg(
-    msg: WorkerMsg,
-    heap: &mut BinaryHeap<Job>,
-    order: &mut u64,
-    epoch: &mut u64,
-) {
-    match msg {
-        WorkerMsg::Reset(new_epoch) => {
-            *epoch = new_epoch;
-            heap.clear();
-        }
-        WorkerMsg::Request {
-            coord,
-            step,
-            priority,
-            epoch: msg_epoch,
-        } => {
-            if msg_epoch != *epoch {
-                return;
-            }
-            heap.push(Job::new(priority, step, coord, *order, msg_epoch));
-            *order = order.wrapping_add(1);
-        }
-    }
 }
 
 fn main() {
@@ -145,7 +79,13 @@ fn main() {
     let blocks = vec![stone, dirt, grass];
 
     let seed: u32 = rand::random();
-    let world_gen = WorldGen::new(seed).with_height(0, 12.0, 0.04);
+    let world_gen = WorldGen::new(seed)
+        .with_height(0, 12.0, 0.04)
+        .with_mountains(36.0, 0.015)
+        .with_caves(0.08, 0.6)
+        .with_cave_open(0.04, 0.7)
+        .with_cave_depth(4, 64)
+        .with_cave_open_depth(3);
     eprintln!(
         "World seed: {}, world_id: {}",
         world_gen.seed, world_gen.world_id
@@ -160,6 +100,12 @@ fn main() {
     let mut next_tick = Instant::now() + delay;
     let mut last_update = Instant::now();
     let mut last_title_update = Instant::now();
+    let mut fps_frames: u32 = 0;
+    let mut fps_last = Instant::now();
+    let mut fps_value: u32 = 0;
+    let mut tps_ticks: u32 = 0;
+    let mut tps_last = Instant::now();
+    let mut tps_value: u32 = 0;
 
     let spawn_height = world_gen.height_at(0, 0) + 2;
     let mut player_pos = Vec3::new(0.0, spawn_height as f32, 0.0);
@@ -187,8 +133,11 @@ fn main() {
     let mouse_sensitivity = 0.0015f32;
     let mut mouse_enabled = false;
     let mut debug_faces = false;
+    let mut debug_chunks = false;
     let mut pause_stream = false;
     let mut pause_render = false;
+    let mut debug_ui = false;
+    let mut debug_dump = false;
     let mut fly_mode = false;
     let mut force_reload = false;
 
@@ -201,47 +150,47 @@ fn main() {
     let (tx_res, rx_res) = mpsc::channel::<MeshData>();
     let blocks_gen = blocks.clone();
     let gen_thread = world_gen.clone();
-    thread::spawn(move || {
-        let mut heap: BinaryHeap<Job> = BinaryHeap::new();
-        let mut order: u64 = 0;
-        let mut epoch: u64 = 0;
-        loop {
-            if heap.is_empty() {
-                match rx_req.recv() {
-                    Ok(msg) => {
-                        handle_worker_msg(msg, &mut heap, &mut order, &mut epoch);
-                    }
+    let rx_req = Arc::new(Mutex::new(rx_req));
+    let worker_count = 8;
+    for _ in 0..worker_count {
+        let rx_req = Arc::clone(&rx_req);
+        let tx_res = tx_res.clone();
+        let blocks_gen = blocks_gen.clone();
+        let gen_thread = gen_thread.clone();
+        thread::spawn(move || {
+            loop {
+                let msg = {
+                    let lock = rx_req.lock().unwrap();
+                    lock.recv()
+                };
+                let msg = match msg {
+                    Ok(msg) => msg,
                     Err(_) => break,
                 };
-            }
-
-            while let Ok(msg) = rx_req.try_recv() {
-                handle_worker_msg(msg, &mut heap, &mut order, &mut epoch);
-            }
-
-            if let Some(job) = heap.pop() {
-                if job.epoch != epoch {
-                    continue;
+                match msg {
+                    WorkerMsg::Request { coord, step } => {
+                        let mesh = generate_chunk_mesh(coord, &blocks_gen, &gen_thread, step);
+                        let _ = tx_res.send(mesh);
+                    }
                 }
-                let mesh = generate_chunk_mesh(job.coord, &blocks_gen, &gen_thread, job.step);
-                let _ = tx_res.send(mesh);
             }
-        }
-    });
+        });
+    }
 
     let base_render_radius = 256;
     let max_render_radius = 256;
-    let request_budget = 64;
+    let base_draw_radius = 128;
+    let request_budget = 96;
     let max_inflight = 2048usize;
-    let y_range_up = 32;
-    let y_range_down = 16;
+    let y_range_up = 128;
+    let y_range_down = 64;
+    let surface_depth_chunks = 8;
     let initial_burst_radius = 4;
     let mut current_chunk = chunk_coord_from_pos(player_pos);
     let mut loaded: HashMap<(i32, i32, i32), i32> = HashMap::new();
     let mut requested: HashMap<(i32, i32, i32), i32> = HashMap::new();
     let mut ring_r: i32 = 0;
     let mut ring_i: i32 = 0;
-    let mut stream_epoch: u64 = 0;
 
     let _ = event_loop.run(move |event, elwt| match event {
         Event::AboutToWait => {
@@ -250,6 +199,7 @@ fn main() {
             let now = Instant::now();
             if now >= next_tick {
                 let dt = (now - last_update).as_secs_f32();
+                let dt = dt.min(0.05);
                 last_update = now;
 
                 let forward = camera.forward.normalize();
@@ -362,6 +312,9 @@ fn main() {
                     if pause_stream {
                         continue;
                     }
+                    let height_chunks = (player_pos.y / CHUNK_SIZE as f32).max(0.0) as i32;
+                    let render_radius = (base_render_radius + height_chunks * 2).min(max_render_radius);
+                    let draw_radius = (base_draw_radius + height_chunks).min(render_radius);
                     stream_tick(
                         &mut gpu,
                         player_pos,
@@ -380,20 +333,68 @@ fn main() {
                         initial_burst_radius,
                         max_inflight,
                         &mut force_reload,
-                        &mut stream_epoch,
+                        &world_gen,
+                        surface_depth_chunks,
+                        draw_radius,
                     );
+                    tps_ticks += 1;
+                }
+
+                fps_frames += 1;
+                if fps_last.elapsed() >= Duration::from_secs(1) {
+                    fps_value = fps_frames;
+                    fps_frames = 0;
+                    fps_last = Instant::now();
+                }
+                if tps_last.elapsed() >= Duration::from_secs(1) {
+                    tps_value = tps_ticks;
+                    tps_ticks = 0;
+                    tps_last = Instant::now();
                 }
 
                 if last_title_update.elapsed() >= Duration::from_millis(250) {
-                    let title = format!(
-                        "chunks loaded:{} requested:{} paused_stream:{} paused_render:{}",
-                        loaded.len(),
-                        requested.len(),
-                        pause_stream,
-                        pause_render
-                    );
-                    gpu.window().set_title(&title);
+                    let height_chunks = (player_pos.y / CHUNK_SIZE as f32).max(0.0) as i32;
+                    let render_radius = (base_render_radius + height_chunks * 2).min(max_render_radius);
+                    let draw_radius = (base_draw_radius + height_chunks).min(render_radius);
+                    if debug_ui {
+                        let title = format!(
+                            "loaded:{} requested:{} tps:{} fps:{} paused_stream:{} paused_render:{}",
+                            loaded.len(),
+                            requested.len(),
+                            tps_value,
+                            fps_value,
+                            pause_stream,
+                            pause_render
+                        );
+                        gpu.window().set_title(&title);
+                        eprintln!(
+                            "loaded={} requested={} tps={} fps={} chunk=({}, {}, {}) radius={} paused_stream={} paused_render={}",
+                            loaded.len(),
+                            requested.len(),
+                            tps_value,
+                            fps_value,
+                            current_chunk.x,
+                            current_chunk.y,
+                            current_chunk.z,
+                            draw_radius,
+                            pause_stream,
+                            pause_render
+                        );
+                    } else {
+                        gpu.window().set_title("wgpu_try");
+                    }
                     last_title_update = Instant::now();
+                }
+
+                if debug_dump {
+                    dump_surface_bands(
+                        &world_gen,
+                        current_chunk,
+                        &loaded,
+                        &requested,
+                        surface_depth_chunks,
+                    );
+                    debug_dump = false;
                 }
                 gpu.window().request_redraw();
                 next_tick = now + delay;
@@ -404,7 +405,10 @@ fn main() {
             ..
         } => {
             if !pause_render {
-                gpu.render(&camera, debug_faces);
+                let height_chunks = (player_pos.y / CHUNK_SIZE as f32).max(0.0) as i32;
+                let render_radius = (base_render_radius + height_chunks * 2).min(max_render_radius);
+                let draw_radius = (base_draw_radius + height_chunks).min(render_radius);
+                gpu.render(&camera, debug_faces, debug_chunks, draw_radius);
             }
         }
         Event::WindowEvent {
@@ -443,11 +447,20 @@ fn main() {
                     pause_stream = !pause_stream;
                 }
                 KeyCode::F3 if pressed => fly_mode = !fly_mode,
-                KeyCode::F4 if pressed => {
+                KeyCode::F5 if pressed => {
                     force_reload = true;
                 }
-                KeyCode::F5 if pressed => {
+                KeyCode::F9 if pressed => {
                     pause_render = !pause_render;
+                }
+                KeyCode::F6 if pressed => {
+                    debug_ui = !debug_ui;
+                }
+                KeyCode::F7 if pressed => {
+                    debug_chunks = !debug_chunks;
+                }
+                KeyCode::F8 if pressed => {
+                    debug_dump = true;
                 }
                 KeyCode::F11 if pressed => {
                     let window = gpu.window();
@@ -533,10 +546,11 @@ fn tile_index_1based(x: u32, y: u32, tiles_x: u32) -> u32 {
 }
 
 fn chunk_coord_from_pos(pos: Vec3) -> IVec3 {
+    let half = (CHUNK_SIZE / 2) as f32;
     IVec3::new(
-        (pos.x / CHUNK_SIZE as f32).floor() as i32,
-        (pos.y / CHUNK_SIZE as f32).floor() as i32,
-        (pos.z / CHUNK_SIZE as f32).floor() as i32,
+        ((pos.x + half) / CHUNK_SIZE as f32).floor() as i32,
+        ((pos.y + half) / CHUNK_SIZE as f32).floor() as i32,
+        ((pos.z + half) / CHUNK_SIZE as f32).floor() as i32,
     )
 }
 
@@ -565,11 +579,29 @@ fn distance_2d(center: IVec3, coord: (i32, i32, i32)) -> i32 {
     dx.max(dz)
 }
 
-fn distance_3d(center: IVec3, coord: (i32, i32, i32)) -> i32 {
-    let dx = (coord.0 - center.x).abs();
-    let dy = (coord.1 - center.y).abs();
-    let dz = (coord.2 - center.z).abs();
-    dx.max(dy).max(dz)
+fn max_height_in_chunk(world_gen: &WorldGen, chunk_x: i32, chunk_z: i32) -> i32 {
+    let half = CHUNK_SIZE / 2;
+    let base_x = chunk_x * CHUNK_SIZE - half;
+    let base_z = chunk_z * CHUNK_SIZE - half;
+    let mut max_h = i32::MIN;
+    let mut z = 0;
+    while z < CHUNK_SIZE {
+        let mut x = 0;
+        while x < CHUNK_SIZE {
+            let h = world_gen.height_at(base_x + x, base_z + z);
+            if h > max_h {
+                max_h = h;
+            }
+            x += 1;
+        }
+        z += 1;
+    }
+    max_h
+}
+
+fn world_y_to_chunk_y(y: i32) -> i32 {
+    let half = CHUNK_SIZE / 2;
+    ((y + half) as f32 / CHUNK_SIZE as f32).floor() as i32
 }
 
 fn dy_order(range_down: i32, range_up: i32) -> Vec<i32> {
@@ -589,13 +621,72 @@ fn dy_order(range_down: i32, range_up: i32) -> Vec<i32> {
 
 fn lod_step(dist: i32) -> i32 {
     let mut step = 1;
-    let mut threshold = 16;
+    let mut threshold = 8;
     let d = dist;
     while d >= threshold {
         step *= 2;
         threshold *= 2;
     }
     step
+}
+
+fn depth_for_dist(base_depth: i32, dist: i32) -> i32 {
+    let mut depth = base_depth;
+    let tiers = dist / 16;
+    depth -= tiers * 3;
+    depth.clamp(2, base_depth)
+}
+
+fn dump_surface_bands(
+    world_gen: &WorldGen,
+    current_chunk: IVec3,
+    loaded: &HashMap<(i32, i32, i32), i32>,
+    requested: &HashMap<(i32, i32, i32), i32>,
+    surface_depth_chunks: i32,
+) {
+    eprintln!("--- surface band dump ---");
+    eprintln!(
+        "loaded_total={} requested_total={}",
+        loaded.len(),
+        requested.len()
+    );
+    for dz in -2..=2 {
+        for dx in -2..=2 {
+            let cx = current_chunk.x + dx;
+            let cz = current_chunk.z + dz;
+            let surface_y = max_height_in_chunk(world_gen, cx, cz);
+            let surface_chunk_y = world_y_to_chunk_y(surface_y);
+            let dist_xz = distance_2d(current_chunk, (cx, surface_chunk_y, cz));
+            let depth = depth_for_dist(surface_depth_chunks, dist_xz);
+            let y_start = surface_chunk_y - depth;
+            let y_end = surface_chunk_y + 1;
+            let mut missing = Vec::new();
+            let mut loaded_count = 0;
+            let mut requested_count = 0;
+            for cy in y_start..=y_end {
+                let key = (cx, cy, cz);
+                if loaded.contains_key(&key) {
+                    loaded_count += 1;
+                } else if requested.contains_key(&key) {
+                    requested_count += 1;
+                } else {
+                    missing.push(cy);
+                }
+            }
+            eprintln!(
+                "xz=({}, {}) surface_y={} band=[{}..{}] loaded={} requested={} missing_count={}",
+                cx,
+                cz,
+                surface_y,
+                y_start,
+                y_end,
+                loaded_count,
+                requested_count,
+                missing.len()
+            );
+        }
+    }
+    eprintln!("--- end dump ---");
 }
 
 fn stream_tick(
@@ -616,16 +707,16 @@ fn stream_tick(
     initial_burst_radius: i32,
     max_inflight: usize,
     force_reload: &mut bool,
-    stream_epoch: &mut u64,
+    world_gen: &WorldGen,
+    surface_depth_chunks: i32,
+    draw_radius: i32,
 ) {
     let new_chunk = chunk_coord_from_pos(player_pos);
-    let mut reset_worker = false;
     if new_chunk != *current_chunk {
         *current_chunk = new_chunk;
         *ring_r = 0;
         *ring_i = 0;
         requested.clear();
-        reset_worker = true;
     }
 
     let dynamic_radius = ((player_pos.y / CHUNK_SIZE as f32).max(0.0) as i32) * 2;
@@ -633,7 +724,7 @@ fn stream_tick(
     let height_chunks = (player_pos.y / CHUNK_SIZE as f32).max(0.0) as i32;
     let height_factor = height_chunks / 8;
     let budget = (request_budget - height_factor * 8).max(16);
-    let dy_list = dy_order(y_range_down, y_range_up);
+    let _dy_list = dy_order(y_range_down, y_range_up);
 
     if *force_reload {
         gpu.clear_chunks();
@@ -642,45 +733,31 @@ fn stream_tick(
         *ring_r = 0;
         *ring_i = 0;
         *force_reload = false;
-        reset_worker = true;
     }
 
-    if reset_worker {
-        *stream_epoch = stream_epoch.wrapping_add(1);
-        let _ = tx_req.send(WorkerMsg::Reset(*stream_epoch));
+    while let Ok(mesh) = rx_res.try_recv() {
+        let k = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
+        gpu.upsert_chunk(mesh.coord, mesh.center, mesh.radius, &mesh.vertices, &mesh.indices);
+        loaded.insert(k, mesh.step);
+        requested.remove(&k);
     }
 
     if requested.len() >= max_inflight {
-        while let Ok(mesh) = rx_res.try_recv() {
-            let k = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
-            let dx = (k.0 - current_chunk.x).abs();
-            let dy = (k.1 - current_chunk.y).abs();
-            let dz = (k.2 - current_chunk.z).abs();
-            if dx > render_radius || dz > render_radius || dy < -y_range_down || dy > y_range_up {
-                requested.remove(&k);
-                continue;
-            }
-            gpu.upsert_chunk(mesh.coord, mesh.center, mesh.radius, &mesh.vertices, &mesh.indices);
-            loaded.insert(k, mesh.step);
-            requested.remove(&k);
-        }
         return;
     }
 
-    for dz in -initial_burst_radius..=initial_burst_radius {
-        for dx in -initial_burst_radius..=initial_burst_radius {
-            for &dy in &dy_list {
-                let coord = (
-                    current_chunk.x + dx,
-                    current_chunk.y + dy,
-                    current_chunk.z + dz,
-                );
-                let dist = distance_2d(*current_chunk, coord);
-                if dist > render_radius {
-                    continue;
-                }
+    // Safe column: 2x2 chunks around player are always requested
+    for dz in 0..=1 {
+        for dx in 0..=1 {
+            let cx = current_chunk.x + dx;
+            let cz = current_chunk.z + dz;
+            let surface_y = max_height_in_chunk(world_gen, cx, cz);
+            let surface_chunk_y = world_y_to_chunk_y(surface_y);
+            let y_start = surface_chunk_y - surface_depth_chunks;
+            let y_end = surface_chunk_y + 1;
+            for dy in y_start..=y_end {
+                let coord = (cx, dy, cz);
                 let step = 1;
-                let priority = distance_3d(*current_chunk, coord);
                 let key = coord;
                 let mut needs_request = true;
                 if let Some(&req_step) = requested.get(&key) {
@@ -692,8 +769,46 @@ fn stream_tick(
                     let _ = tx_req.send(WorkerMsg::Request {
                         coord: IVec3::new(coord.0, coord.1, coord.2),
                         step,
-                        priority,
-                        epoch: *stream_epoch,
+                    });
+                    requested.insert(key, step);
+                }
+            }
+        }
+    }
+
+    for dz in -initial_burst_radius..=initial_burst_radius {
+        for dx in -initial_burst_radius..=initial_burst_radius {
+            if requested.len() >= max_inflight {
+                return;
+            }
+            let cx = current_chunk.x + dx;
+            let cz = current_chunk.z + dz;
+            let surface_y = max_height_in_chunk(world_gen, cx, cz);
+            let surface_chunk_y = world_y_to_chunk_y(surface_y);
+            let y_start = surface_chunk_y - surface_depth_chunks;
+            let y_end = surface_chunk_y + 1;
+
+            for dy in y_start..=y_end {
+                if requested.len() >= max_inflight {
+                    return;
+                }
+                let coord = (cx, dy, cz);
+                let dist = distance_2d(*current_chunk, coord);
+                if dist > render_radius {
+                    continue;
+                }
+                let step = 1;
+                let key = coord;
+                let mut needs_request = true;
+                if let Some(&req_step) = requested.get(&key) {
+                    needs_request = req_step != step;
+                } else if let Some(&loaded_step) = loaded.get(&key) {
+                    needs_request = loaded_step != step;
+                }
+                if needs_request {
+                    let _ = tx_req.send(WorkerMsg::Request {
+                        coord: IVec3::new(coord.0, coord.1, coord.2),
+                        step,
                     });
                     requested.insert(key, step);
                 }
@@ -703,6 +818,9 @@ fn stream_tick(
 
     let mut budget = budget;
     while budget > 0 && *ring_r <= render_radius {
+        if requested.len() >= max_inflight {
+            return;
+        }
         let (dx, dz) = ring_coord(*ring_r, *ring_i);
         *ring_i += 1;
         let ring_len = ring_length(*ring_r);
@@ -710,14 +828,23 @@ fn stream_tick(
             *ring_i = 0;
             *ring_r += 1;
         }
-        for &dy in &dy_list {
+        let cx = current_chunk.x + dx;
+        let cz = current_chunk.z + dz;
+        let surface_y = max_height_in_chunk(world_gen, cx, cz);
+        let surface_chunk_y = world_y_to_chunk_y(surface_y);
+        let dist_xz = distance_2d(*current_chunk, (cx, surface_chunk_y, cz));
+        let depth = depth_for_dist(surface_depth_chunks, dist_xz);
+        let y_start = surface_chunk_y - depth;
+        let y_end = surface_chunk_y + 1;
+
+        for dy in y_start..=y_end {
             if budget <= 0 {
                 break;
             }
             let coord = (
-                current_chunk.x + dx,
-                current_chunk.y + dy,
-                current_chunk.z + dz,
+                cx,
+                dy,
+                cz,
             );
             let dist = distance_2d(*current_chunk, coord);
             if dist > render_radius {
@@ -728,7 +855,6 @@ fn stream_tick(
             } else {
                 lod_step(dist)
             };
-            let priority = distance_3d(*current_chunk, coord);
             let key = coord;
             let mut needs_request = true;
             if let Some(&req_step) = requested.get(&key) {
@@ -740,28 +866,28 @@ fn stream_tick(
                 let _ = tx_req.send(WorkerMsg::Request {
                     coord: IVec3::new(coord.0, coord.1, coord.2),
                     step,
-                    priority,
-                    epoch: *stream_epoch,
                 });
                 requested.insert(key, step);
                 budget -= 1;
                 if requested.len() >= max_inflight {
-                    break;
+                    return;
                 }
             }
         }
+
+        // surface chunk already included in y_start..=y_end
     }
 
     let to_remove: Vec<(i32, i32, i32)> = loaded
         .keys()
         .filter(|(x, y, z)| {
             let dx = x - current_chunk.x;
-            let dy = y - current_chunk.y;
+            let _dy = y - current_chunk.y;
             let dz = z - current_chunk.z;
             dx.abs() > render_radius
                 || dz.abs() > render_radius
-                || dy < -y_range_down
-                || dy > y_range_up
+                || dx.abs() > draw_radius + 8
+                || dz.abs() > draw_radius + 8
         })
         .cloned()
         .collect();
@@ -769,37 +895,6 @@ fn stream_tick(
         gpu.remove_chunk(IVec3::new(coord.0, coord.1, coord.2));
         loaded.remove(&coord);
         requested.remove(&coord);
-    }
-
-    while let Ok(mesh) = rx_res.try_recv() {
-        let k = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
-        let dx = (k.0 - current_chunk.x).abs();
-        let dy = (k.1 - current_chunk.y).abs();
-        let dz = (k.2 - current_chunk.z).abs();
-        if dx > render_radius || dz > render_radius || dy < -y_range_down || dy > y_range_up {
-            requested.remove(&k);
-            continue;
-        }
-        gpu.upsert_chunk(mesh.coord, mesh.center, mesh.radius, &mesh.vertices, &mesh.indices);
-        loaded.insert(k, mesh.step);
-        requested.remove(&k);
-
-        let dist = dx.max(dz);
-        let desired_step = if dx <= 1 && dz <= 1 {
-            1
-        } else {
-            lod_step(dist)
-        };
-        if desired_step != mesh.step {
-            let priority = dx.max(dy).max(dz);
-            let _ = tx_req.send(WorkerMsg::Request {
-                coord: mesh.coord,
-                step: desired_step,
-                priority,
-                epoch: *stream_epoch,
-            });
-            requested.insert(k, desired_step);
-        }
     }
 }
 
