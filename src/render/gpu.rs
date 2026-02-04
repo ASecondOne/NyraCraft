@@ -1,4 +1,4 @@
-use crate::camera::Camera;
+use crate::player::Camera;
 use crate::render::atlas::TextureAtlas;
 use crate::render::CubeStyle;
 use crate::render::mesh::ChunkVertex;

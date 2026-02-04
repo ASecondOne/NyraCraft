@@ -12,13 +12,14 @@ use winit::{
     window::WindowBuilder,
 };
 
-mod camera;
 mod colorthing;
+mod physics;
+mod player;
 mod render;
 mod world;
 
 use render::{CubeStyle, TextureAtlas};
-use camera::Camera;
+use player::{Camera, PlayerConfig, PlayerInput, PlayerState, update_player};
 use render::Gpu;
 use world::CHUNK_SIZE;
 use glam::IVec3;
@@ -54,11 +55,7 @@ fn main() {
     let seed: u32 = rand::random();
     let world_gen = WorldGen::new(seed)
         .with_height(0, 12.0, 0.04)
-        .with_mountains(36.0, 0.015)
-        .with_caves(0.08, 0.6)
-        .with_cave_open(0.04, 0.7)
-        .with_cave_depth(4, 64)
-        .with_cave_open_depth(3);
+        .with_mountains(36.0, 0.015);
     eprintln!(
         "World seed: {}, world_id: {}",
         world_gen.seed, world_gen.world_id
@@ -81,28 +78,38 @@ fn main() {
     let mut tps_value: u32 = 0;
 
     let spawn_height = world_gen.height_at(0, 0) + 2;
-    let mut player_pos = Vec3::new(0.0, spawn_height as f32, 0.0);
-    let mut velocity = Vec3::ZERO;
-    let mut grounded = false;
-    let player_height = 2.0f32;
-    let player_radius = 0.35f32;
-    let eye_height = 1.6f32;
+    let mut player = PlayerState {
+        position: Vec3::new(0.0, spawn_height as f32, 0.0),
+        velocity: Vec3::ZERO,
+        grounded: false,
+    };
+    let player_config = PlayerConfig {
+        height: 2.0,
+        radius: 0.35,
+        eye_height: 1.6,
+        move_speed,
+        jump_speed: 7.0,
+        gravity: -18.0,
+    };
 
     let mut camera = Camera {
-        position: player_pos + Vec3::new(0.0, eye_height, 0.0),
+        position: player.position + Vec3::new(0.0, player_config.eye_height, 0.0),
         forward: Vec3::new(0.0, 0.0, -1.0),
         up: Vec3::Y,
     };
     let forward = camera.forward.normalize();
     let mut yaw = forward.z.atan2(forward.x);
     let mut pitch = forward.y.asin();
-    let mut move_forward = false;
-    let mut move_back = false;
-    let mut move_left = false;
-    let mut move_right = false;
-    let mut jump = false;
-    let mut move_up = false;
-    let mut move_down = false;
+    let mut input = PlayerInput {
+        move_forward: false,
+        move_back: false,
+        move_left: false,
+        move_right: false,
+        move_up: false,
+        move_down: false,
+        jump: false,
+        fly_mode: false,
+    };
     let mouse_sensitivity = 0.0015f32;
     let mut mouse_enabled = false;
     let mut debug_faces = false;
@@ -159,7 +166,7 @@ fn main() {
     let max_inflight = 2048usize;
     let surface_depth_chunks = 8;
     let initial_burst_radius = 4;
-    let mut current_chunk = chunk_coord_from_pos(player_pos);
+    let mut current_chunk = chunk_coord_from_pos(player.position);
     let mut loaded: HashMap<(i32, i32, i32), i32> = HashMap::new();
     let mut requested: HashMap<(i32, i32, i32), i32> = HashMap::new();
     let mut ring_r: i32 = 0;
@@ -175,109 +182,16 @@ fn main() {
                 let dt = dt.min(0.05);
                 last_update = now;
 
-                let forward = camera.forward.normalize();
-                let forward_flat = Vec3::new(forward.x, 0.0, forward.z);
-                let forward_flat = if forward_flat.length_squared() > 0.0 {
-                    forward_flat.normalize()
-                } else {
-                    Vec3::new(0.0, 0.0, -1.0)
-                };
-                let right = forward_flat.cross(camera.up).normalize();
-
-                let speed = move_speed;
-                let mut move_dir = Vec3::ZERO;
-                if move_forward {
-                    move_dir += forward_flat;
-                }
-                if move_back {
-                    move_dir -= forward_flat;
-                }
-                if move_right {
-                    move_dir += right;
-                }
-                if move_left {
-                    move_dir -= right;
-                }
-                if fly_mode {
-                    if move_up {
-                        move_dir += camera.up;
-                    }
-                    if move_down {
-                        move_dir -= camera.up;
-                    }
-                }
-
-                let move_dir = if move_dir.length_squared() > 0.0 {
-                    move_dir.normalize()
-                } else {
-                    Vec3::ZERO
-                };
-
-                velocity.x = move_dir.x * speed;
-                velocity.z = move_dir.z * speed;
-
-                if fly_mode {
-                    velocity.y = move_dir.y * speed;
-                    grounded = false;
-                    jump = false;
-                } else {
-                    if jump && grounded {
-                        velocity.y = 7.0;
-                        grounded = false;
-                    }
-                    jump = false;
-                    velocity.y += -18.0 * dt;
-                }
-
-                let mut new_pos = player_pos;
-                // X axis
-                new_pos.x += velocity.x * dt;
-                if collides(new_pos, player_height, player_radius, &is_solid) {
-                    if velocity.x > 0.0 {
-                        let max_x = new_pos.x + player_radius;
-                        let block_x = max_x.floor() as i32;
-                        new_pos.x = block_x as f32 - player_radius - 0.001;
-                    } else if velocity.x < 0.0 {
-                        let min_x = new_pos.x - player_radius;
-                        let block_x = min_x.floor() as i32;
-                        new_pos.x = block_x as f32 + 1.0 + player_radius + 0.001;
-                    }
-                    velocity.x = 0.0;
-                }
-                // Z axis
-                new_pos.z += velocity.z * dt;
-                if collides(new_pos, player_height, player_radius, &is_solid) {
-                    if velocity.z > 0.0 {
-                        let max_z = new_pos.z + player_radius;
-                        let block_z = max_z.floor() as i32;
-                        new_pos.z = block_z as f32 - player_radius - 0.001;
-                    } else if velocity.z < 0.0 {
-                        let min_z = new_pos.z - player_radius;
-                        let block_z = min_z.floor() as i32;
-                        new_pos.z = block_z as f32 + 1.0 + player_radius + 0.001;
-                    }
-                    velocity.z = 0.0;
-                }
-                // Y axis
-                new_pos.y += velocity.y * dt;
-                if collides(new_pos, player_height, player_radius, &is_solid) {
-                    if velocity.y < 0.0 {
-                        let min_y = new_pos.y;
-                        let block_y = min_y.floor() as i32;
-                        new_pos.y = block_y as f32 + 1.0 + 0.001;
-                        grounded = true;
-                    } else if velocity.y > 0.0 {
-                        let max_y = new_pos.y + player_height;
-                        let block_y = max_y.floor() as i32;
-                        new_pos.y = block_y as f32 - player_height - 0.001;
-                    }
-                    velocity.y = 0.0;
-                } else {
-                    grounded = false;
-                }
-
-                player_pos = new_pos;
-                camera.position = player_pos + Vec3::new(0.0, eye_height, 0.0);
+                input.fly_mode = fly_mode;
+                camera.position = update_player(
+                    &mut player,
+                    &mut input,
+                    camera.forward,
+                    camera.up,
+                    dt,
+                    &player_config,
+                    &is_solid,
+                );
 
                 tick_accum = tick_accum.saturating_add(Duration::from_secs_f32(dt));
                 while tick_accum >= tick_dt {
@@ -285,12 +199,12 @@ fn main() {
                     if pause_stream {
                         continue;
                     }
-                    let height_chunks = (player_pos.y / CHUNK_SIZE as f32).max(0.0) as i32;
+                    let height_chunks = (player.position.y / CHUNK_SIZE as f32).max(0.0) as i32;
                     let render_radius = (base_render_radius + height_chunks * 2).min(max_render_radius);
                     let draw_radius = (base_draw_radius + height_chunks).min(render_radius);
                     stream_tick(
                         &mut gpu,
-                        player_pos,
+                        player.position,
                         &mut current_chunk,
                         &mut ring_r,
                         &mut ring_i,
@@ -327,7 +241,7 @@ fn main() {
                 }
 
                 if last_title_update.elapsed() >= Duration::from_millis(250) {
-                    let height_chunks = (player_pos.y / CHUNK_SIZE as f32).max(0.0) as i32;
+                    let height_chunks = (player.position.y / CHUNK_SIZE as f32).max(0.0) as i32;
                     let render_radius = (base_render_radius + height_chunks * 2).min(max_render_radius);
                     let draw_radius = (base_draw_radius + height_chunks).min(render_radius);
                     if debug_ui {
@@ -379,7 +293,7 @@ fn main() {
             ..
         } => {
             if !pause_render {
-                let height_chunks = (player_pos.y / CHUNK_SIZE as f32).max(0.0) as i32;
+                let height_chunks = (player.position.y / CHUNK_SIZE as f32).max(0.0) as i32;
                 let render_radius = (base_render_radius + height_chunks * 2).min(max_render_radius);
                 let draw_radius = (base_draw_radius + height_chunks).min(render_radius);
                 gpu.render(&camera, debug_faces, debug_chunks, draw_radius);
@@ -400,20 +314,20 @@ fn main() {
         } => {
             let pressed = matches!(state, ElementState::Pressed);
             match key {
-                KeyCode::KeyW => move_forward = pressed,
-                KeyCode::KeyS => move_back = pressed,
-                KeyCode::KeyA => move_left = pressed,
-                KeyCode::KeyD => move_right = pressed,
+                KeyCode::KeyW => input.move_forward = pressed,
+                KeyCode::KeyS => input.move_back = pressed,
+                KeyCode::KeyA => input.move_left = pressed,
+                KeyCode::KeyD => input.move_right = pressed,
                 KeyCode::Space => {
                     if fly_mode {
-                        move_up = pressed;
+                        input.move_up = pressed;
                     } else if pressed {
-                        jump = true;
+                        input.jump = true;
                     }
                 }
                 KeyCode::ShiftLeft | KeyCode::ShiftRight => {
                     if fly_mode {
-                        move_down = pressed;
+                        input.move_down = pressed;
                     }
                 }
                 KeyCode::F1 if pressed => debug_faces = !debug_faces,
@@ -871,30 +785,4 @@ fn stream_tick(
     }
 
     // no super chunks
-}
-
-fn collides<F>(pos: Vec3, height: f32, radius: f32, is_solid: &F) -> bool
-where
-    F: Fn(i32, i32, i32) -> bool,
-{
-    let min = Vec3::new(pos.x - radius, pos.y, pos.z - radius);
-    let max = Vec3::new(pos.x + radius, pos.y + height, pos.z + radius);
-
-    let min_x = min.x.floor() as i32;
-    let max_x = (max.x - 0.001).floor() as i32;
-    let min_y = min.y.floor() as i32;
-    let max_y = (max.y - 0.001).floor() as i32;
-    let min_z = min.z.floor() as i32;
-    let max_z = (max.z - 0.001).floor() as i32;
-
-    for z in min_z..=max_z {
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                if is_solid(x, y, z) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }

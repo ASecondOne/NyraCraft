@@ -10,26 +10,13 @@ pub struct WorldGen {
     perlin: Perlin,
     mountain_amp: f64,
     mountain_freq: f64,
-    cave_freq: f64,
-    cave_threshold: f64,
-    cave_min_depth: i32,
-    cave_max_depth: i32,
-    cave_open_freq: f64,
-    cave_open_threshold: f64,
-    cave_open_depth: i32,
     mountain_perlin: Perlin,
-    #[allow(dead_code)]
-    cave_perlin: Perlin,
-    #[allow(dead_code)]
-    cave_open_perlin: Perlin,
 }
 
 impl WorldGen {
     pub fn new(seed: u32) -> Self {
         let perlin = Perlin::new(seed);
         let mountain_perlin = Perlin::new(seed.wrapping_add(1));
-        let cave_perlin = Perlin::new(seed.wrapping_add(2));
-        let cave_open_perlin = Perlin::new(seed.wrapping_add(3));
         let world_id = derive_world_id(seed);
         Self {
             seed,
@@ -40,16 +27,7 @@ impl WorldGen {
             perlin,
             mountain_amp: 24.0,
             mountain_freq: 0.015,
-            cave_freq: 0.08,
-            cave_threshold: 0.45,
-            cave_min_depth: 4,
-            cave_max_depth: 64,
-            cave_open_freq: 0.04,
-            cave_open_threshold: 0.7,
-            cave_open_depth: 3,
             mountain_perlin,
-            cave_perlin,
-            cave_open_perlin,
         }
     }
 
@@ -63,29 +41,6 @@ impl WorldGen {
     pub fn with_mountains(mut self, amplitude: f64, frequency: f64) -> Self {
         self.mountain_amp = amplitude;
         self.mountain_freq = frequency;
-        self
-    }
-
-    pub fn with_caves(mut self, frequency: f64, threshold: f64) -> Self {
-        self.cave_freq = frequency;
-        self.cave_threshold = threshold;
-        self
-    }
-
-    pub fn with_cave_open(mut self, frequency: f64, threshold: f64) -> Self {
-        self.cave_open_freq = frequency;
-        self.cave_open_threshold = threshold;
-        self
-    }
-
-    pub fn with_cave_open_depth(mut self, depth: i32) -> Self {
-        self.cave_open_depth = depth.max(1);
-        self
-    }
-
-    pub fn with_cave_depth(mut self, min_depth: i32, max_depth: i32) -> Self {
-        self.cave_min_depth = min_depth.max(0);
-        self.cave_max_depth = max_depth.max(self.cave_min_depth + 1);
         self
     }
 
@@ -115,11 +70,6 @@ impl WorldGen {
         false
     }
 
-    #[allow(dead_code)]
-    pub fn block_at(&self, x: i32, y: i32, z: i32) -> i8 {
-        let h = self.height_at(x, z);
-        self.block_id_for_height(y, h)
-    }
 }
 
 fn derive_world_id(seed: u32) -> u64 {
