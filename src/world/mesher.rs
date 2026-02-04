@@ -17,8 +17,6 @@ pub struct MeshData {
     pub coord: IVec3,
     pub step: i32,
     pub mode: MeshMode,
-    pub is_super: bool,
-    pub super_size: i32,
     pub center: Vec3,
     pub radius: f32,
     pub vertices: Vec<ChunkVertex>,
@@ -46,114 +44,112 @@ pub fn generate_chunk_mesh(
     let chunk_max_y = origin.y + half;
 
     if mode != MeshMode::Full {
-        let mut z = 0;
-        while z < size {
-            let mut x = 0;
-            while x < size {
-                let wx = origin.x + x - half;
-                let wz = origin.z + z - half;
-                let height = worldgen.height_at(wx, wz);
-                if height < chunk_min_y || height > chunk_max_y {
-                    x += step;
-                    continue;
-                }
-                let block_id = worldgen.block_id_for_height(height, height);
-                if block_id < 0 {
-                    x += step;
-                    continue;
-                }
-                let block = &blocks[block_id as usize];
-                let wy = height;
-                let sx = (size - x).min(step);
-                let sz = (size - z).min(step);
-                emit_face(&mut vertices, &mut indices, block, 2, wx, wy, wz, sx, 1, sz, use_texture);
+        let cell = step.max(1);
+        let grid = size / cell;
+        let grid_usize = grid as usize;
+        let mut cells = vec![-1_i32; grid_usize * grid_usize * grid_usize];
+        let block_count = blocks.len();
 
-                if mode == MeshMode::SurfaceSides {
-                    let h_px = worldgen.height_at(wx + sx, wz);
-                    let h_mx = worldgen.height_at(wx - 1, wz);
-                    let h_pz = worldgen.height_at(wx, wz + sz);
-                    let h_mz = worldgen.height_at(wx, wz - 1);
-
-                    if h_px < height {
-                        let base = (h_px + 1).max(chunk_min_y);
-                        let top = height.min(chunk_max_y);
-                        if base <= top {
-                            emit_face(
-                                &mut vertices,
-                                &mut indices,
-                                block,
-                                0,
-                                wx,
-                                base,
-                                wz,
-                                sx,
-                                top - base + 1,
-                                sz,
-                                use_texture,
-                            );
+        let mut cz = 0;
+        while cz < grid {
+            let mut cy = 0;
+            while cy < grid {
+                let mut cx = 0;
+                while cx < grid {
+                    let mut counts = vec![0_i32; block_count];
+                    let mut oz = 0;
+                    while oz < cell {
+                        let mut oy = 0;
+                        while oy < cell {
+                            let mut ox = 0;
+                            while ox < cell {
+                                let wx = origin.x + cx * cell + ox - half;
+                                let wy = origin.y + cy * cell + oy - half;
+                                let wz = origin.z + cz * cell + oz - half;
+                                if wy < chunk_min_y || wy > chunk_max_y {
+                                    ox += 1;
+                                    continue;
+                                }
+                                let height = worldgen.height_at(wx, wz);
+                                if wy <= height {
+                                    let block_id = worldgen.block_id_for_height(wy, height);
+                                    if block_id >= 0 {
+                                        counts[block_id as usize] += 1;
+                                    }
+                                }
+                                ox += 1;
+                            }
+                            oy += 1;
+                        }
+                        oz += 1;
+                    }
+                    let mut best = -1;
+                    let mut best_count = 0;
+                    for (i, &c) in counts.iter().enumerate() {
+                        if c > best_count {
+                            best_count = c;
+                            best = i as i32;
                         }
                     }
-                    if h_mx < height {
-                        let base = (h_mx + 1).max(chunk_min_y);
-                        let top = height.min(chunk_max_y);
-                        if base <= top {
-                            emit_face(
-                                &mut vertices,
-                                &mut indices,
-                                block,
-                                1,
-                                wx,
-                                base,
-                                wz,
-                                sx,
-                                top - base + 1,
-                                sz,
-                                use_texture,
-                            );
-                        }
+                    if best_count > 0 {
+                        let idx = (cx + cy * grid + cz * grid * grid) as usize;
+                        cells[idx] = best;
                     }
-                    if h_pz < height {
-                        let base = (h_pz + 1).max(chunk_min_y);
-                        let top = height.min(chunk_max_y);
-                        if base <= top {
-                            emit_face(
-                                &mut vertices,
-                                &mut indices,
-                                block,
-                                4,
-                                wx,
-                                base,
-                                wz,
-                                sx,
-                                top - base + 1,
-                                sz,
-                                use_texture,
-                            );
-                        }
-                    }
-                    if h_mz < height {
-                        let base = (h_mz + 1).max(chunk_min_y);
-                        let top = height.min(chunk_max_y);
-                        if base <= top {
-                            emit_face(
-                                &mut vertices,
-                                &mut indices,
-                                block,
-                                5,
-                                wx,
-                                base,
-                                wz,
-                                sx,
-                                top - base + 1,
-                                sz,
-                                use_texture,
-                            );
-                        }
-                    }
+                    cx += 1;
                 }
-                x += step;
+                cy += 1;
             }
-            z += step;
+            cz += 1;
+        }
+
+        let mut cz = 0;
+        while cz < grid {
+            let mut cy = 0;
+            while cy < grid {
+                let mut cx = 0;
+                while cx < grid {
+                    let idx = (cx + cy * grid + cz * grid * grid) as usize;
+                    let id = cells[idx];
+                    if id < 0 {
+                        cx += 1;
+                        continue;
+                    }
+                    let block = &blocks[id as usize];
+                    let wx = origin.x + cx * cell - half;
+                    let wy = origin.y + cy * cell - half;
+                    let wz = origin.z + cz * cell - half;
+
+                    let nx = if cx + 1 < grid { cells[(cx + 1 + cy * grid + cz * grid * grid) as usize] } else { -1 };
+                    let px = if cx > 0 { cells[(cx - 1 + cy * grid + cz * grid * grid) as usize] } else { -1 };
+                    let ny = if cy + 1 < grid { cells[(cx + (cy + 1) * grid + cz * grid * grid) as usize] } else { -1 };
+                    let py = if cy > 0 { cells[(cx + (cy - 1) * grid + cz * grid * grid) as usize] } else { -1 };
+                    let nz = if cz + 1 < grid { cells[(cx + cy * grid + (cz + 1) * grid * grid) as usize] } else { -1 };
+                    let pz = if cz > 0 { cells[(cx + cy * grid + (cz - 1) * grid * grid) as usize] } else { -1 };
+
+                    if nx < 0 {
+                        emit_face(&mut vertices, &mut indices, block, 0, wx, wy, wz, cell, cell, cell, use_texture);
+                    }
+                    if px < 0 {
+                        emit_face(&mut vertices, &mut indices, block, 1, wx, wy, wz, cell, cell, cell, use_texture);
+                    }
+                    if ny < 0 {
+                        emit_face(&mut vertices, &mut indices, block, 2, wx, wy, wz, cell, cell, cell, use_texture);
+                    }
+                    if py < 0 {
+                        emit_face(&mut vertices, &mut indices, block, 3, wx, wy, wz, cell, cell, cell, use_texture);
+                    }
+                    if nz < 0 {
+                        emit_face(&mut vertices, &mut indices, block, 4, wx, wy, wz, cell, cell, cell, use_texture);
+                    }
+                    if pz < 0 {
+                        emit_face(&mut vertices, &mut indices, block, 5, wx, wy, wz, cell, cell, cell, use_texture);
+                    }
+
+                    cx += 1;
+                }
+                cy += 1;
+            }
+            cz += 1;
         }
 
         let center = Vec3::new(origin.x as f32, origin.y as f32, origin.z as f32);
@@ -163,8 +159,6 @@ pub fn generate_chunk_mesh(
             coord,
             step,
             mode,
-            is_super: false,
-            super_size: 1,
             center,
             radius,
             vertices,
@@ -270,70 +264,6 @@ pub fn generate_chunk_mesh(
         coord,
         step,
         mode,
-        is_super: false,
-        super_size: 1,
-        center,
-        radius,
-        vertices,
-        indices,
-    }
-}
-
-pub fn generate_super_chunk_mesh(
-    min_chunk: IVec3,
-    blocks: &[BlockTexture],
-    worldgen: &WorldGen,
-    step: i32,
-    super_size: i32,
-) -> MeshData {
-    let step = step.max(1);
-    let size = CHUNK_SIZE * super_size;
-    let half = CHUNK_SIZE / 2;
-    let min_world_x = min_chunk.x * CHUNK_SIZE - half;
-    let min_world_y = min_chunk.y * CHUNK_SIZE - half;
-    let min_world_z = min_chunk.z * CHUNK_SIZE - half;
-    let max_world_y = min_world_y + CHUNK_SIZE - 1;
-    let use_texture = 0;
-
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-
-    let mut z = 0;
-    while z < size {
-        let mut x = 0;
-        while x < size {
-            let wx = min_world_x + x;
-            let wz = min_world_z + z;
-            let height = worldgen.height_at(wx, wz);
-            if height >= min_world_y && height <= max_world_y {
-                let block_id = worldgen.block_id_for_height(height, height);
-                if block_id >= 0 {
-                    let block = &blocks[block_id as usize];
-                    let sx = (size - x).min(step);
-                    let sz = (size - z).min(step);
-                    emit_face(&mut vertices, &mut indices, block, 2, wx, height, wz, sx, 1, sz, use_texture);
-                }
-            }
-            x += step;
-        }
-        z += step;
-    }
-
-    let center = Vec3::new(
-        min_world_x as f32 + (size as f32) * 0.5,
-        min_world_y as f32 + (CHUNK_SIZE as f32) * 0.5,
-        min_world_z as f32 + (size as f32) * 0.5,
-    );
-    let half_xz = (size as f32) * 0.5;
-    let half_y = (CHUNK_SIZE as f32) * 0.5;
-    let radius = Vec3::new(half_xz, half_y, half_xz).length();
-
-    MeshData {
-        coord: min_chunk,
-        step,
-        mode: MeshMode::SurfaceOnly,
-        is_super: true,
-        super_size,
         center,
         radius,
         vertices,
