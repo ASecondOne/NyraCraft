@@ -5,10 +5,18 @@ use crate::render::mesh::ChunkVertex;
 use crate::world::worldgen::WorldGen;
 use crate::world::CHUNK_SIZE;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeshMode {
+    Full = 0,
+    SurfaceSides = 1,
+    SurfaceOnly = 2,
+}
+
 #[derive(Clone)]
 pub struct MeshData {
     pub coord: IVec3,
     pub step: i32,
+    pub mode: MeshMode,
     pub center: Vec3,
     pub radius: f32,
     pub vertices: Vec<ChunkVertex>,
@@ -20,6 +28,7 @@ pub fn generate_chunk_mesh(
     blocks: &[BlockTexture],
     worldgen: &WorldGen,
     step: i32,
+    mode: MeshMode,
 ) -> MeshData {
     let origin = IVec3::new(coord.x * CHUNK_SIZE, coord.y * CHUNK_SIZE, coord.z * CHUNK_SIZE);
     let mut vertices = Vec::new();
@@ -28,10 +37,131 @@ pub fn generate_chunk_mesh(
     let size = CHUNK_SIZE as i32;
     let half = CHUNK_SIZE / 2;
     let step = step.max(1);
-    let allow_caves = step == 1;
+    let allow_caves = step == 1 && mode == MeshMode::Full;
 
     let chunk_min_y = origin.y - half;
     let chunk_max_y = origin.y + half;
+
+    if mode != MeshMode::Full {
+        let mut z = 0;
+        while z < size {
+            let mut x = 0;
+            while x < size {
+                let wx = origin.x + x - half;
+                let wz = origin.z + z - half;
+                let height = worldgen.height_at(wx, wz);
+                if height < chunk_min_y || height > chunk_max_y {
+                    x += step;
+                    continue;
+                }
+                let block_id = worldgen.block_id_for_height(height, height);
+                if block_id < 0 {
+                    x += step;
+                    continue;
+                }
+                let block = &blocks[block_id as usize];
+                let wy = height;
+                let sx = (size - x).min(step);
+                let sz = (size - z).min(step);
+                emit_face(&mut vertices, &mut indices, block, 2, wx, wy, wz, sx, 1, sz);
+
+                if mode == MeshMode::SurfaceSides {
+                    let h_px = worldgen.height_at(wx + sx, wz);
+                    let h_mx = worldgen.height_at(wx - 1, wz);
+                    let h_pz = worldgen.height_at(wx, wz + sz);
+                    let h_mz = worldgen.height_at(wx, wz - 1);
+
+                    if h_px < height {
+                        let base = (h_px + 1).max(chunk_min_y);
+                        let top = height.min(chunk_max_y);
+                        if base <= top {
+                            emit_face(
+                                &mut vertices,
+                                &mut indices,
+                                block,
+                                0,
+                                wx,
+                                base,
+                                wz,
+                                sx,
+                                top - base + 1,
+                                sz,
+                            );
+                        }
+                    }
+                    if h_mx < height {
+                        let base = (h_mx + 1).max(chunk_min_y);
+                        let top = height.min(chunk_max_y);
+                        if base <= top {
+                            emit_face(
+                                &mut vertices,
+                                &mut indices,
+                                block,
+                                1,
+                                wx,
+                                base,
+                                wz,
+                                sx,
+                                top - base + 1,
+                                sz,
+                            );
+                        }
+                    }
+                    if h_pz < height {
+                        let base = (h_pz + 1).max(chunk_min_y);
+                        let top = height.min(chunk_max_y);
+                        if base <= top {
+                            emit_face(
+                                &mut vertices,
+                                &mut indices,
+                                block,
+                                4,
+                                wx,
+                                base,
+                                wz,
+                                sx,
+                                top - base + 1,
+                                sz,
+                            );
+                        }
+                    }
+                    if h_mz < height {
+                        let base = (h_mz + 1).max(chunk_min_y);
+                        let top = height.min(chunk_max_y);
+                        if base <= top {
+                            emit_face(
+                                &mut vertices,
+                                &mut indices,
+                                block,
+                                5,
+                                wx,
+                                base,
+                                wz,
+                                sx,
+                                top - base + 1,
+                                sz,
+                            );
+                        }
+                    }
+                }
+                x += step;
+            }
+            z += step;
+        }
+
+        let center = Vec3::new(origin.x as f32, origin.y as f32, origin.z as f32);
+        let radius = chunk_radius();
+
+        return MeshData {
+            coord,
+            step,
+            mode,
+            center,
+            radius,
+            vertices,
+            indices,
+        };
+    }
 
     let mut z = 0;
     while z < size {
@@ -130,6 +260,7 @@ pub fn generate_chunk_mesh(
     MeshData {
         coord,
         step,
+        mode,
         center,
         radius,
         vertices,

@@ -17,19 +17,20 @@ mod colorthing;
 mod render;
 mod world;
 
-use colorthing::ColorThing;
-use render::{BlockTexture, CubeStyle, TextureAtlas};
+use render::{CubeStyle, TextureAtlas};
 use camera::Camera;
 use render::Gpu;
 use world::CHUNK_SIZE;
 use glam::IVec3;
 use world::worldgen::WorldGen;
-use world::mesher::{generate_chunk_mesh, MeshData};
+use world::mesher::{generate_chunk_mesh, MeshData, MeshMode};
+use world::blocks::{default_blocks, DEFAULT_TILES_X};
 
 enum WorkerMsg {
     Request {
         coord: IVec3,
         step: i32,
+        mode: MeshMode,
     },
 }
 
@@ -47,36 +48,8 @@ fn main() {
         tile_size: 16,
     };
 
-    let tiles_x = 16;
-    let stone = BlockTexture::solid(
-        tile_index_1based(2, 1, tiles_x),
-        ColorThing::new(1.0, 1.0, 1.0),
-    );
-    let dirt = BlockTexture::solid(
-        tile_index_1based(3, 1, tiles_x),
-        ColorThing::new(1.0, 1.0, 1.0),
-    );
-    let grass = BlockTexture {
-        colors: [
-            ColorThing::new(0.62, 0.82, 0.35), // +X
-            ColorThing::new(0.62, 0.82, 0.35), // -X
-            ColorThing::new(0.62, 0.82, 0.35), // +Y (top)
-            ColorThing::new(1.0, 1.0, 1.0),    // -Y (bottom)
-            ColorThing::new(0.62, 0.82, 0.35), // +Z
-            ColorThing::new(0.62, 0.82, 0.35), // -Z
-        ],
-        tiles: [
-            tile_index_1based(4, 1, tiles_x), // sides
-            tile_index_1based(4, 1, tiles_x),
-            tile_index_1based(9, 3, tiles_x), // top (tinted)
-            tile_index_1based(3, 1, tiles_x), // bottom
-            tile_index_1based(4, 1, tiles_x),
-            tile_index_1based(4, 1, tiles_x),
-        ],
-        rotations: [3, 3, 0, 0, 0, 0],
-    };
-
-    let blocks = vec![stone, dirt, grass];
+    let tiles_x = DEFAULT_TILES_X;
+    let blocks = default_blocks(tiles_x);
 
     let seed: u32 = rand::random();
     let world_gen = WorldGen::new(seed)
@@ -168,8 +141,8 @@ fn main() {
                     Err(_) => break,
                 };
                 match msg {
-                    WorkerMsg::Request { coord, step } => {
-                        let mesh = generate_chunk_mesh(coord, &blocks_gen, &gen_thread, step);
+                    WorkerMsg::Request { coord, step, mode } => {
+                        let mesh = generate_chunk_mesh(coord, &blocks_gen, &gen_thread, step, mode);
                         let _ = tx_res.send(mesh);
                     }
                 }
@@ -180,10 +153,10 @@ fn main() {
     let base_render_radius = 256;
     let max_render_radius = 256;
     let base_draw_radius = 128;
+    let lod_near_radius = 16;
+    let lod_mid_radius = 64;
     let request_budget = 96;
     let max_inflight = 2048usize;
-    let y_range_up = 128;
-    let y_range_down = 64;
     let surface_depth_chunks = 8;
     let initial_burst_radius = 4;
     let mut current_chunk = chunk_coord_from_pos(player_pos);
@@ -328,15 +301,16 @@ fn main() {
                         base_render_radius,
                         max_render_radius,
                         request_budget,
-                        y_range_down,
-                        y_range_up,
                         initial_burst_radius,
                         max_inflight,
                         &mut force_reload,
                         &world_gen,
                         surface_depth_chunks,
                         draw_radius,
+                        lod_near_radius,
+                        lod_mid_radius,
                     );
+                    gpu.update_visible(&camera, draw_radius);
                     tps_ticks += 1;
                 }
 
@@ -539,12 +513,6 @@ fn main() {
     });
 }
 
-fn tile_index_1based(x: u32, y: u32, tiles_x: u32) -> u32 {
-    let x0 = x.saturating_sub(1);
-    let y0 = y.saturating_sub(1);
-    x0 + y0 * tiles_x
-}
-
 fn chunk_coord_from_pos(pos: Vec3) -> IVec3 {
     let half = (CHUNK_SIZE / 2) as f32;
     IVec3::new(
@@ -604,21 +572,6 @@ fn world_y_to_chunk_y(y: i32) -> i32 {
     ((y + half) as f32 / CHUNK_SIZE as f32).floor() as i32
 }
 
-fn dy_order(range_down: i32, range_up: i32) -> Vec<i32> {
-    let max = range_down.max(range_up);
-    let mut out = Vec::with_capacity((max * 2 + 1) as usize);
-    out.push(0);
-    for offset in 1..=max {
-        if offset <= range_up {
-            out.push(offset);
-        }
-        if offset <= range_down {
-            out.push(-offset);
-        }
-    }
-    out
-}
-
 fn lod_step(dist: i32) -> i32 {
     let mut step = 1;
     let mut threshold = 8;
@@ -628,6 +581,10 @@ fn lod_step(dist: i32) -> i32 {
         threshold *= 2;
     }
     step
+}
+
+fn pack_lod(mode: MeshMode, step: i32) -> i32 {
+    ((mode as i32) << 16) | (step & 0xFFFF)
 }
 
 fn depth_for_dist(base_depth: i32, dist: i32) -> i32 {
@@ -702,14 +659,14 @@ fn stream_tick(
     base_render_radius: i32,
     max_render_radius: i32,
     request_budget: i32,
-    y_range_down: i32,
-    y_range_up: i32,
     initial_burst_radius: i32,
     max_inflight: usize,
     force_reload: &mut bool,
     world_gen: &WorldGen,
     surface_depth_chunks: i32,
     draw_radius: i32,
+    lod_near_radius: i32,
+    lod_mid_radius: i32,
 ) {
     let new_chunk = chunk_coord_from_pos(player_pos);
     if new_chunk != *current_chunk {
@@ -724,8 +681,6 @@ fn stream_tick(
     let height_chunks = (player_pos.y / CHUNK_SIZE as f32).max(0.0) as i32;
     let height_factor = height_chunks / 8;
     let budget = (request_budget - height_factor * 8).max(16);
-    let _dy_list = dy_order(y_range_down, y_range_up);
-
     if *force_reload {
         gpu.clear_chunks();
         loaded.clear();
@@ -738,7 +693,7 @@ fn stream_tick(
     while let Ok(mesh) = rx_res.try_recv() {
         let k = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
         gpu.upsert_chunk(mesh.coord, mesh.center, mesh.radius, &mesh.vertices, &mesh.indices);
-        loaded.insert(k, mesh.step);
+        loaded.insert(k, pack_lod(mesh.mode, mesh.step));
         requested.remove(&k);
     }
 
@@ -758,19 +713,22 @@ fn stream_tick(
             for dy in y_start..=y_end {
                 let coord = (cx, dy, cz);
                 let step = 1;
+                let mode = MeshMode::Full;
+                let lod = pack_lod(mode, step);
                 let key = coord;
                 let mut needs_request = true;
                 if let Some(&req_step) = requested.get(&key) {
-                    needs_request = req_step != step;
+                    needs_request = req_step != lod;
                 } else if let Some(&loaded_step) = loaded.get(&key) {
-                    needs_request = loaded_step != step;
+                    needs_request = loaded_step != lod;
                 }
                 if needs_request {
                     let _ = tx_req.send(WorkerMsg::Request {
                         coord: IVec3::new(coord.0, coord.1, coord.2),
                         step,
+                        mode,
                     });
-                    requested.insert(key, step);
+                    requested.insert(key, lod);
                 }
             }
         }
@@ -798,19 +756,22 @@ fn stream_tick(
                     continue;
                 }
                 let step = 1;
+                let mode = MeshMode::Full;
+                let lod = pack_lod(mode, step);
                 let key = coord;
                 let mut needs_request = true;
                 if let Some(&req_step) = requested.get(&key) {
-                    needs_request = req_step != step;
+                    needs_request = req_step != lod;
                 } else if let Some(&loaded_step) = loaded.get(&key) {
-                    needs_request = loaded_step != step;
+                    needs_request = loaded_step != lod;
                 }
                 if needs_request {
                     let _ = tx_req.send(WorkerMsg::Request {
                         coord: IVec3::new(coord.0, coord.1, coord.2),
                         step,
+                        mode,
                     });
-                    requested.insert(key, step);
+                    requested.insert(key, lod);
                 }
             }
         }
@@ -850,24 +811,29 @@ fn stream_tick(
             if dist > render_radius {
                 continue;
             }
-            let step = if dx.abs() <= 1 && dz.abs() <= 1 {
-                1
+            let mode = if dist <= lod_near_radius {
+                MeshMode::Full
+            } else if dist <= lod_mid_radius {
+                MeshMode::SurfaceSides
             } else {
-                lod_step(dist)
+                MeshMode::SurfaceOnly
             };
+            let step = if mode == MeshMode::Full { 1 } else { lod_step(dist) };
+            let lod = pack_lod(mode, step);
             let key = coord;
             let mut needs_request = true;
             if let Some(&req_step) = requested.get(&key) {
-                needs_request = req_step != step;
+                needs_request = req_step != lod;
             } else if let Some(&loaded_step) = loaded.get(&key) {
-                needs_request = loaded_step != step;
+                needs_request = loaded_step != lod;
             }
             if needs_request {
                 let _ = tx_req.send(WorkerMsg::Request {
                     coord: IVec3::new(coord.0, coord.1, coord.2),
                     step,
+                    mode,
                 });
-                requested.insert(key, step);
+                requested.insert(key, lod);
                 budget -= 1;
                 if requested.len() >= max_inflight {
                     return;

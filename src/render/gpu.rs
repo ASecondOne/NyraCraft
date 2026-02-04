@@ -2,6 +2,7 @@ use crate::camera::Camera;
 use crate::render::atlas::TextureAtlas;
 use crate::render::CubeStyle;
 use crate::render::mesh::ChunkVertex;
+use crate::render::texture::{AtlasTexture, create_dummy_texture, load_atlas_texture};
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat4, Vec3};
 use self_cell::self_cell;
@@ -45,6 +46,7 @@ struct GpuInner<'a> {
     tiles_x: u32,
     tile_uv_size: [f32; 2],
     chunks: HashMap<IVec3, ChunkGpuMesh>,
+    visible: Vec<IVec3>,
 }
 
 self_cell! {
@@ -97,9 +99,14 @@ impl Gpu {
 
             let depth_view = create_depth_view(&device, &config);
 
-            let (texture_view, sampler, tiles_x, tile_uv_size) = if style.use_texture {
+            let AtlasTexture {
+                view: texture_view,
+                sampler,
+                tiles_x,
+                tile_uv_size,
+            } = if style.use_texture {
                 let atlas = atlas.expect("TextureAtlas required when use_texture is true");
-                create_atlas_texture(&device, &queue, &atlas)
+                load_atlas_texture(&device, &queue, &atlas)
             } else {
                 create_dummy_texture(&device, &queue)
             };
@@ -276,6 +283,7 @@ impl Gpu {
                 tiles_x,
                 tile_uv_size,
                 chunks: HashMap::new(),
+                visible: Vec::new(),
             }
         });
 
@@ -363,12 +371,12 @@ impl Gpu {
                 let draw_radius = draw_radius as f32 * crate::world::CHUNK_SIZE as f32;
                 let draw_radius_sq = draw_radius * draw_radius;
                 rpass.set_pipeline(&gpu.render_pipeline);
-                for chunk in gpu.chunks.values() {
+                for coord in &gpu.visible {
+                    let Some(chunk) = gpu.chunks.get(coord) else {
+                        continue;
+                    };
                     let to_center = chunk.center - camera.position;
                     if to_center.length_squared() > draw_radius_sq {
-                        continue;
-                    }
-                    if !chunk_visible(camera.position, camera.forward, chunk) {
                         continue;
                     }
                     rpass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
@@ -443,6 +451,26 @@ impl Gpu {
     pub fn clear_chunks(&mut self) {
         self.cell.with_dependent_mut(|_, gpu| {
             gpu.chunks.clear();
+            gpu.visible.clear();
+        });
+    }
+
+    pub fn update_visible(&mut self, camera: &Camera, draw_radius: i32) {
+        self.cell.with_dependent_mut(|_, gpu| {
+            let draw_radius = draw_radius as f32 * crate::world::CHUNK_SIZE as f32;
+            let draw_radius_sq = draw_radius * draw_radius;
+            gpu.visible.clear();
+            gpu.visible.reserve(gpu.chunks.len());
+            for (coord, chunk) in &gpu.chunks {
+                let to_center = chunk.center - camera.position;
+                if to_center.length_squared() > draw_radius_sq {
+                    continue;
+                }
+                if !chunk_visible(camera.position, camera.forward, chunk) {
+                    continue;
+                }
+                gpu.visible.push(*coord);
+            }
         });
     }
 }
@@ -503,125 +531,6 @@ fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration)
     });
 
     texture.create_view(&wgpu::TextureViewDescriptor::default())
-}
-
-fn create_atlas_texture(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    atlas: &TextureAtlas,
-) -> (wgpu::TextureView, wgpu::Sampler, u32, [f32; 2]) {
-    let image = image::open(&atlas.path)
-        .unwrap_or_else(|e| panic!("failed to open atlas {}: {e}", atlas.path));
-    let rgba = image.to_rgba8();
-    let (width, height) = rgba.dimensions();
-
-    let bytes_per_row = 4 * width;
-    assert!(
-        bytes_per_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT == 0,
-        "atlas width must align to 256-byte rows; got {bytes_per_row}"
-    );
-
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("atlas_texture"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-
-    queue.write_texture(
-        wgpu::ImageCopyTexture {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &rgba,
-        wgpu::ImageDataLayout {
-            offset: 0,
-            bytes_per_row: Some(bytes_per_row),
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("atlas_sampler"),
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        address_mode_w: wgpu::AddressMode::ClampToEdge,
-        mag_filter: wgpu::FilterMode::Nearest,
-        min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::FilterMode::Nearest,
-        ..Default::default()
-    });
-
-    let tiles_x = width / atlas.tile_size;
-    let tiles_y = height / atlas.tile_size;
-    assert!(tiles_x > 0 && tiles_y > 0, "atlas tile size is invalid");
-    let tile_uv_size = [
-        atlas.tile_size as f32 / width as f32,
-        atlas.tile_size as f32 / height as f32,
-    ];
-
-    (view, sampler, tiles_x, tile_uv_size)
-}
-
-fn create_dummy_texture(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-) -> (wgpu::TextureView, wgpu::Sampler, u32, [f32; 2]) {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("dummy_texture"),
-        size: wgpu::Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-
-    queue.write_texture(
-        wgpu::ImageCopyTexture {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &[255, 255, 255, 255],
-        wgpu::ImageDataLayout {
-            offset: 0,
-            bytes_per_row: Some(4),
-            rows_per_image: Some(1),
-        },
-        wgpu::Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-    );
-
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
-    (view, sampler, 1, [1.0, 1.0])
 }
 
 fn chunk_visible(camera_pos: Vec3, camera_forward: Vec3, chunk: &ChunkGpuMesh) -> bool {
