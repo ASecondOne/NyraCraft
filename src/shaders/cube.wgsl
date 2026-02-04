@@ -24,7 +24,8 @@ struct VertexInput {
     @location(2) tile: u32,
     @location(3) face: u32,
     @location(4) rotation: u32,
-    @location(5) color: vec4<f32>,
+    @location(5) use_texture: u32,
+    @location(6) color: vec4<f32>,
 };
 
 struct VertexOutput {
@@ -33,7 +34,8 @@ struct VertexOutput {
     @location(1) tile: u32,
     @location(2) face: u32,
     @location(3) rotation: u32,
-    @location(4) color: vec4<f32>,
+    @location(4) use_texture: u32,
+    @location(5) color: vec4<f32>,
 };
 
 @vertex
@@ -44,6 +46,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     out.tile = input.tile;
     out.face = input.face;
     out.rotation = input.rotation;
+    out.use_texture = input.use_texture;
     out.color = input.color;
     return out;
 }
@@ -71,7 +74,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         }
         return color;
     }
-    if (uniforms.use_texture == 1u) {
+    if (uniforms.use_texture == 1u && input.use_texture == 1u) {
         let uv_rot = rotate_uv(input.uv, input.rotation);
         let tiles_x = uniforms.tiles_x;
         let tile_x = input.tile % tiles_x;

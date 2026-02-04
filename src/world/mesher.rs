@@ -17,6 +17,8 @@ pub struct MeshData {
     pub coord: IVec3,
     pub step: i32,
     pub mode: MeshMode,
+    pub is_super: bool,
+    pub super_size: i32,
     pub center: Vec3,
     pub radius: f32,
     pub vertices: Vec<ChunkVertex>,
@@ -38,6 +40,7 @@ pub fn generate_chunk_mesh(
     let half = CHUNK_SIZE / 2;
     let step = step.max(1);
     let allow_caves = step == 1 && mode == MeshMode::Full;
+    let use_texture = if mode == MeshMode::SurfaceOnly { 0 } else { 1 };
 
     let chunk_min_y = origin.y - half;
     let chunk_max_y = origin.y + half;
@@ -63,7 +66,7 @@ pub fn generate_chunk_mesh(
                 let wy = height;
                 let sx = (size - x).min(step);
                 let sz = (size - z).min(step);
-                emit_face(&mut vertices, &mut indices, block, 2, wx, wy, wz, sx, 1, sz);
+                emit_face(&mut vertices, &mut indices, block, 2, wx, wy, wz, sx, 1, sz, use_texture);
 
                 if mode == MeshMode::SurfaceSides {
                     let h_px = worldgen.height_at(wx + sx, wz);
@@ -86,6 +89,7 @@ pub fn generate_chunk_mesh(
                                 sx,
                                 top - base + 1,
                                 sz,
+                                use_texture,
                             );
                         }
                     }
@@ -104,6 +108,7 @@ pub fn generate_chunk_mesh(
                                 sx,
                                 top - base + 1,
                                 sz,
+                                use_texture,
                             );
                         }
                     }
@@ -122,6 +127,7 @@ pub fn generate_chunk_mesh(
                                 sx,
                                 top - base + 1,
                                 sz,
+                                use_texture,
                             );
                         }
                     }
@@ -140,6 +146,7 @@ pub fn generate_chunk_mesh(
                                 sx,
                                 top - base + 1,
                                 sz,
+                                use_texture,
                             );
                         }
                     }
@@ -156,6 +163,8 @@ pub fn generate_chunk_mesh(
             coord,
             step,
             mode,
+            is_super: false,
+            super_size: 1,
             center,
             radius,
             vertices,
@@ -198,22 +207,22 @@ pub fn generate_chunk_mesh(
                     let sz = (size - z).min(step);
 
                     if is_air(IVec3::new(wx + sx, wy, wz), worldgen, allow_caves) {
-                        emit_face(&mut vertices, &mut indices, block, 0, wx, wy, wz, sx, sy, sz);
+                        emit_face(&mut vertices, &mut indices, block, 0, wx, wy, wz, sx, sy, sz, use_texture);
                     }
                     if is_air(IVec3::new(wx - 1, wy, wz), worldgen, allow_caves) {
-                        emit_face(&mut vertices, &mut indices, block, 1, wx, wy, wz, sx, sy, sz);
+                        emit_face(&mut vertices, &mut indices, block, 1, wx, wy, wz, sx, sy, sz, use_texture);
                     }
                     if is_air(IVec3::new(wx, wy + 1, wz), worldgen, allow_caves) {
-                        emit_face(&mut vertices, &mut indices, block, 2, wx, wy, wz, sx, 1, sz);
+                        emit_face(&mut vertices, &mut indices, block, 2, wx, wy, wz, sx, 1, sz, use_texture);
                     }
                     if is_air(IVec3::new(wx, wy - 1, wz), worldgen, allow_caves) {
-                        emit_face(&mut vertices, &mut indices, block, 3, wx, wy, wz, sx, 1, sz);
+                        emit_face(&mut vertices, &mut indices, block, 3, wx, wy, wz, sx, 1, sz, use_texture);
                     }
                     if is_air(IVec3::new(wx, wy, wz + sz), worldgen, allow_caves) {
-                        emit_face(&mut vertices, &mut indices, block, 4, wx, wy, wz, sx, sy, sz);
+                        emit_face(&mut vertices, &mut indices, block, 4, wx, wy, wz, sx, sy, sz, use_texture);
                     }
                     if is_air(IVec3::new(wx, wy, wz - 1), worldgen, allow_caves) {
-                        emit_face(&mut vertices, &mut indices, block, 5, wx, wy, wz, sx, sy, sz);
+                        emit_face(&mut vertices, &mut indices, block, 5, wx, wy, wz, sx, sy, sz, use_texture);
                     }
                 }
                 y += step;
@@ -229,22 +238,22 @@ pub fn generate_chunk_mesh(
                         let sy = 1;
                         let sz = 1;
                         if is_air(IVec3::new(wx + 1, wy, wz), worldgen, allow_caves) {
-                            emit_face(&mut vertices, &mut indices, block, 0, wx, wy, wz, sx, sy, sz);
+                            emit_face(&mut vertices, &mut indices, block, 0, wx, wy, wz, sx, sy, sz, use_texture);
                         }
                         if is_air(IVec3::new(wx - 1, wy, wz), worldgen, allow_caves) {
-                            emit_face(&mut vertices, &mut indices, block, 1, wx, wy, wz, sx, sy, sz);
+                            emit_face(&mut vertices, &mut indices, block, 1, wx, wy, wz, sx, sy, sz, use_texture);
                         }
                         if is_air(IVec3::new(wx, wy + 1, wz), worldgen, allow_caves) {
-                            emit_face(&mut vertices, &mut indices, block, 2, wx, wy, wz, sx, sy, sz);
+                            emit_face(&mut vertices, &mut indices, block, 2, wx, wy, wz, sx, sy, sz, use_texture);
                         }
                         if is_air(IVec3::new(wx, wy - 1, wz), worldgen, allow_caves) {
-                            emit_face(&mut vertices, &mut indices, block, 3, wx, wy, wz, sx, sy, sz);
+                            emit_face(&mut vertices, &mut indices, block, 3, wx, wy, wz, sx, sy, sz, use_texture);
                         }
                         if is_air(IVec3::new(wx, wy, wz + 1), worldgen, allow_caves) {
-                            emit_face(&mut vertices, &mut indices, block, 4, wx, wy, wz, sx, sy, sz);
+                            emit_face(&mut vertices, &mut indices, block, 4, wx, wy, wz, sx, sy, sz, use_texture);
                         }
                         if is_air(IVec3::new(wx, wy, wz - 1), worldgen, allow_caves) {
-                            emit_face(&mut vertices, &mut indices, block, 5, wx, wy, wz, sx, sy, sz);
+                            emit_face(&mut vertices, &mut indices, block, 5, wx, wy, wz, sx, sy, sz, use_texture);
                         }
                     }
                 }
@@ -261,6 +270,70 @@ pub fn generate_chunk_mesh(
         coord,
         step,
         mode,
+        is_super: false,
+        super_size: 1,
+        center,
+        radius,
+        vertices,
+        indices,
+    }
+}
+
+pub fn generate_super_chunk_mesh(
+    min_chunk: IVec3,
+    blocks: &[BlockTexture],
+    worldgen: &WorldGen,
+    step: i32,
+    super_size: i32,
+) -> MeshData {
+    let step = step.max(1);
+    let size = CHUNK_SIZE * super_size;
+    let half = CHUNK_SIZE / 2;
+    let min_world_x = min_chunk.x * CHUNK_SIZE - half;
+    let min_world_y = min_chunk.y * CHUNK_SIZE - half;
+    let min_world_z = min_chunk.z * CHUNK_SIZE - half;
+    let max_world_y = min_world_y + CHUNK_SIZE - 1;
+    let use_texture = 0;
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    let mut z = 0;
+    while z < size {
+        let mut x = 0;
+        while x < size {
+            let wx = min_world_x + x;
+            let wz = min_world_z + z;
+            let height = worldgen.height_at(wx, wz);
+            if height >= min_world_y && height <= max_world_y {
+                let block_id = worldgen.block_id_for_height(height, height);
+                if block_id >= 0 {
+                    let block = &blocks[block_id as usize];
+                    let sx = (size - x).min(step);
+                    let sz = (size - z).min(step);
+                    emit_face(&mut vertices, &mut indices, block, 2, wx, height, wz, sx, 1, sz, use_texture);
+                }
+            }
+            x += step;
+        }
+        z += step;
+    }
+
+    let center = Vec3::new(
+        min_world_x as f32 + (size as f32) * 0.5,
+        min_world_y as f32 + (CHUNK_SIZE as f32) * 0.5,
+        min_world_z as f32 + (size as f32) * 0.5,
+    );
+    let half_xz = (size as f32) * 0.5;
+    let half_y = (CHUNK_SIZE as f32) * 0.5;
+    let radius = Vec3::new(half_xz, half_y, half_xz).length();
+
+    MeshData {
+        coord: min_chunk,
+        step,
+        mode: MeshMode::SurfaceOnly,
+        is_super: true,
+        super_size,
         center,
         radius,
         vertices,
@@ -279,6 +352,7 @@ fn emit_face(
     sx: i32,
     sy: i32,
     sz: i32,
+    use_texture: u32,
 ) {
     let base = vertices.len() as u32;
     let color = block.colors[face as usize].as_f32_rgba();
@@ -338,6 +412,7 @@ fn emit_face(
         tile,
         face,
         rotation,
+        use_texture,
         _pad0: 0,
         color,
     });
@@ -347,6 +422,7 @@ fn emit_face(
         tile,
         face,
         rotation,
+        use_texture,
         _pad0: 0,
         color,
     });
@@ -356,6 +432,7 @@ fn emit_face(
         tile,
         face,
         rotation,
+        use_texture,
         _pad0: 0,
         color,
     });
@@ -365,6 +442,7 @@ fn emit_face(
         tile,
         face,
         rotation,
+        use_texture,
         _pad0: 0,
         color,
     });

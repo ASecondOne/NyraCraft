@@ -47,6 +47,8 @@ struct GpuInner<'a> {
     tile_uv_size: [f32; 2],
     chunks: HashMap<IVec3, ChunkGpuMesh>,
     visible: Vec<IVec3>,
+    super_chunks: HashMap<IVec3, ChunkGpuMesh>,
+    super_visible: Vec<IVec3>,
 }
 
 self_cell! {
@@ -284,6 +286,8 @@ impl Gpu {
                 tile_uv_size,
                 chunks: HashMap::new(),
                 visible: Vec::new(),
+                super_chunks: HashMap::new(),
+                super_visible: Vec::new(),
             }
         });
 
@@ -383,6 +387,18 @@ impl Gpu {
                     rpass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     rpass.draw_indexed(0..chunk.index_count, 0, 0..1);
                 }
+                for coord in &gpu.super_visible {
+                    let Some(chunk) = gpu.super_chunks.get(coord) else {
+                        continue;
+                    };
+                    let to_center = chunk.center - camera.position;
+                    if to_center.length_squared() > draw_radius_sq {
+                        continue;
+                    }
+                    rpass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
+                    rpass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    rpass.draw_indexed(0..chunk.index_count, 0, 0..1);
+                }
 
                 if debug_chunks {
                     rpass.set_pipeline(&gpu.line_pipeline);
@@ -452,6 +468,8 @@ impl Gpu {
         self.cell.with_dependent_mut(|_, gpu| {
             gpu.chunks.clear();
             gpu.visible.clear();
+            gpu.super_chunks.clear();
+            gpu.super_visible.clear();
         });
     }
 
@@ -461,6 +479,8 @@ impl Gpu {
             let draw_radius_sq = draw_radius * draw_radius;
             gpu.visible.clear();
             gpu.visible.reserve(gpu.chunks.len());
+            gpu.super_visible.clear();
+            gpu.super_visible.reserve(gpu.super_chunks.len());
             for (coord, chunk) in &gpu.chunks {
                 let to_center = chunk.center - camera.position;
                 if to_center.length_squared() > draw_radius_sq {
@@ -471,6 +491,62 @@ impl Gpu {
                 }
                 gpu.visible.push(*coord);
             }
+            for (coord, chunk) in &gpu.super_chunks {
+                let to_center = chunk.center - camera.position;
+                if to_center.length_squared() > draw_radius_sq {
+                    continue;
+                }
+                if !chunk_visible(camera.position, camera.forward, chunk) {
+                    continue;
+                }
+                gpu.super_visible.push(*coord);
+            }
+        });
+    }
+
+    pub fn upsert_super_chunk(
+        &mut self,
+        coord: IVec3,
+        center: Vec3,
+        radius: f32,
+        vertices: &[ChunkVertex],
+        indices: &[u32],
+    ) {
+        self.cell.with_dependent_mut(|_, gpu| {
+            let vertex_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("super_chunk_vertex_buffer"),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let index_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("super_chunk_index_buffer"),
+                contents: bytemuck::cast_slice(indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            let line_vertices = chunk_wireframe_vertices(coord);
+            let line_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("super_chunk_line_buffer"),
+                contents: bytemuck::cast_slice(&line_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            gpu.super_chunks.insert(
+                coord,
+                ChunkGpuMesh {
+                    vertex_buffer,
+                    index_buffer,
+                    index_count: indices.len() as u32,
+                    center,
+                    radius,
+                    line_buffer,
+                    line_count: line_vertices.len() as u32,
+                },
+            );
+        });
+    }
+
+    pub fn remove_super_chunk(&mut self, coord: IVec3) {
+        self.cell.with_dependent_mut(|_, gpu| {
+            gpu.super_chunks.remove(&coord);
         });
     }
 }

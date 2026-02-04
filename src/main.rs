@@ -23,7 +23,7 @@ use render::Gpu;
 use world::CHUNK_SIZE;
 use glam::IVec3;
 use world::worldgen::WorldGen;
-use world::mesher::{generate_chunk_mesh, MeshData, MeshMode};
+use world::mesher::{generate_chunk_mesh, generate_super_chunk_mesh, MeshData, MeshMode};
 use world::blocks::{default_blocks, DEFAULT_TILES_X};
 
 enum WorkerMsg {
@@ -31,6 +31,8 @@ enum WorkerMsg {
         coord: IVec3,
         step: i32,
         mode: MeshMode,
+        is_super: bool,
+        super_size: i32,
     },
 }
 
@@ -141,8 +143,12 @@ fn main() {
                     Err(_) => break,
                 };
                 match msg {
-                    WorkerMsg::Request { coord, step, mode } => {
-                        let mesh = generate_chunk_mesh(coord, &blocks_gen, &gen_thread, step, mode);
+                    WorkerMsg::Request { coord, step, mode, is_super, super_size } => {
+                        let mesh = if is_super {
+                            generate_super_chunk_mesh(coord, &blocks_gen, &gen_thread, step, super_size)
+                        } else {
+                            generate_chunk_mesh(coord, &blocks_gen, &gen_thread, step, mode)
+                        };
                         let _ = tx_res.send(mesh);
                     }
                 }
@@ -162,6 +168,9 @@ fn main() {
     let mut current_chunk = chunk_coord_from_pos(player_pos);
     let mut loaded: HashMap<(i32, i32, i32), i32> = HashMap::new();
     let mut requested: HashMap<(i32, i32, i32), i32> = HashMap::new();
+    let mut loaded_super: HashMap<(i32, i32, i32), i32> = HashMap::new();
+    let mut requested_super: HashMap<(i32, i32, i32), i32> = HashMap::new();
+    let super_chunk_size = 2;
     let mut ring_r: i32 = 0;
     let mut ring_i: i32 = 0;
 
@@ -296,6 +305,8 @@ fn main() {
                         &mut ring_i,
                         &mut loaded,
                         &mut requested,
+                        &mut loaded_super,
+                        &mut requested_super,
                         &tx_req,
                         &rx_res,
                         base_render_radius,
@@ -309,6 +320,7 @@ fn main() {
                         draw_radius,
                         lod_near_radius,
                         lod_mid_radius,
+                        super_chunk_size,
                     );
                     gpu.update_visible(&camera, draw_radius);
                     tps_ticks += 1;
@@ -583,6 +595,18 @@ fn lod_step(dist: i32) -> i32 {
     step
 }
 
+fn lod_div(dist: i32, base: i32) -> i32 {
+    if dist <= base {
+        3
+    } else if dist <= base * 2 {
+        6
+    } else if dist <= base * 3 {
+        9
+    } else {
+        18
+    }
+}
+
 fn pack_lod(mode: MeshMode, step: i32) -> i32 {
     ((mode as i32) << 16) | (step & 0xFFFF)
 }
@@ -654,6 +678,8 @@ fn stream_tick(
     ring_i: &mut i32,
     loaded: &mut HashMap<(i32, i32, i32), i32>,
     requested: &mut HashMap<(i32, i32, i32), i32>,
+    loaded_super: &mut HashMap<(i32, i32, i32), i32>,
+    requested_super: &mut HashMap<(i32, i32, i32), i32>,
     tx_req: &mpsc::Sender<WorkerMsg>,
     rx_res: &mpsc::Receiver<MeshData>,
     base_render_radius: i32,
@@ -667,6 +693,7 @@ fn stream_tick(
     draw_radius: i32,
     lod_near_radius: i32,
     lod_mid_radius: i32,
+    super_chunk_size: i32,
 ) {
     let new_chunk = chunk_coord_from_pos(player_pos);
     if new_chunk != *current_chunk {
@@ -674,6 +701,7 @@ fn stream_tick(
         *ring_r = 0;
         *ring_i = 0;
         requested.clear();
+        requested_super.clear();
     }
 
     let dynamic_radius = ((player_pos.y / CHUNK_SIZE as f32).max(0.0) as i32) * 2;
@@ -685,6 +713,8 @@ fn stream_tick(
         gpu.clear_chunks();
         loaded.clear();
         requested.clear();
+        loaded_super.clear();
+        requested_super.clear();
         *ring_r = 0;
         *ring_i = 0;
         *force_reload = false;
@@ -692,12 +722,31 @@ fn stream_tick(
 
     while let Ok(mesh) = rx_res.try_recv() {
         let k = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
-        gpu.upsert_chunk(mesh.coord, mesh.center, mesh.radius, &mesh.vertices, &mesh.indices);
-        loaded.insert(k, pack_lod(mesh.mode, mesh.step));
-        requested.remove(&k);
+        if mesh.is_super {
+            gpu.upsert_super_chunk(mesh.coord, mesh.center, mesh.radius, &mesh.vertices, &mesh.indices);
+            loaded_super.insert(k, pack_lod(mesh.mode, mesh.step));
+            requested_super.remove(&k);
+            let sx = mesh.super_size.max(1);
+            let mut dz = 0;
+            while dz < sx {
+                let mut dx = 0;
+                while dx < sx {
+                    let child = (mesh.coord.x + dx, mesh.coord.y, mesh.coord.z + dz);
+                    gpu.remove_chunk(IVec3::new(child.0, child.1, child.2));
+                    loaded.remove(&child);
+                    requested.remove(&child);
+                    dx += 1;
+                }
+                dz += 1;
+            }
+        } else {
+            gpu.upsert_chunk(mesh.coord, mesh.center, mesh.radius, &mesh.vertices, &mesh.indices);
+            loaded.insert(k, pack_lod(mesh.mode, mesh.step));
+            requested.remove(&k);
+        }
     }
 
-    if requested.len() >= max_inflight {
+    if requested.len() + requested_super.len() >= max_inflight {
         return;
     }
 
@@ -727,6 +776,8 @@ fn stream_tick(
                         coord: IVec3::new(coord.0, coord.1, coord.2),
                         step,
                         mode,
+                        is_super: false,
+                        super_size: 1,
                     });
                     requested.insert(key, lod);
                 }
@@ -770,6 +821,8 @@ fn stream_tick(
                         coord: IVec3::new(coord.0, coord.1, coord.2),
                         step,
                         mode,
+                        is_super: false,
+                        super_size: 1,
                     });
                     requested.insert(key, lod);
                 }
@@ -811,32 +864,60 @@ fn stream_tick(
             if dist > render_radius {
                 continue;
             }
-            let mode = if dist <= lod_near_radius {
-                MeshMode::Full
-            } else if dist <= lod_mid_radius {
-                MeshMode::SurfaceSides
+            if dist > lod_mid_radius {
+                let base_x = cx.div_euclid(super_chunk_size) * super_chunk_size;
+                let base_z = cz.div_euclid(super_chunk_size) * super_chunk_size;
+                let super_coord = (base_x, surface_chunk_y, base_z);
+                let step = lod_step(dist);
+                let lod = pack_lod(MeshMode::SurfaceOnly, step);
+                let mut needs_request = true;
+                if let Some(&req_step) = requested_super.get(&super_coord) {
+                    needs_request = req_step != lod;
+                } else if let Some(&loaded_step) = loaded_super.get(&super_coord) {
+                    needs_request = loaded_step != lod;
+                }
+                if needs_request {
+                    let _ = tx_req.send(WorkerMsg::Request {
+                        coord: IVec3::new(super_coord.0, super_coord.1, super_coord.2),
+                        step,
+                        mode: MeshMode::SurfaceOnly,
+                        is_super: true,
+                        super_size: super_chunk_size,
+                    });
+                    requested_super.insert(super_coord, lod);
+                    budget -= 1;
+                    if requested.len() + requested_super.len() >= max_inflight {
+                        return;
+                    }
+                }
             } else {
-                MeshMode::SurfaceOnly
-            };
-            let step = if mode == MeshMode::Full { 1 } else { lod_step(dist) };
-            let lod = pack_lod(mode, step);
-            let key = coord;
-            let mut needs_request = true;
-            if let Some(&req_step) = requested.get(&key) {
-                needs_request = req_step != lod;
-            } else if let Some(&loaded_step) = loaded.get(&key) {
-                needs_request = loaded_step != lod;
-            }
-            if needs_request {
-                let _ = tx_req.send(WorkerMsg::Request {
-                    coord: IVec3::new(coord.0, coord.1, coord.2),
-                    step,
-                    mode,
-                });
-                requested.insert(key, lod);
-                budget -= 1;
-                if requested.len() >= max_inflight {
-                    return;
+                let mode = if dist <= lod_near_radius {
+                    MeshMode::Full
+                } else {
+                    MeshMode::SurfaceSides
+                };
+                let step = if mode == MeshMode::Full { 1 } else { lod_step(dist) };
+                let lod = pack_lod(mode, step);
+                let key = coord;
+                let mut needs_request = true;
+                if let Some(&req_step) = requested.get(&key) {
+                    needs_request = req_step != lod;
+                } else if let Some(&loaded_step) = loaded.get(&key) {
+                    needs_request = loaded_step != lod;
+                }
+                if needs_request {
+                    let _ = tx_req.send(WorkerMsg::Request {
+                        coord: IVec3::new(coord.0, coord.1, coord.2),
+                        step,
+                        mode,
+                        is_super: false,
+                        super_size: 1,
+                    });
+                    requested.insert(key, lod);
+                    budget -= 1;
+                    if requested.len() + requested_super.len() >= max_inflight {
+                        return;
+                    }
                 }
             }
         }
@@ -861,6 +942,22 @@ fn stream_tick(
         gpu.remove_chunk(IVec3::new(coord.0, coord.1, coord.2));
         loaded.remove(&coord);
         requested.remove(&coord);
+    }
+
+    let to_remove_super: Vec<(i32, i32, i32)> = loaded_super
+        .keys()
+        .filter(|(x, y, z)| {
+            let dx = x - current_chunk.x;
+            let _dy = y - current_chunk.y;
+            let dz = z - current_chunk.z;
+            dx.abs() > render_radius || dz.abs() > render_radius
+        })
+        .cloned()
+        .collect();
+    for coord in to_remove_super {
+        gpu.remove_super_chunk(IVec3::new(coord.0, coord.1, coord.2));
+        loaded_super.remove(&coord);
+        requested_super.remove(&coord);
     }
 }
 
