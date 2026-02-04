@@ -1,9 +1,9 @@
+use glam::Vec3;
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use glam::Vec3;
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
@@ -18,14 +18,14 @@ mod player;
 mod render;
 mod world;
 
-use render::{CubeStyle, TextureAtlas};
+use glam::IVec3;
 use player::{Camera, PlayerConfig, PlayerInput, PlayerState, update_player};
 use render::Gpu;
+use render::{CubeStyle, TextureAtlas};
 use world::CHUNK_SIZE;
-use glam::IVec3;
+use world::blocks::{DEFAULT_TILES_X, default_blocks};
+use world::mesher::{MeshData, MeshMode, generate_chunk_mesh};
 use world::worldgen::WorldGen;
-use world::mesher::{generate_chunk_mesh, MeshData, MeshMode};
-use world::blocks::{default_blocks, DEFAULT_TILES_X};
 
 enum WorkerMsg {
     Request {
@@ -159,10 +159,10 @@ fn main() {
 
     let base_render_radius = 256;
     let max_render_radius = 256;
-    let base_draw_radius = 128;
+    let base_draw_radius = 256;
     let lod_near_radius = 16;
     let lod_mid_radius = 64;
-    let request_budget = 96;
+    let request_budget = 192;
     let max_inflight = 2048usize;
     let surface_depth_chunks = 8;
     let initial_burst_radius = 4;
@@ -171,6 +171,7 @@ fn main() {
     let mut requested: HashMap<(i32, i32, i32), i32> = HashMap::new();
     let mut ring_r: i32 = 0;
     let mut ring_i: i32 = 0;
+    let mut emergency_budget: i32 = 16;
 
     let _ = event_loop.run(move |event, elwt| match event {
         Event::AboutToWait => {
@@ -223,6 +224,7 @@ fn main() {
                         draw_radius,
                         lod_near_radius,
                         lod_mid_radius,
+                        &mut emergency_budget,
                     );
                     gpu.update_visible(&camera, draw_radius);
                     tps_ticks += 1;
@@ -284,7 +286,9 @@ fn main() {
                     );
                     debug_dump = false;
                 }
-                gpu.window().request_redraw();
+                if !pause_render {
+                    gpu.window().request_redraw();
+                }
                 next_tick = now + delay;
             }
         }
@@ -582,6 +586,7 @@ fn stream_tick(
     draw_radius: i32,
     lod_near_radius: i32,
     lod_mid_radius: i32,
+    emergency_budget: &mut i32,
 ) {
     let new_chunk = chunk_coord_from_pos(player_pos);
     if new_chunk != *current_chunk {
@@ -589,6 +594,7 @@ fn stream_tick(
         *ring_r = 0;
         *ring_i = 0;
         requested.clear();
+        *emergency_budget = 16;
     }
 
     let dynamic_radius = ((player_pos.y / CHUNK_SIZE as f32).max(0.0) as i32) * 2;
@@ -607,10 +613,17 @@ fn stream_tick(
 
     while let Ok(mesh) = rx_res.try_recv() {
         let k = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
-        gpu.upsert_chunk(mesh.coord, mesh.center, mesh.radius, &mesh.vertices, &mesh.indices);
+        gpu.upsert_chunk(
+            mesh.coord,
+            mesh.center,
+            mesh.radius,
+            &mesh.vertices,
+            &mesh.indices,
+        );
         loaded.insert(k, pack_lod(mesh.mode, mesh.step));
         requested.remove(&k);
     }
+    gpu.rebuild_dirty_superchunks(player_pos, 8);
 
     if requested.len() >= max_inflight {
         return;
@@ -647,6 +660,49 @@ fn stream_tick(
                 }
             }
         }
+    }
+
+    if *emergency_budget > 0 {
+        let mut count = *emergency_budget;
+        'emergency: for dz in -1..=1 {
+            for dx in -1..=1 {
+                if count <= 0 || requested.len() >= max_inflight {
+                    break 'emergency;
+                }
+                let cx = current_chunk.x + dx;
+                let cz = current_chunk.z + dz;
+                let surface_y = max_height_in_chunk(world_gen, cx, cz);
+                let surface_chunk_y = world_y_to_chunk_y(surface_y);
+                let y_start = surface_chunk_y - surface_depth_chunks;
+                let y_end = surface_chunk_y + 1;
+                for dy in y_start..=y_end {
+                    if count <= 0 || requested.len() >= max_inflight {
+                        break 'emergency;
+                    }
+                    let coord = (cx, dy, cz);
+                    let step = 1;
+                    let mode = MeshMode::Full;
+                    let lod = pack_lod(mode, step);
+                    let key = coord;
+                    let mut needs_request = true;
+                    if let Some(&req_step) = requested.get(&key) {
+                        needs_request = req_step != lod;
+                    } else if let Some(&loaded_step) = loaded.get(&key) {
+                        needs_request = loaded_step != lod;
+                    }
+                    if needs_request {
+                        let _ = tx_req.send(WorkerMsg::Request {
+                            coord: IVec3::new(coord.0, coord.1, coord.2),
+                            step,
+                            mode,
+                        });
+                        requested.insert(key, lod);
+                        count -= 1;
+                    }
+                }
+            }
+        }
+        *emergency_budget = count;
     }
 
     for dz in -initial_burst_radius..=initial_burst_radius {
@@ -717,11 +773,7 @@ fn stream_tick(
             if budget <= 0 {
                 break;
             }
-            let coord = (
-                cx,
-                dy,
-                cz,
-            );
+            let coord = (cx, dy, cz);
             let dist = distance_2d(*current_chunk, coord);
             if dist > render_radius {
                 continue;
