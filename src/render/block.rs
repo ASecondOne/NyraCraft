@@ -8,6 +8,7 @@ pub struct BlockTexture {
     pub tiles: [u32; FACE_COUNT],
     pub colors: [ColorThing; FACE_COUNT],
     pub rotations: [u32; FACE_COUNT],
+    pub transparent_mode: [u32; FACE_COUNT],
 }
 
 #[allow(dead_code)]
@@ -17,6 +18,7 @@ impl BlockTexture {
             tiles: [tile; FACE_COUNT],
             colors: [color; FACE_COUNT],
             rotations: [0; FACE_COUNT],
+            transparent_mode: [0; FACE_COUNT],
         }
     }
 
@@ -30,6 +32,7 @@ impl BlockTexture {
             tiles: [side, side, top, bottom, side, side],
             colors: [color; FACE_COUNT],
             rotations: [0; FACE_COUNT],
+            transparent_mode: [0; FACE_COUNT],
         }
     }
 
@@ -49,8 +52,9 @@ impl BlockTexture {
                 .unwrap(),
             tiles: self.tiles,
             rotations: self.rotations,
+            transparent_mode: self.transparent_mode,
             _pad0: [0; 2],
-            _pad1: [0; 2],
+            _pad1: [0; 4],
         }
     }
 }
@@ -61,6 +65,7 @@ pub struct BlockTextureRaw {
     pub colors: [[f32; 4]; FACE_COUNT],
     pub tiles: [u32; FACE_COUNT],
     pub rotations: [u32; FACE_COUNT],
+    pub transparent_mode: [u32; FACE_COUNT],
     pub _pad0: [u32; 2],
-    pub _pad1: [u32; 2],
+    pub _pad1: [u32; 4],
 }

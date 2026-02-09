@@ -3,6 +3,7 @@ use glam::{IVec3, Vec3};
 use crate::render::block::BlockTexture;
 use crate::render::mesh::ChunkVertex;
 use crate::world::CHUNK_SIZE;
+use crate::world::blocks::{BLOCK_LEAVES, BLOCK_LOG};
 use crate::world::worldgen::WorldGen;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +73,9 @@ pub fn generate_chunk_mesh(
                         oz += 1;
                     }
                     if max_h >= chunk_min_y && max_h <= chunk_max_y {
-                        let block_id = worldgen.block_id_for_height(max_h, max_h);
+                        let wx = origin.x + cx * cell - half;
+                        let wz = origin.z + cz * cell - half;
+                        let block_id = worldgen.block_id_at(wx, max_h, wz, max_h);
                         if block_id >= 0 {
                             let block = &blocks[block_id as usize];
                             let wx = origin.x + cx * cell - half;
@@ -118,13 +121,14 @@ pub fn generate_chunk_mesh(
         let mut cells = vec![-1_i32; grid_usize * grid_usize * grid_usize];
         let block_count = blocks.len();
 
+        let mut counts = vec![0_i32; block_count];
         let mut cz = 0;
         while cz < grid {
             let mut cy = 0;
             while cy < grid {
                 let mut cx = 0;
                 while cx < grid {
-                    let mut counts = vec![0_i32; block_count];
+                    counts.fill(0);
                     let mut oz = 0;
                     while oz < cell {
                         let mut oy = 0;
@@ -142,10 +146,10 @@ pub fn generate_chunk_mesh(
                                     .height_at_world(wx, wz)
                                     .unwrap_or_else(|| worldgen.height_at(wx, wz));
                                 if wy <= height {
-                                    let block_id = worldgen.block_id_for_height(wy, height);
-                                    if block_id >= 0 {
-                                        counts[block_id as usize] += 1;
-                                    }
+                                let block_id = worldgen.block_id_at(wx, wy, wz, height);
+                                if block_id >= 0 {
+                                    counts[block_id as usize] += 1;
+                                }
                                 }
                                 ox += 1;
                             }
@@ -359,7 +363,7 @@ pub fn generate_chunk_mesh(
                     y += step;
                     continue;
                 }
-                let block_id = worldgen.block_id_for_height(y, height);
+                let block_id = worldgen.block_id_at(wx, y, wz, height);
                 if block_id >= 0 {
                     let block = &blocks[block_id as usize];
                     let wy = y;
@@ -494,7 +498,7 @@ pub fn generate_chunk_mesh(
 
             if height >= chunk_min_y && height <= chunk_max_y {
                 if !worldgen.is_cave(wx, height, wz, height) {
-                    let block_id = worldgen.block_id_for_height(height, height);
+                    let block_id = worldgen.block_id_at(wx, height, wz, height);
                     if block_id >= 0 {
                         let block = &blocks[block_id as usize];
                         let wy = height;
@@ -629,6 +633,298 @@ pub fn generate_chunk_mesh(
         z += step;
     }
 
+    let mut z = 0;
+    while z < size {
+        let mut x = 0;
+        while x < size {
+            let wx = origin.x + x - half;
+            let wz = origin.z + z - half;
+            let height = height_cache
+                .height_at_world(wx, wz)
+                .unwrap_or_else(|| worldgen.height_at(wx, wz));
+            if let Some(tree) = worldgen.tree_at(wx, wz, height) {
+                let log_block = &blocks[BLOCK_LOG];
+                let leaves_block = &blocks[BLOCK_LEAVES];
+                let trunk_end = tree.base_y + tree.trunk_h;
+                let top = trunk_end;
+                let r = tree.leaf_r;
+                let tree_contains = |x: i32, y: i32, z: i32| -> bool {
+                    if x == wx && z == wz && y >= tree.base_y && y < trunk_end {
+                        return true;
+                    }
+                    let dy = y - top;
+                    if dy < -r || dy > r {
+                        return false;
+                    }
+                    let dx = x - wx;
+                    let dz = z - wz;
+                    let dist2 = dx * dx + dy * dy + dz * dz;
+                    if dist2 <= r * r {
+                        if dx == 0 && dz == 0 && y < trunk_end {
+                            return false;
+                        }
+                        return true;
+                    }
+                    false
+                };
+                let mut ty = tree.base_y;
+                while ty < trunk_end {
+                    if ty >= chunk_min_y && ty <= chunk_max_y {
+                        let wy = ty;
+                        let n = IVec3::new(wx + 1, wy, wz);
+                        if !tree_contains(n.x, n.y, n.z)
+                            && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                        {
+                            emit_face(
+                                &mut vertices,
+                                &mut indices,
+                                log_block,
+                                0,
+                                wx,
+                                wy,
+                                wz,
+                                1,
+                                1,
+                                1,
+                                use_texture,
+                            );
+                        }
+                        let n = IVec3::new(wx - 1, wy, wz);
+                        if !tree_contains(n.x, n.y, n.z)
+                            && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                        {
+                            emit_face(
+                                &mut vertices,
+                                &mut indices,
+                                log_block,
+                                1,
+                                wx,
+                                wy,
+                                wz,
+                                1,
+                                1,
+                                1,
+                                use_texture,
+                            );
+                        }
+                        let n = IVec3::new(wx, wy + 1, wz);
+                        if !tree_contains(n.x, n.y, n.z)
+                            && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                        {
+                            emit_face(
+                                &mut vertices,
+                                &mut indices,
+                                log_block,
+                                2,
+                                wx,
+                                wy,
+                                wz,
+                                1,
+                                1,
+                                1,
+                                use_texture,
+                            );
+                        }
+                        let n = IVec3::new(wx, wy - 1, wz);
+                        if !tree_contains(n.x, n.y, n.z)
+                            && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                        {
+                            emit_face(
+                                &mut vertices,
+                                &mut indices,
+                                log_block,
+                                3,
+                                wx,
+                                wy,
+                                wz,
+                                1,
+                                1,
+                                1,
+                                use_texture,
+                            );
+                        }
+                        let n = IVec3::new(wx, wy, wz + 1);
+                        if !tree_contains(n.x, n.y, n.z)
+                            && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                        {
+                            emit_face(
+                                &mut vertices,
+                                &mut indices,
+                                log_block,
+                                4,
+                                wx,
+                                wy,
+                                wz,
+                                1,
+                                1,
+                                1,
+                                use_texture,
+                            );
+                        }
+                        let n = IVec3::new(wx, wy, wz - 1);
+                        if !tree_contains(n.x, n.y, n.z)
+                            && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                        {
+                            emit_face(
+                                &mut vertices,
+                                &mut indices,
+                                log_block,
+                                5,
+                                wx,
+                                wy,
+                                wz,
+                                1,
+                                1,
+                                1,
+                                use_texture,
+                            );
+                        }
+                    }
+                    ty += 1;
+                }
+
+                let mut dy = -r;
+                while dy <= r {
+                    let mut dz = -r;
+                    while dz <= r {
+                        let mut dx = -r;
+                        while dx <= r {
+                            if dx == 0 && dz == 0 && dy < 0 {
+                                dx += 1;
+                                continue;
+                            }
+                            let dist2 = dx * dx + dy * dy + dz * dz;
+                            if dist2 <= r * r {
+                                let lx = wx + dx;
+                                let ly = top + dy;
+                                let lz = wz + dz;
+                                if ly >= chunk_min_y && ly <= chunk_max_y {
+                                    if lx == wx && lz == wz && ly >= tree.base_y && ly < trunk_end {
+                                        dx += 1;
+                                        continue;
+                                    }
+                                    let n = IVec3::new(lx + 1, ly, lz);
+                                    if !tree_contains(n.x, n.y, n.z)
+                                        && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                                    {
+                                        emit_face(
+                                            &mut vertices,
+                                            &mut indices,
+                                            leaves_block,
+                                            0,
+                                            lx,
+                                            ly,
+                                            lz,
+                                            1,
+                                            1,
+                                            1,
+                                            use_texture,
+                                        );
+                                    }
+                                    let n = IVec3::new(lx - 1, ly, lz);
+                                    if !tree_contains(n.x, n.y, n.z)
+                                        && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                                    {
+                                        emit_face(
+                                            &mut vertices,
+                                            &mut indices,
+                                            leaves_block,
+                                            1,
+                                            lx,
+                                            ly,
+                                            lz,
+                                            1,
+                                            1,
+                                            1,
+                                            use_texture,
+                                        );
+                                    }
+                                    let n = IVec3::new(lx, ly + 1, lz);
+                                    if !tree_contains(n.x, n.y, n.z)
+                                        && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                                    {
+                                        emit_face(
+                                            &mut vertices,
+                                            &mut indices,
+                                            leaves_block,
+                                            2,
+                                            lx,
+                                            ly,
+                                            lz,
+                                            1,
+                                            1,
+                                            1,
+                                            use_texture,
+                                        );
+                                    }
+                                    let n = IVec3::new(lx, ly - 1, lz);
+                                    if !tree_contains(n.x, n.y, n.z)
+                                        && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                                    {
+                                        emit_face(
+                                            &mut vertices,
+                                            &mut indices,
+                                            leaves_block,
+                                            3,
+                                            lx,
+                                            ly,
+                                            lz,
+                                            1,
+                                            1,
+                                            1,
+                                            use_texture,
+                                        );
+                                    }
+                                    let n = IVec3::new(lx, ly, lz + 1);
+                                    if !tree_contains(n.x, n.y, n.z)
+                                        && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                                    {
+                                        emit_face(
+                                            &mut vertices,
+                                            &mut indices,
+                                            leaves_block,
+                                            4,
+                                            lx,
+                                            ly,
+                                            lz,
+                                            1,
+                                            1,
+                                            1,
+                                            use_texture,
+                                        );
+                                    }
+                                    let n = IVec3::new(lx, ly, lz - 1);
+                                    if !tree_contains(n.x, n.y, n.z)
+                                        && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                                    {
+                                        emit_face(
+                                            &mut vertices,
+                                            &mut indices,
+                                            leaves_block,
+                                            5,
+                                            lx,
+                                            ly,
+                                            lz,
+                                            1,
+                                            1,
+                                            1,
+                                            use_texture,
+                                        );
+                                    }
+                                }
+                            }
+                            dx += 1;
+                        }
+                        dz += 1;
+                    }
+                    dy += 1;
+                }
+            }
+            x += 1;
+        }
+        z += 1;
+    }
+
     let center = Vec3::new(origin.x as f32, origin.y as f32, origin.z as f32);
     let radius = chunk_radius();
 
@@ -660,6 +956,7 @@ fn emit_face(
     let color = block.colors[face as usize].as_f32_rgba();
     let tile = block.tiles[face as usize];
     let rotation = block.rotations[face as usize];
+    let transparent_mode = block.transparent_mode[face as usize];
 
     let fx = sx as f32;
     let fy = sy as f32;
@@ -721,7 +1018,7 @@ fn emit_face(
         face,
         rotation,
         use_texture,
-        _pad0: 0,
+        transparent_mode,
         color,
     });
     vertices.push(ChunkVertex {
@@ -731,7 +1028,7 @@ fn emit_face(
         face,
         rotation,
         use_texture,
-        _pad0: 0,
+        transparent_mode,
         color,
     });
     vertices.push(ChunkVertex {
@@ -741,7 +1038,7 @@ fn emit_face(
         face,
         rotation,
         use_texture,
-        _pad0: 0,
+        transparent_mode,
         color,
     });
     vertices.push(ChunkVertex {
@@ -751,7 +1048,7 @@ fn emit_face(
         face,
         rotation,
         use_texture,
-        _pad0: 0,
+        transparent_mode,
         color,
     });
 

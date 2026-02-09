@@ -25,7 +25,8 @@ struct VertexInput {
     @location(3) face: u32,
     @location(4) rotation: u32,
     @location(5) use_texture: u32,
-    @location(6) color: vec4<f32>,
+    @location(6) transparent_mode: u32,
+    @location(7) color: vec4<f32>,
 };
 
 struct VertexOutput {
@@ -35,7 +36,8 @@ struct VertexOutput {
     @location(2) face: u32,
     @location(3) rotation: u32,
     @location(4) use_texture: u32,
-    @location(5) color: vec4<f32>,
+    @location(5) transparent_mode: u32,
+    @location(6) color: vec4<f32>,
 };
 
 @vertex
@@ -47,6 +49,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     out.face = input.face;
     out.rotation = input.rotation;
     out.use_texture = input.use_texture;
+    out.transparent_mode = input.transparent_mode;
     out.color = input.color;
     return out;
 }
@@ -82,7 +85,25 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let uv_base = vec2<f32>(f32(tile_x), f32(tile_y)) * uniforms.tile_uv_size;
         let uv = uv_base + fract(uv_rot) * uniforms.tile_uv_size;
         let tex = textureSample(atlas_texture, atlas_sampler, uv);
-        color = tex * color;
+        if (input.transparent_mode == 1u) {
+            if (tex.a < 0.05) {
+                discard;
+            }
+            let tinted_rgb = tex.rgb * color.rgb;
+            let tint_mix = clamp(tex.a, 0.0, 1.0);
+            color = vec4<f32>(
+                mix(tex.rgb, tinted_rgb, tint_mix),
+                tex.a * color.a,
+            );
+        } else if (input.transparent_mode == 2u) {
+            // RGB atlas fallback: treat near-white as transparent background.
+            if (tex.r > 0.92 && tex.g > 0.92 && tex.b > 0.92) {
+                discard;
+            }
+            color = vec4<f32>(tex.rgb * color.rgb, color.a);
+        } else {
+            color = tex * color;
+        }
     }
     return color;
 }

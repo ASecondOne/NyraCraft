@@ -9,7 +9,7 @@ pub struct ChunkVertex {
     pub face: u32,
     pub rotation: u32,
     pub use_texture: u32,
-    pub _pad0: u32,
+    pub transparent_mode: u32,
     pub color: [f32; 4],
 }
 
@@ -55,8 +55,14 @@ impl ChunkVertex {
                 },
                 wgpu::VertexAttribute {
                     offset: mem::size_of::<[f32; 5]>() as wgpu::BufferAddress
-                        + 5 * mem::size_of::<u32>() as wgpu::BufferAddress,
+                        + 4 * mem::size_of::<u32>() as wgpu::BufferAddress,
                     shader_location: 6,
+                    format: wgpu::VertexFormat::Uint32,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 5]>() as wgpu::BufferAddress
+                        + 5 * mem::size_of::<u32>() as wgpu::BufferAddress,
+                    shader_location: 7,
                     format: wgpu::VertexFormat::Float32x4,
                 },
             ],

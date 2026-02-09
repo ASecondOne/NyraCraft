@@ -1,5 +1,6 @@
 use glam::Vec3;
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -22,6 +23,7 @@ use glam::IVec3;
 use player::{Camera, PlayerConfig, PlayerInput, PlayerState, update_player};
 use render::Gpu;
 use render::{CubeStyle, TextureAtlas};
+use render::GpuStats;
 use world::CHUNK_SIZE;
 use world::blocks::{DEFAULT_TILES_X, default_blocks};
 use world::mesher::{MeshData, MeshMode, generate_chunk_mesh};
@@ -53,9 +55,7 @@ fn main() {
     let blocks = default_blocks(tiles_x);
 
     let seed: u32 = rand::random();
-    let world_gen = WorldGen::new(seed)
-        .with_height(0, 12.0, 0.04)
-        .with_mountains(36.0, 0.015);
+    let world_gen = WorldGen::new(seed);
     eprintln!(
         "World seed: {}, world_id: {}",
         world_gen.seed, world_gen.world_id
@@ -70,6 +70,8 @@ fn main() {
     let mut next_tick = Instant::now() + delay;
     let mut last_update = Instant::now();
     let mut last_title_update = Instant::now();
+    let mut last_stats_print = Instant::now();
+    let start_time = Instant::now();
     let mut fps_frames: u32 = 0;
     let mut fps_last = Instant::now();
     let mut fps_value: u32 = 0;
@@ -77,7 +79,7 @@ fn main() {
     let mut tps_last = Instant::now();
     let mut tps_value: u32 = 0;
 
-    let spawn_height = world_gen.height_at(0, 0) + 2;
+    let spawn_height = (world_gen.height_at(0, 0) + 4).max(4);
     let mut player = PlayerState {
         position: Vec3::new(0.0, spawn_height as f32, 0.0),
         velocity: Vec3::ZERO,
@@ -120,6 +122,7 @@ fn main() {
     let mut debug_dump = false;
     let mut fly_mode = false;
     let mut force_reload = false;
+    let mut f1_down = false;
 
     let is_solid = {
         let worldgen = world_gen.clone();
@@ -201,7 +204,8 @@ fn main() {
                         continue;
                     }
                     let height_chunks = (player.position.y / CHUNK_SIZE as f32).max(0.0) as i32;
-                    let render_radius = (base_render_radius + height_chunks * 2).min(max_render_radius);
+                    let render_radius =
+                        (base_render_radius + height_chunks * 2).min(max_render_radius);
                     let draw_radius = (base_draw_radius + height_chunks).min(render_radius);
                     stream_tick(
                         &mut gpu,
@@ -243,9 +247,6 @@ fn main() {
                 }
 
                 if last_title_update.elapsed() >= Duration::from_millis(250) {
-                    let height_chunks = (player.position.y / CHUNK_SIZE as f32).max(0.0) as i32;
-                    let render_radius = (base_render_radius + height_chunks * 2).min(max_render_radius);
-                    let draw_radius = (base_draw_radius + height_chunks).min(render_radius);
                     if debug_ui {
                         let title = format!(
                             "loaded:{} requested:{} tps:{} fps:{} paused_stream:{} paused_render:{}",
@@ -257,23 +258,29 @@ fn main() {
                             pause_render
                         );
                         gpu.window().set_title(&title);
-                        eprintln!(
-                            "loaded={} requested={} tps={} fps={} chunk=({}, {}, {}) radius={} paused_stream={} paused_render={}",
-                            loaded.len(),
-                            requested.len(),
-                            tps_value,
-                            fps_value,
-                            current_chunk.x,
-                            current_chunk.y,
-                            current_chunk.z,
-                            draw_radius,
-                            pause_stream,
-                            pause_render
-                        );
                     } else {
                         gpu.window().set_title("wgpu_try");
                     }
                     last_title_update = Instant::now();
+                }
+
+                if debug_ui && last_stats_print.elapsed() >= Duration::from_millis(500) {
+                    let stats = gpu.stats();
+                    print_stats(
+                        &stats,
+                        &loaded,
+                        &requested,
+                        tps_value,
+                        fps_value,
+                        current_chunk,
+                        player.position,
+                        start_time.elapsed(),
+                        pause_stream,
+                        pause_render,
+                        base_render_radius,
+                        base_draw_radius,
+                    );
+                    last_stats_print = Instant::now();
                 }
 
                 if debug_dump {
@@ -300,6 +307,8 @@ fn main() {
                 let height_chunks = (player.position.y / CHUNK_SIZE as f32).max(0.0) as i32;
                 let render_radius = (base_render_radius + height_chunks * 2).min(max_render_radius);
                 let draw_radius = (base_draw_radius + height_chunks).min(render_radius);
+                let selection = pick_block(camera.position, camera.forward, &world_gen, 8.0);
+                gpu.set_selection(selection);
                 gpu.render(&camera, debug_faces, debug_chunks, draw_radius);
             }
         }
@@ -317,6 +326,32 @@ fn main() {
             ..
         } => {
             let pressed = matches!(state, ElementState::Pressed);
+            if key == KeyCode::F1 {
+                f1_down = pressed;
+                return;
+            }
+            if pressed && f1_down {
+                match key {
+                    KeyCode::KeyF => debug_faces = !debug_faces,
+                    KeyCode::KeyW => debug_chunks = !debug_chunks,
+                    KeyCode::KeyP => pause_stream = !pause_stream,
+                    KeyCode::KeyV => pause_render = !pause_render,
+                    KeyCode::KeyD => debug_ui = !debug_ui,
+                    KeyCode::KeyG => debug_dump = true,
+                    KeyCode::KeyR => force_reload = true,
+                    KeyCode::KeyM => fly_mode = !fly_mode,
+                    KeyCode::KeyX => {
+                        let window = gpu.window();
+                        if window.fullscreen().is_some() {
+                            window.set_fullscreen(None);
+                        } else {
+                            window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
             match key {
                 KeyCode::KeyW => input.move_forward = pressed,
                 KeyCode::KeyS => input.move_back = pressed,
@@ -332,34 +367,6 @@ fn main() {
                 KeyCode::ShiftLeft | KeyCode::ShiftRight => {
                     if fly_mode {
                         input.move_down = pressed;
-                    }
-                }
-                KeyCode::F1 if pressed => debug_faces = !debug_faces,
-                KeyCode::F2 if pressed => {
-                    pause_stream = !pause_stream;
-                }
-                KeyCode::F3 if pressed => fly_mode = !fly_mode,
-                KeyCode::F5 if pressed => {
-                    force_reload = true;
-                }
-                KeyCode::F9 if pressed => {
-                    pause_render = !pause_render;
-                }
-                KeyCode::F6 if pressed => {
-                    debug_ui = !debug_ui;
-                }
-                KeyCode::F7 if pressed => {
-                    debug_chunks = !debug_chunks;
-                }
-                KeyCode::F8 if pressed => {
-                    debug_dump = true;
-                }
-                KeyCode::F11 if pressed => {
-                    let window = gpu.window();
-                    if window.fullscreen().is_some() {
-                        window.set_fullscreen(None);
-                    } else {
-                        window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
                     }
                 }
                 _ => {}
@@ -490,6 +497,31 @@ fn world_y_to_chunk_y(y: i32) -> i32 {
     ((y + half) as f32 / CHUNK_SIZE as f32).floor() as i32
 }
 
+fn pick_block(
+    camera_pos: Vec3,
+    forward: Vec3,
+    world_gen: &WorldGen,
+    max_dist: f32,
+) -> Option<IVec3> {
+    let dir = forward.normalize();
+    let step = 0.1f32;
+    let mut t = 0.0f32;
+    let mut last_block = IVec3::new(i32::MIN, i32::MIN, i32::MIN);
+    while t <= max_dist {
+        let pos = camera_pos + dir * t;
+        let block = IVec3::new(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
+        if block != last_block {
+            let height = world_gen.height_at(block.x, block.z);
+            if block.y <= height {
+                return Some(block);
+            }
+            last_block = block;
+        }
+        t += step;
+    }
+    None
+}
+
 fn lod_div(dist: i32, base: i32) -> i32 {
     if dist <= base {
         3
@@ -565,6 +597,54 @@ fn dump_surface_bands(
     eprintln!("--- end dump ---");
 }
 
+fn print_stats(
+    stats: &GpuStats,
+    loaded: &HashMap<(i32, i32, i32), i32>,
+    requested: &HashMap<(i32, i32, i32), i32>,
+    tps: u32,
+    fps: u32,
+    current_chunk: IVec3,
+    player_pos: Vec3,
+    world_time: Duration,
+    pause_stream: bool,
+    pause_render: bool,
+    base_render_radius: i32,
+    base_draw_radius: i32,
+) {
+    let triangles = stats.total_indices / 3;
+    let seconds = world_time.as_secs_f32();
+    print!("\x1B[2J\x1B[H");
+    println!("F3 STATS (refresh 0.5s)");
+    println!(
+        "time: {:>8.2}s | tps: {:>3} | fps: {:>3} | paused_stream: {} | paused_render: {}",
+        seconds, tps, fps, pause_stream, pause_render
+    );
+    println!(
+        "player: ({:>7.2}, {:>7.2}, {:>7.2}) | chunk: ({:>4}, {:>4}, {:>4})",
+        player_pos.x, player_pos.y, player_pos.z, current_chunk.x, current_chunk.y, current_chunk.z
+    );
+    println!(
+        "loaded: {:>6} | requested: {:>6} | base_render_radius: {:>4} | base_draw_radius: {:>4}",
+        loaded.len(),
+        requested.len(),
+        base_render_radius,
+        base_draw_radius
+    );
+    println!(
+        "gpu: chunks={} super_chunks={} visible_supers={} dirty_supers={}",
+        stats.chunks, stats.super_chunks, stats.visible_supers, stats.dirty_supers
+    );
+    println!(
+        "gpu: pending_updates={} pending_queue={} total_triangles={} total_index_count={}",
+        stats.pending_updates, stats.pending_queue, triangles, stats.total_indices
+    );
+    println!(
+        "gpu: total_vertex_capacity={}",
+        stats.total_vertices_capacity
+    );
+    let _ = io::stdout().flush();
+}
+
 fn stream_tick(
     gpu: &mut Gpu,
     player_pos: Vec3,
@@ -588,6 +668,17 @@ fn stream_tick(
     lod_mid_radius: i32,
     emergency_budget: &mut i32,
 ) {
+    let mut height_cache: HashMap<(i32, i32), i32> = HashMap::new();
+    let mut max_height_cached = |cx: i32, cz: i32| -> i32 {
+        if let Some(h) = height_cache.get(&(cx, cz)) {
+            *h
+        } else {
+            let h = max_height_in_chunk(world_gen, cx, cz);
+            height_cache.insert((cx, cz), h);
+            h
+        }
+    };
+
     let new_chunk = chunk_coord_from_pos(player_pos);
     if new_chunk != *current_chunk {
         *current_chunk = new_chunk;
@@ -611,19 +702,31 @@ fn stream_tick(
         *force_reload = false;
     }
 
-    while let Ok(mesh) = rx_res.try_recv() {
+    let max_apply_per_tick = 8;
+    for _ in 0..max_apply_per_tick {
+        let Ok(mesh) = rx_res.try_recv() else { break; };
         let k = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
+        let MeshData {
+            coord,
+            step,
+            mode,
+            center,
+            radius,
+            vertices,
+            indices,
+        } = mesh;
         gpu.upsert_chunk(
-            mesh.coord,
-            mesh.center,
-            mesh.radius,
-            &mesh.vertices,
-            &mesh.indices,
+            coord,
+            center,
+            radius,
+            vertices,
+            indices,
         );
-        loaded.insert(k, pack_lod(mesh.mode, mesh.step));
+        loaded.insert(k, pack_lod(mode, step));
         requested.remove(&k);
     }
-    gpu.rebuild_dirty_superchunks(player_pos, 8);
+    let max_rebuilds_per_tick = 2;
+    gpu.rebuild_dirty_superchunks(player_pos, max_rebuilds_per_tick);
 
     if requested.len() >= max_inflight {
         return;
@@ -634,7 +737,7 @@ fn stream_tick(
         for dx in 0..=1 {
             let cx = current_chunk.x + dx;
             let cz = current_chunk.z + dz;
-            let surface_y = max_height_in_chunk(world_gen, cx, cz);
+            let surface_y = max_height_cached(cx, cz);
             let surface_chunk_y = world_y_to_chunk_y(surface_y);
             let y_start = surface_chunk_y - surface_depth_chunks;
             let y_end = surface_chunk_y + 1;
@@ -671,7 +774,7 @@ fn stream_tick(
                 }
                 let cx = current_chunk.x + dx;
                 let cz = current_chunk.z + dz;
-                let surface_y = max_height_in_chunk(world_gen, cx, cz);
+                let surface_y = max_height_cached(cx, cz);
                 let surface_chunk_y = world_y_to_chunk_y(surface_y);
                 let y_start = surface_chunk_y - surface_depth_chunks;
                 let y_end = surface_chunk_y + 1;
@@ -712,7 +815,7 @@ fn stream_tick(
             }
             let cx = current_chunk.x + dx;
             let cz = current_chunk.z + dz;
-            let surface_y = max_height_in_chunk(world_gen, cx, cz);
+            let surface_y = max_height_cached(cx, cz);
             let surface_chunk_y = world_y_to_chunk_y(surface_y);
             let y_start = surface_chunk_y - surface_depth_chunks;
             let y_end = surface_chunk_y + 1;
@@ -762,7 +865,7 @@ fn stream_tick(
         }
         let cx = current_chunk.x + dx;
         let cz = current_chunk.z + dz;
-        let surface_y = max_height_in_chunk(world_gen, cx, cz);
+        let surface_y = max_height_cached(cx, cz);
         let surface_chunk_y = world_y_to_chunk_y(surface_y);
         let dist_xz = distance_2d(*current_chunk, (cx, surface_chunk_y, cz));
         let depth = depth_for_dist(surface_depth_chunks, dist_xz);
