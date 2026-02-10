@@ -6,7 +6,8 @@ struct Uniforms {
     debug_chunks: u32,
     tile_uv_size: vec2<f32>,
     chunk_size: f32,
-    _pad0: f32,
+    occlusion_cull: u32,
+    camera_pos: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -38,6 +39,7 @@ struct VertexOutput {
     @location(4) use_texture: u32,
     @location(5) transparent_mode: u32,
     @location(6) color: vec4<f32>,
+    @location(7) world_pos: vec3<f32>,
 };
 
 @vertex
@@ -51,6 +53,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     out.use_texture = input.use_texture;
     out.transparent_mode = input.transparent_mode;
     out.color = input.color;
+    out.world_pos = input.position;
     return out;
 }
 
@@ -63,8 +66,26 @@ fn rotate_uv(uv: vec2<f32>, rot: u32) -> vec2<f32> {
     }
 }
 
+fn face_normal(face: u32) -> vec3<f32> {
+    switch(face) {
+        case 0u: { return vec3<f32>(1.0, 0.0, 0.0); }
+        case 1u: { return vec3<f32>(-1.0, 0.0, 0.0); }
+        case 2u: { return vec3<f32>(0.0, 1.0, 0.0); }
+        case 3u: { return vec3<f32>(0.0, -1.0, 0.0); }
+        case 4u: { return vec3<f32>(0.0, 0.0, 1.0); }
+        default: { return vec3<f32>(0.0, 0.0, -1.0); }
+    }
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    if (uniforms.occlusion_cull == 1u) {
+        let view_dir = uniforms.camera_pos.xyz - input.world_pos;
+        if (dot(face_normal(input.face), view_dir) <= 0.0) {
+            discard;
+        }
+    }
+
     var color = input.color;
     if (uniforms.debug_faces == 1u) {
         switch(input.face) {

@@ -19,7 +19,8 @@ struct SceneUniform {
     debug_chunks: u32,
     tile_uv_size: [f32; 2],
     chunk_size: f32,
-    _pad0: f32,
+    occlusion_cull: u32,
+    camera_pos: [f32; 4],
 }
 
 struct SuperChunkGpuMesh {
@@ -161,7 +162,8 @@ impl Gpu {
                 debug_chunks: 0,
                 tile_uv_size,
                 chunk_size: crate::world::CHUNK_SIZE as f32,
-                _pad0: 0.0,
+                occlusion_cull: 0,
+                camera_pos: [0.0, 0.0, 0.0, 0.0],
             };
 
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -379,7 +381,8 @@ impl Gpu {
                 debug_chunks: 0,
                 tile_uv_size: gpu.tile_uv_size,
                 chunk_size: crate::world::CHUNK_SIZE as f32,
-                _pad0: 0.0,
+                occlusion_cull: 0,
+                camera_pos: [camera.position.x, camera.position.y, camera.position.z, 0.0],
             };
 
             gpu.queue
