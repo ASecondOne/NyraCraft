@@ -953,7 +953,7 @@ fn emit_face(
     use_texture: u32,
 ) {
     let base = vertices.len() as u32;
-    let color = block.colors[face as usize].as_f32_rgba();
+    let color = [1.0, 1.0, 1.0, 1.0];
     let tile = block.tiles[face as usize];
     let rotation = block.rotations[face as usize];
     let transparent_mode = block.transparent_mode[face as usize];

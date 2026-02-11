@@ -2,26 +2,25 @@ use crate::player::Camera;
 use crate::render::atlas::TextureAtlas;
 use crate::render::CubeStyle;
 use crate::render::mesh::ChunkVertex;
-use crate::render::texture::{AtlasTexture, create_dummy_texture, load_atlas_texture};
+use crate::render::texture::{AtlasTexture, create_dummy_texture, load_atlas_texture, load_grass_colormap_texture};
 use bytemuck::{Pod, Zeroable};
-use glam::{IVec3, Mat4, Vec3};
+use glam::{IVec3, Mat4, Vec2, Vec3};
 use self_cell::self_cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use wgpu::util::DeviceExt;
 
-#[repr(C, align(16))]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SceneUniform {
     mvp: [[f32; 4]; 4],
-    use_texture: u32,
-    tiles_x: u32,
-    debug_faces: u32,
-    debug_chunks: u32,
-    tile_uv_size: [f32; 2],
-    chunk_size: f32,
-    occlusion_cull: u32,
     camera_pos: [f32; 4],
+    tile_misc: [f32; 4],      // [tile_uv_x, tile_uv_y, chunk_size, colormap_scale]
+    flags0: [u32; 4],         // [use_texture, tiles_x, debug_faces, debug_chunks]
+    flags1: [u32; 4],         // [occlusion_cull, grass_top_tile, grass_side_tile, reserved]
+    colormap_misc: [f32; 4],  // [colormap_strength, reserved, reserved, reserved]
 }
+
+
 
 struct SuperChunkGpuMesh {
     vertex_buffer: wgpu::Buffer,
@@ -95,7 +94,6 @@ pub struct Gpu {
 }
 
 pub struct GpuStats {
-    pub chunks: usize,
     pub super_chunks: usize,
     pub dirty_supers: usize,
     pub visible_supers: usize,
@@ -154,16 +152,15 @@ impl Gpu {
                 create_dummy_texture(&device, &queue)
             };
 
+            let grass_colormap = load_grass_colormap_texture(&device, &queue);
+
             let uniform = SceneUniform {
                 mvp: Mat4::IDENTITY.to_cols_array_2d(),
-                use_texture: style.use_texture as u32,
-                tiles_x,
-                debug_faces: 0,
-                debug_chunks: 0,
-                tile_uv_size,
-                chunk_size: crate::world::CHUNK_SIZE as f32,
-                occlusion_cull: 0,
                 camera_pos: [0.0, 0.0, 0.0, 0.0],
+                tile_misc: [tile_uv_size[0], tile_uv_size[1], crate::world::CHUNK_SIZE as f32, 0.0015],
+                flags0: [style.use_texture as u32, tiles_x, 0, 0],
+                flags1: [0, 2, 3, 0],
+                colormap_misc: [0.72, 0.0, 0.0, 0.0],
             };
 
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -202,6 +199,22 @@ impl Gpu {
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
                     ],
                 });
 
@@ -220,6 +233,14 @@ impl Gpu {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&grass_colormap.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&grass_colormap.sampler),
                     },
                 ],
             });
@@ -375,14 +396,11 @@ impl Gpu {
 
             let uniform = SceneUniform {
                 mvp: mvp.to_cols_array_2d(),
-                use_texture: self.style.use_texture as u32,
-                tiles_x: gpu.tiles_x,
-                debug_faces: debug_faces as u32,
-                debug_chunks: 0,
-                tile_uv_size: gpu.tile_uv_size,
-                chunk_size: crate::world::CHUNK_SIZE as f32,
-                occlusion_cull: 0,
                 camera_pos: [camera.position.x, camera.position.y, camera.position.z, 0.0],
+                tile_misc: [gpu.tile_uv_size[0], gpu.tile_uv_size[1], crate::world::CHUNK_SIZE as f32, 0.0015],
+                flags0: [self.style.use_texture as u32, gpu.tiles_x, debug_faces as u32, 0],
+                flags1: [0, 2, 3, 0],
+                colormap_misc: [0.72, 0.0, 0.0, 0.0],
             };
 
             gpu.queue
@@ -496,7 +514,6 @@ impl Gpu {
                 total_vertices_capacity += chunk.vertex_capacity as u64;
             }
             GpuStats {
-                chunks: gpu.chunks.len(),
                 super_chunks: gpu.super_chunks.len(),
                 dirty_supers: gpu.dirty_supers.len(),
                 visible_supers: gpu.visible_supers.len(),
@@ -598,6 +615,13 @@ impl Gpu {
                 if to_center.length_squared() > draw_radius_sq {
                     continue;
                 }
+
+                // Cheap horizon/underground cull for far terrain columns.
+                let horiz_dist = Vec2::new(to_center.x, to_center.z).length();
+                if horiz_dist > draw_radius * 0.35 && to_center.y < -(chunk.radius * 1.8) {
+                    continue;
+                }
+
                 if !chunk_visible(camera.position, camera.forward, chunk) {
                     continue;
                 }

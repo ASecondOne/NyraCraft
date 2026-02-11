@@ -2,17 +2,17 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Run wgpu_try",
+      "name": "Run NyraCraft",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/target/debug/wgpu_try",
+      "program": "${workspaceFolder}/target/debug/NyraCraft",
       "args": [],
       "stopAtEntry": false,
       "cwd": "${workspaceFolder}",
       "environment": [],
       "externalConsole": false,
       "MIMode": "gdb",
-      "preLaunchTask": "Run wgpu_try"
+      "preLaunchTask": "Run NyraCraft"
     }
   ]
 }

@@ -1,12 +1,10 @@
 struct Uniforms {
     mvp: mat4x4<f32>,
-    use_texture: u32,
-    tiles_x: u32,
-    debug_faces: u32,
-    debug_chunks: u32,
-    tile_uv_size: vec2<f32>,
-    chunk_size: f32,
-    _pad0: f32,
+    camera_pos: vec4<f32>,
+    tile_misc: vec4<f32>,
+    flags0: vec4<u32>,
+    flags1: vec4<u32>,
+    colormap_misc: vec4<f32>,
 };
 
 @group(0) @binding(0)

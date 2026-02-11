@@ -3,6 +3,21 @@
 version = 4
 
 [[package]]
+name = "NyraCraft"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "image",
+ "noise",
+ "pollster",
+ "rand 0.8.5",
+ "self_cell",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "ab_glyph"
 version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2005,21 +2020,6 @@ dependencies = [
  "bitflags 2.10.0",
  "js-sys",
  "web-sys",
-]
-
-[[package]]
-name = "wgpu_try"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "glam",
- "image",
- "noise",
- "pollster",
- "rand 0.8.5",
- "self_cell",
- "wgpu",
- "winit",
 ]
 
 [[package]]
