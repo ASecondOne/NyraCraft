@@ -172,11 +172,23 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let uv = uv_base + fract(uv_rot) * uniforms.tile_misc.xy;
         let tex = textureSample(atlas_texture, atlas_sampler, uv);
         var tex_rgb = tex.rgb;
+        var tex_a = tex.a;
 
         // Apply biome colormap on grass top and grass side (including hanging side overlay).
         let is_grass_top = input.face == 2u && input.tile == uniforms.flags1.y;
         let is_side_face = input.face == 0u || input.face == 1u || input.face == 4u || input.face == 5u;
         let is_grass_side = is_side_face && input.tile == uniforms.flags1.z;
+        if (is_grass_side) {
+            let overlay_tile = uniforms.flags1.w;
+            let overlay_x = overlay_tile % tiles_x;
+            let overlay_y = overlay_tile / tiles_x;
+            let overlay_uv_base = vec2<f32>(f32(overlay_x), f32(overlay_y)) * uniforms.tile_misc.xy;
+            let overlay_uv = overlay_uv_base + fract(uv_rot) * uniforms.tile_misc.xy;
+            let overlay = textureSample(atlas_texture, atlas_sampler, overlay_uv);
+            tex_rgb = mix(tex_rgb, overlay.rgb, overlay.a);
+            tex_a = max(tex_a, overlay.a);
+        }
+
         if (is_grass_top || is_grass_side) {
             let cm_uv = grass_colormap_uv(input.world_pos);
             let cm = textureSample(grass_colormap_texture, grass_colormap_sampler, cm_uv).rgb;
@@ -185,14 +197,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         }
 
         if (input.transparent_mode == 1u) {
-            if (tex.a < 0.05) {
+            if (tex_a < 0.05) {
                 discard;
             }
             let tinted_rgb = tex_rgb * color.rgb;
-            let tint_mix = clamp(tex.a, 0.0, 1.0);
+            let tint_mix = clamp(tex_a, 0.0, 1.0);
             color = vec4<f32>(
                 mix(tex_rgb, tinted_rgb, tint_mix),
-                tex.a * color.a,
+                tex_a * color.a,
             );
         } else if (input.transparent_mode == 2u) {
             // RGB atlas fallback: treat near-white as transparent background.
@@ -201,7 +213,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             }
             color = vec4<f32>(tex_rgb * color.rgb, color.a);
         } else {
-            color = vec4<f32>(tex_rgb, tex.a) * color;
+            color = vec4<f32>(tex_rgb, tex_a) * color;
         }
     }
     return color;

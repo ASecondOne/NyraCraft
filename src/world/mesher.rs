@@ -24,13 +24,18 @@ pub struct MeshData {
     pub indices: Vec<u32>,
 }
 
-pub fn generate_chunk_mesh(
+pub fn generate_chunk_mesh<F>(
     coord: IVec3,
     blocks: &[BlockTexture],
     worldgen: &WorldGen,
+    block_at: &F,
+    edited_y_range: Option<(i32, i32)>,
     step: i32,
     mode: MeshMode,
-) -> MeshData {
+) -> MeshData
+where
+    F: Fn(i32, i32, i32) -> i8,
+{
     let origin = IVec3::new(
         coord.x * CHUNK_SIZE,
         coord.y * CHUNK_SIZE,
@@ -43,7 +48,6 @@ pub fn generate_chunk_mesh(
     let mut indices = Vec::new();
 
     let step = step.max(1);
-    let allow_caves = step == 1 && mode == MeshMode::Full;
     let use_texture = if mode == MeshMode::SurfaceOnly { 0 } else { 1 };
 
     let chunk_min_y = origin.y - half;
@@ -75,7 +79,7 @@ pub fn generate_chunk_mesh(
                     if max_h >= chunk_min_y && max_h <= chunk_max_y {
                         let wx = origin.x + cx * cell - half;
                         let wz = origin.z + cz * cell - half;
-                        let block_id = worldgen.block_id_at(wx, max_h, wz, max_h);
+                        let block_id = block_at(wx, max_h, wz);
                         if block_id >= 0 {
                             let block = &blocks[block_id as usize];
                             let wx = origin.x + cx * cell - half;
@@ -142,14 +146,9 @@ pub fn generate_chunk_mesh(
                                     ox += 1;
                                     continue;
                                 }
-                                let height = height_cache
-                                    .height_at_world(wx, wz)
-                                    .unwrap_or_else(|| worldgen.height_at(wx, wz));
-                                if wy <= height {
-                                let block_id = worldgen.block_id_at(wx, wy, wz, height);
+                                let block_id = block_at(wx, wy, wz);
                                 if block_id >= 0 {
                                     counts[block_id as usize] += 1;
-                                }
                                 }
                                 ox += 1;
                             }
@@ -345,13 +344,19 @@ pub fn generate_chunk_mesh(
             let height = height_cache
                 .height_at_world(wx, wz)
                 .unwrap_or_else(|| worldgen.height_at(wx, wz));
-            if height < chunk_min_y {
+            if height < chunk_min_y && edited_y_range.is_none() {
                 x += step;
                 continue;
             }
 
-            let y_start = chunk_min_y;
-            let y_end = height.min(chunk_max_y);
+            let mut y_start = chunk_min_y;
+            let mut y_end = height.min(chunk_max_y);
+            if let Some((edit_min_y, edit_max_y)) = edited_y_range {
+                y_start = y_start.min(edit_min_y - 1);
+                y_end = y_end.max(edit_max_y + 1);
+            }
+            y_start = y_start.max(chunk_min_y);
+            y_end = y_end.min(chunk_max_y);
             if y_end < y_start {
                 x += step;
                 continue;
@@ -359,11 +364,7 @@ pub fn generate_chunk_mesh(
 
             let mut y = y_start;
             while y <= y_end {
-                if worldgen.is_cave(wx, y, wz, height) {
-                    y += step;
-                    continue;
-                }
-                let block_id = worldgen.block_id_at(wx, y, wz, height);
+                let block_id = block_at(wx, y, wz);
                 if block_id >= 0 {
                     let block = &blocks[block_id as usize];
                     let wy = y;
@@ -372,12 +373,7 @@ pub fn generate_chunk_mesh(
                     let sy = ((y - chunk_min_y) % step) + 1;
                     let sz = (size - z).min(step);
 
-                    if is_air(
-                        IVec3::new(wx + sx, wy, wz),
-                        worldgen,
-                        allow_caves,
-                        Some(&height_cache),
-                    ) {
+                    if is_air(IVec3::new(wx + sx, wy, wz), block_at) {
                         emit_face(
                             &mut vertices,
                             &mut indices,
@@ -392,12 +388,7 @@ pub fn generate_chunk_mesh(
                             use_texture,
                         );
                     }
-                    if is_air(
-                        IVec3::new(wx - 1, wy, wz),
-                        worldgen,
-                        allow_caves,
-                        Some(&height_cache),
-                    ) {
+                    if is_air(IVec3::new(wx - 1, wy, wz), block_at) {
                         emit_face(
                             &mut vertices,
                             &mut indices,
@@ -412,12 +403,7 @@ pub fn generate_chunk_mesh(
                             use_texture,
                         );
                     }
-                    if is_air(
-                        IVec3::new(wx, wy + 1, wz),
-                        worldgen,
-                        allow_caves,
-                        Some(&height_cache),
-                    ) {
+                    if is_air(IVec3::new(wx, wy + 1, wz), block_at) {
                         emit_face(
                             &mut vertices,
                             &mut indices,
@@ -432,12 +418,7 @@ pub fn generate_chunk_mesh(
                             use_texture,
                         );
                     }
-                    if is_air(
-                        IVec3::new(wx, wy - 1, wz),
-                        worldgen,
-                        allow_caves,
-                        Some(&height_cache),
-                    ) {
+                    if is_air(IVec3::new(wx, wy - 1, wz), block_at) {
                         emit_face(
                             &mut vertices,
                             &mut indices,
@@ -452,12 +433,7 @@ pub fn generate_chunk_mesh(
                             use_texture,
                         );
                     }
-                    if is_air(
-                        IVec3::new(wx, wy, wz + sz),
-                        worldgen,
-                        allow_caves,
-                        Some(&height_cache),
-                    ) {
+                    if is_air(IVec3::new(wx, wy, wz + sz), block_at) {
                         emit_face(
                             &mut vertices,
                             &mut indices,
@@ -472,12 +448,7 @@ pub fn generate_chunk_mesh(
                             use_texture,
                         );
                     }
-                    if is_air(
-                        IVec3::new(wx, wy, wz - 1),
-                        worldgen,
-                        allow_caves,
-                        Some(&height_cache),
-                    ) {
+                    if is_air(IVec3::new(wx, wy, wz - 1), block_at) {
                         emit_face(
                             &mut vertices,
                             &mut indices,
@@ -497,20 +468,14 @@ pub fn generate_chunk_mesh(
             }
 
             if height >= chunk_min_y && height <= chunk_max_y {
-                if !worldgen.is_cave(wx, height, wz, height) {
-                    let block_id = worldgen.block_id_at(wx, height, wz, height);
-                    if block_id >= 0 {
+                let block_id = block_at(wx, height, wz);
+                if block_id >= 0 {
                         let block = &blocks[block_id as usize];
                         let wy = height;
                         let sx = 1;
                         let sy = 1;
                         let sz = 1;
-                        if is_air(
-                            IVec3::new(wx + 1, wy, wz),
-                            worldgen,
-                            allow_caves,
-                            Some(&height_cache),
-                        ) {
+                        if is_air(IVec3::new(wx + 1, wy, wz), block_at) {
                             emit_face(
                                 &mut vertices,
                                 &mut indices,
@@ -525,12 +490,7 @@ pub fn generate_chunk_mesh(
                                 use_texture,
                             );
                         }
-                        if is_air(
-                            IVec3::new(wx - 1, wy, wz),
-                            worldgen,
-                            allow_caves,
-                            Some(&height_cache),
-                        ) {
+                        if is_air(IVec3::new(wx - 1, wy, wz), block_at) {
                             emit_face(
                                 &mut vertices,
                                 &mut indices,
@@ -545,12 +505,7 @@ pub fn generate_chunk_mesh(
                                 use_texture,
                             );
                         }
-                        if is_air(
-                            IVec3::new(wx, wy + 1, wz),
-                            worldgen,
-                            allow_caves,
-                            Some(&height_cache),
-                        ) {
+                        if is_air(IVec3::new(wx, wy + 1, wz), block_at) {
                             emit_face(
                                 &mut vertices,
                                 &mut indices,
@@ -565,12 +520,7 @@ pub fn generate_chunk_mesh(
                                 use_texture,
                             );
                         }
-                        if is_air(
-                            IVec3::new(wx, wy - 1, wz),
-                            worldgen,
-                            allow_caves,
-                            Some(&height_cache),
-                        ) {
+                        if is_air(IVec3::new(wx, wy - 1, wz), block_at) {
                             emit_face(
                                 &mut vertices,
                                 &mut indices,
@@ -585,12 +535,7 @@ pub fn generate_chunk_mesh(
                                 use_texture,
                             );
                         }
-                        if is_air(
-                            IVec3::new(wx, wy, wz + 1),
-                            worldgen,
-                            allow_caves,
-                            Some(&height_cache),
-                        ) {
+                        if is_air(IVec3::new(wx, wy, wz + 1), block_at) {
                             emit_face(
                                 &mut vertices,
                                 &mut indices,
@@ -605,12 +550,7 @@ pub fn generate_chunk_mesh(
                                 use_texture,
                             );
                         }
-                        if is_air(
-                            IVec3::new(wx, wy, wz - 1),
-                            worldgen,
-                            allow_caves,
-                            Some(&height_cache),
-                        ) {
+                        if is_air(IVec3::new(wx, wy, wz - 1), block_at) {
                             emit_face(
                                 &mut vertices,
                                 &mut indices,
@@ -625,7 +565,6 @@ pub fn generate_chunk_mesh(
                                 use_texture,
                             );
                         }
-                    }
                 }
             }
             x += step;
@@ -648,32 +587,16 @@ pub fn generate_chunk_mesh(
                 let trunk_end = tree.base_y + tree.trunk_h;
                 let top = trunk_end;
                 let r = tree.leaf_r;
-                let tree_contains = |x: i32, y: i32, z: i32| -> bool {
-                    if x == wx && z == wz && y >= tree.base_y && y < trunk_end {
-                        return true;
-                    }
-                    let dy = y - top;
-                    if dy < -r || dy > r {
-                        return false;
-                    }
-                    let dx = x - wx;
-                    let dz = z - wz;
-                    let dist2 = dx * dx + dy * dy + dz * dz;
-                    if dist2 <= r * r {
-                        if dx == 0 && dz == 0 && y < trunk_end {
-                            return false;
-                        }
-                        return true;
-                    }
-                    false
-                };
                 let mut ty = tree.base_y;
                 while ty < trunk_end {
                     if ty >= chunk_min_y && ty <= chunk_max_y {
                         let wy = ty;
+                        if block_at(wx, wy, wz) != BLOCK_LOG as i8 {
+                            ty += 1;
+                            continue;
+                        }
                         let n = IVec3::new(wx + 1, wy, wz);
-                        if !tree_contains(n.x, n.y, n.z)
-                            && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                        if is_air(n, block_at)
                         {
                             emit_face(
                                 &mut vertices,
@@ -690,8 +613,7 @@ pub fn generate_chunk_mesh(
                             );
                         }
                         let n = IVec3::new(wx - 1, wy, wz);
-                        if !tree_contains(n.x, n.y, n.z)
-                            && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                        if is_air(n, block_at)
                         {
                             emit_face(
                                 &mut vertices,
@@ -708,8 +630,7 @@ pub fn generate_chunk_mesh(
                             );
                         }
                         let n = IVec3::new(wx, wy + 1, wz);
-                        if !tree_contains(n.x, n.y, n.z)
-                            && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                        if is_air(n, block_at)
                         {
                             emit_face(
                                 &mut vertices,
@@ -726,8 +647,7 @@ pub fn generate_chunk_mesh(
                             );
                         }
                         let n = IVec3::new(wx, wy - 1, wz);
-                        if !tree_contains(n.x, n.y, n.z)
-                            && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                        if is_air(n, block_at)
                         {
                             emit_face(
                                 &mut vertices,
@@ -744,8 +664,7 @@ pub fn generate_chunk_mesh(
                             );
                         }
                         let n = IVec3::new(wx, wy, wz + 1);
-                        if !tree_contains(n.x, n.y, n.z)
-                            && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                        if is_air(n, block_at)
                         {
                             emit_face(
                                 &mut vertices,
@@ -762,8 +681,7 @@ pub fn generate_chunk_mesh(
                             );
                         }
                         let n = IVec3::new(wx, wy, wz - 1);
-                        if !tree_contains(n.x, n.y, n.z)
-                            && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                        if is_air(n, block_at)
                         {
                             emit_face(
                                 &mut vertices,
@@ -803,9 +721,12 @@ pub fn generate_chunk_mesh(
                                         dx += 1;
                                         continue;
                                     }
+                                    if block_at(lx, ly, lz) != BLOCK_LEAVES as i8 {
+                                        dx += 1;
+                                        continue;
+                                    }
                                     let n = IVec3::new(lx + 1, ly, lz);
-                                    if !tree_contains(n.x, n.y, n.z)
-                                        && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                                    if is_air(n, block_at)
                                     {
                                         emit_face(
                                             &mut vertices,
@@ -822,8 +743,7 @@ pub fn generate_chunk_mesh(
                                         );
                                     }
                                     let n = IVec3::new(lx - 1, ly, lz);
-                                    if !tree_contains(n.x, n.y, n.z)
-                                        && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                                    if is_air(n, block_at)
                                     {
                                         emit_face(
                                             &mut vertices,
@@ -840,8 +760,7 @@ pub fn generate_chunk_mesh(
                                         );
                                     }
                                     let n = IVec3::new(lx, ly + 1, lz);
-                                    if !tree_contains(n.x, n.y, n.z)
-                                        && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                                    if is_air(n, block_at)
                                     {
                                         emit_face(
                                             &mut vertices,
@@ -858,8 +777,7 @@ pub fn generate_chunk_mesh(
                                         );
                                     }
                                     let n = IVec3::new(lx, ly - 1, lz);
-                                    if !tree_contains(n.x, n.y, n.z)
-                                        && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                                    if is_air(n, block_at)
                                     {
                                         emit_face(
                                             &mut vertices,
@@ -876,8 +794,7 @@ pub fn generate_chunk_mesh(
                                         );
                                     }
                                     let n = IVec3::new(lx, ly, lz + 1);
-                                    if !tree_contains(n.x, n.y, n.z)
-                                        && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                                    if is_air(n, block_at)
                                     {
                                         emit_face(
                                             &mut vertices,
@@ -894,8 +811,7 @@ pub fn generate_chunk_mesh(
                                         );
                                     }
                                     let n = IVec3::new(lx, ly, lz - 1);
-                                    if !tree_contains(n.x, n.y, n.z)
-                                        && is_air(n, worldgen, allow_caves, Some(&height_cache))
+                                    if is_air(n, block_at)
                                     {
                                         emit_face(
                                             &mut vertices,
@@ -1055,23 +971,11 @@ fn emit_face(
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
-fn is_air(
-    world: IVec3,
-    worldgen: &WorldGen,
-    allow_caves: bool,
-    cache: Option<&HeightCache>,
-) -> bool {
-    let height = if let Some(cache) = cache {
-        cache
-            .height_at_world(world.x, world.z)
-            .unwrap_or_else(|| worldgen.height_at(world.x, world.z))
-    } else {
-        worldgen.height_at(world.x, world.z)
-    };
-    if world.y > height {
-        return true;
-    }
-    allow_caves && worldgen.is_cave(world.x, world.y, world.z, height)
+fn is_air<F>(world: IVec3, block_at: &F) -> bool
+where
+    F: Fn(i32, i32, i32) -> i8,
+{
+    block_at(world.x, world.y, world.z) < 0
 }
 
 fn chunk_radius() -> f32 {

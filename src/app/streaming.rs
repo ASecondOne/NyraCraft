@@ -18,8 +18,14 @@ use crate::world::worldgen::{TreeSpec, WorldGen, WORLD_HALF_SIZE_CHUNKS};
 use crate::world::CHUNK_SIZE;
 
 pub enum WorkerResult {
-    Raw(MeshData),
-    Packed(PackedMeshData),
+    Raw {
+        mesh: MeshData,
+        dirty_rev: Option<u64>,
+    },
+    Packed {
+        packed: PackedMeshData,
+        dirty_rev: Option<u64>,
+    },
 }
 
 #[derive(Clone)]
@@ -120,15 +126,18 @@ pub struct MeshCacheEntry {
 
 impl MeshCacheEntry {
     pub fn into_worker_result(self, coord: IVec3, step: i32, mode: MeshMode) -> WorkerResult {
-        WorkerResult::Packed(PackedMeshData {
-            coord,
-            step,
-            mode,
-            center: self.center,
-            radius: self.radius,
-            vertices: self.vertices,
-            indices: self.indices,
-        })
+        WorkerResult::Packed {
+            packed: PackedMeshData {
+                coord,
+                step,
+                mode,
+                center: self.center,
+                radius: self.radius,
+                vertices: self.vertices,
+                indices: self.indices,
+            },
+            dirty_rev: None,
+        }
     }
 }
 
@@ -442,6 +451,10 @@ fn enqueue_request(queue: &SharedRequestQueue, coord: IVec3, step: i32, mode: Me
     cvar.notify_one();
 }
 
+pub fn request_chunk_remesh_now(queue: &SharedRequestQueue, coord: IVec3) {
+    enqueue_request(queue, coord, 1, MeshMode::Full, 1_000_000_000);
+}
+
 pub fn pop_request(queue: &SharedRequestQueue) -> Option<RequestTask> {
     let (lock, cvar) = &**queue;
     let mut state = lock.lock().unwrap();
@@ -490,26 +503,43 @@ fn world_y_to_chunk_y(y: i32) -> i32 {
 pub fn pick_block(
     camera_pos: Vec3,
     forward: Vec3,
-    world_gen: &WorldGen,
     max_dist: f32,
-) -> Option<(IVec3, i8)> {
+    mut block_at: impl FnMut(i32, i32, i32) -> i8,
+) -> Option<PickHit> {
     let dir = forward.normalize();
     let step = 0.1f32;
-    let mut t = 0.0f32;
+    let mut t = step;
     let mut last_block = IVec3::new(i32::MIN, i32::MIN, i32::MIN);
+    let mut prev_block = IVec3::new(
+        camera_pos.x.floor() as i32,
+        camera_pos.y.floor() as i32,
+        camera_pos.z.floor() as i32,
+    );
     while t <= max_dist {
         let pos = camera_pos + dir * t;
         let block = IVec3::new(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
         if block != last_block {
-            let block_id = world_gen.block_id_full_at(block.x, block.y, block.z);
+            let block_id = block_at(block.x, block.y, block.z);
             if block_id >= 0 {
-                return Some((block, block_id));
+                return Some(PickHit {
+                    block,
+                    block_id,
+                    place: prev_block,
+                });
             }
+            prev_block = block;
             last_block = block;
         }
         t += step;
     }
     None
+}
+
+#[derive(Clone, Copy)]
+pub struct PickHit {
+    pub block: IVec3,
+    pub block_id: i8,
+    pub place: IVec3,
 }
 
 fn lod_div(dist: i32, base: i32) -> i32 {
@@ -803,6 +833,7 @@ pub fn stream_tick(
     column_height_cache: &mut HashMap<(i32, i32), i32>,
     req_queue: &SharedRequestQueue,
     rx_res: &mpsc::Receiver<WorkerResult>,
+    dirty_chunks: &Arc<Mutex<HashMap<(i32, i32, i32), u64>>>,
     base_render_radius: i32,
     max_render_radius: i32,
     request_budget: i32,
@@ -874,19 +905,36 @@ pub fn stream_tick(
 
     for _ in 0..max_apply_per_tick {
         let Ok(result) = rx_res.try_recv() else { break; };
-        let mesh = match result {
-            WorkerResult::Raw(mesh) => mesh,
-            WorkerResult::Packed(packed) => MeshData {
-                coord: packed.coord,
-                step: packed.step,
-                mode: packed.mode,
-                center: packed.center,
-                radius: packed.radius,
-                vertices: unpack_far_vertices(&packed.vertices),
-                indices: packed.indices,
-            },
+        let (mesh, dirty_rev) = match result {
+            WorkerResult::Raw { mesh, dirty_rev } => (mesh, dirty_rev),
+            WorkerResult::Packed { packed, dirty_rev } => (
+                MeshData {
+                    coord: packed.coord,
+                    step: packed.step,
+                    mode: packed.mode,
+                    center: packed.center,
+                    radius: packed.radius,
+                    vertices: unpack_far_vertices(&packed.vertices),
+                    indices: packed.indices,
+                },
+                dirty_rev,
+            ),
         };
         let k = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
+
+        let mut dirty_guard = dirty_chunks.lock().unwrap();
+        if let Some(current_rev) = dirty_guard.get(&k).copied() {
+            match dirty_rev {
+                Some(result_rev) if result_rev == current_rev => {
+                    dirty_guard.remove(&k);
+                }
+                _ => {
+                    continue;
+                }
+            }
+        }
+        drop(dirty_guard);
+
         gpu.upsert_chunk(
             mesh.coord,
             mesh.center,

@@ -1,9 +1,9 @@
 use glam::{IVec3, Vec3};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,7 +24,7 @@ mod world;
 use app::streaming::{
     CacheWriteMsg, MeshCacheEntry, PackedMeshData, SharedRequestQueue, WorkerResult,
     chunk_coord_from_pos, estimate_mesh_memory_mb, is_solid_cached,
-    mesh_cache_dir, new_request_queue, pick_block, pop_request, print_stats, should_pack_far_lod,
+    mesh_cache_dir, new_request_queue, pick_block, pop_request, print_stats, request_chunk_remesh_now, should_pack_far_lod,
     stream_tick, try_load_cached_mesh, write_cached_mesh, pack_far_vertices,
 };
 use player::{Camera, PlayerConfig, PlayerInput, PlayerState, update_player};
@@ -32,7 +32,7 @@ use render::Gpu;
 use render::{CubeStyle, TextureAtlas};
 use world::CHUNK_SIZE;
 use world::blocks::{
-    DEFAULT_TILES_X, build_block_index, default_blocks,
+    BLOCK_LEAVES, BLOCK_LOG, BLOCK_STONE, DEFAULT_TILES_X, build_block_index, default_blocks,
 };
 use world::mesher::generate_chunk_mesh;
 use world::worldgen::{TreeSpec, WorldGen};
@@ -97,6 +97,13 @@ fn main() {
         "World seed: {}, world_id: {}",
         world_gen.seed, world_gen.world_id
     );
+
+    let edited_blocks: Arc<RwLock<HashMap<(i32, i32, i32), i8>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    let dirty_chunks: Arc<Mutex<HashMap<(i32, i32, i32), u64>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let edited_chunk_ranges: Arc<Mutex<HashMap<(i32, i32, i32), (i32, i32)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     let mut gpu = Gpu::new(window, style, Some(atlas));
 
@@ -164,9 +171,16 @@ fn main() {
 
     let is_solid = {
         let worldgen = world_gen.clone();
+        let edited_blocks = Arc::clone(&edited_blocks);
         let height_cache = RefCell::new(HashMap::<(i32, i32), i32>::new());
         let tree_cache = RefCell::new(HashMap::<(i32, i32), Option<TreeSpec>>::new());
         move |x: i32, y: i32, z: i32| -> bool {
+            if !worldgen.in_world_bounds(x, z) {
+                return true;
+            }
+            if let Some(id) = edited_blocks.read().unwrap().get(&(x, y, z)).copied() {
+                return id >= 0;
+            }
             is_solid_cached(&worldgen, &height_cache, &tree_cache, x, y, z)
         }
     };
@@ -213,6 +227,9 @@ fn main() {
         let blocks_gen = blocks_gen.clone();
         let gen_thread = gen_thread.clone();
         let cache_dir = cache_dir.clone();
+        let edited_blocks = Arc::clone(&edited_blocks);
+        let dirty_chunks = Arc::clone(&dirty_chunks);
+        let edited_chunk_ranges = Arc::clone(&edited_chunk_ranges);
         thread::spawn(move || {
             loop {
                 let Some(task) = pop_request(&request_queue) else {
@@ -221,13 +238,46 @@ fn main() {
                 let coord = task.coord;
                 let step = task.step;
                 let mode = task.mode;
-                if should_pack_far_lod(mode, step) {
+                let coord_key = (coord.x, coord.y, coord.z);
+                let dirty_rev = dirty_chunks.lock().unwrap().get(&coord_key).copied();
+                if should_pack_far_lod(mode, step) && dirty_rev.is_none() {
                     if let Some(cached) = try_load_cached_mesh(&cache_dir, coord, step, mode) {
                         let _ = tx_res.send(cached.into_worker_result(coord, step, mode));
                         continue;
                     }
                 }
-                let mesh = generate_chunk_mesh(coord, &blocks_gen, &gen_thread, step, mode);
+                let mesh = if dirty_rev.is_none() {
+                    let block_at = |x: i32, y: i32, z: i32| -> i8 {
+                        gen_thread.block_id_full_at(x, y, z)
+                    };
+                    generate_chunk_mesh(
+                        coord,
+                        &blocks_gen,
+                        &gen_thread,
+                        &block_at,
+                        None,
+                        step,
+                        mode,
+                    )
+                } else {
+                    let edit_range = edited_chunk_ranges.lock().unwrap().get(&coord_key).copied();
+                    let overrides = edited_blocks.read().unwrap().clone();
+                    let block_at = |x: i32, y: i32, z: i32| -> i8 {
+                        overrides
+                            .get(&(x, y, z))
+                            .copied()
+                            .unwrap_or_else(|| gen_thread.block_id_full_at(x, y, z))
+                    };
+                    generate_chunk_mesh(
+                        coord,
+                        &blocks_gen,
+                        &gen_thread,
+                        &block_at,
+                        edit_range,
+                        step,
+                        mode,
+                    )
+                };
                 if should_pack_far_lod(mode, step) {
                     let packed_vertices = pack_far_vertices(&mesh.vertices);
                     let packed_for_write = packed_vertices.clone();
@@ -241,18 +291,20 @@ fn main() {
                         vertices: packed_vertices,
                         indices: mesh.indices,
                     };
-                    let _ = tx_cache.send(CacheWriteMsg::Write {
-                        coord: mesh.coord,
-                        step: mesh.step,
-                        mode: mesh.mode,
-                        center: mesh.center,
-                        radius: mesh.radius,
-                        vertices: packed_for_write,
-                        indices: indices_for_write,
-                    });
-                    let _ = tx_res.send(WorkerResult::Packed(packed));
+                    if dirty_rev.is_none() {
+                        let _ = tx_cache.send(CacheWriteMsg::Write {
+                            coord: mesh.coord,
+                            step: mesh.step,
+                            mode: mesh.mode,
+                            center: mesh.center,
+                            radius: mesh.radius,
+                            vertices: packed_for_write,
+                            indices: indices_for_write,
+                        });
+                    }
+                    let _ = tx_res.send(WorkerResult::Packed { packed, dirty_rev });
                 } else {
-                    let _ = tx_res.send(WorkerResult::Raw(mesh));
+                    let _ = tx_res.send(WorkerResult::Raw { mesh, dirty_rev });
                 }
             }
         });
@@ -298,6 +350,7 @@ fn main() {
     let mut ring_i: i32 = 0;
     let mut emergency_budget: i32 = 16;
     let mut looked_block: Option<(IVec3, i8)> = None;
+    let mut looked_hit: Option<(IVec3, i8, IVec3)> = None;
     let mut adaptive_request_budget = request_budget;
     let mut adaptive_pregen_budget = pregen_budget_per_tick;
     let mut adaptive_max_apply_per_tick: usize = 24;
@@ -350,6 +403,7 @@ fn main() {
                         &mut column_height_cache,
                         &request_queue,
                         &rx_res,
+                        &dirty_chunks,
                         base_render_radius,
                         max_render_radius,
                         adaptive_request_budget,
@@ -383,8 +437,11 @@ fn main() {
                         last_camera_pos = camera.position;
                         last_camera_forward = camera.forward;
                     }
-                    looked_block =
-                        pick_block(camera.position, camera.forward, &world_gen, 8.0);
+                    looked_hit = pick_block(camera.position, camera.forward, 8.0, |x, y, z| {
+                        block_id_with_edits(&world_gen, &edited_blocks, x, y, z)
+                    })
+                    .map(|hit| (hit.block, hit.block_id, hit.place));
+                    looked_block = looked_hit.map(|(block, block_id, _)| (block, block_id));
                     tps_ticks += 1;
                 }
 
@@ -554,6 +611,76 @@ fn main() {
                 _ => {}
             }
         }
+        Event::WindowEvent {
+            event:
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button,
+                    ..
+                },
+            ..
+        } => {
+            if !mouse_enabled {
+                return;
+            }
+            let Some((target_block, target_id, place_block)) = looked_hit else {
+                return;
+            };
+            match button {
+                MouseButton::Left => {
+                    if block_id_with_edits(
+                        &world_gen,
+                        &edited_blocks,
+                        target_block.x,
+                        target_block.y,
+                        target_block.z,
+                    ) >= 0
+                    {
+                        edited_blocks.write().unwrap().insert(
+                            (target_block.x, target_block.y, target_block.z),
+                            -1,
+                        );
+                        mark_edited_chunk_range(&edited_chunk_ranges, target_block);
+                        let tree_like = target_id == BLOCK_LOG as i8 || target_id == BLOCK_LEAVES as i8;
+                        invalidate_block_edit(
+                            &mut gpu,
+                            &mut loaded,
+                            &mut requested,
+                            &dirty_chunks,
+                            &request_queue,
+                            target_block,
+                            tree_like,
+                        );
+                    }
+                }
+                MouseButton::Right => {
+                    let place_id = block_id_with_edits(
+                        &world_gen,
+                        &edited_blocks,
+                        place_block.x,
+                        place_block.y,
+                        place_block.z,
+                    );
+                    if place_id < 0 && world_gen.in_world_bounds(place_block.x, place_block.z) {
+                        edited_blocks.write().unwrap().insert(
+                            (place_block.x, place_block.y, place_block.z),
+                            BLOCK_STONE as i8,
+                        );
+                        mark_edited_chunk_range(&edited_chunk_ranges, place_block);
+                        invalidate_block_edit(
+                            &mut gpu,
+                            &mut loaded,
+                            &mut requested,
+                            &dirty_chunks,
+                            &request_queue,
+                            place_block,
+                            false,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
         Event::DeviceEvent {
             event: DeviceEvent::MouseMotion { delta },
             ..
@@ -654,9 +781,115 @@ fn main() {
 }
 
 
+fn block_id_with_edits(
+    world_gen: &WorldGen,
+    edited_blocks: &Arc<RwLock<HashMap<(i32, i32, i32), i8>>>,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> i8 {
+    if let Some(id) = edited_blocks.read().unwrap().get(&(x, y, z)).copied() {
+        return id;
+    }
+    world_gen.block_id_full_at(x, y, z)
+}
+
+fn world_to_chunk_coord(block: IVec3) -> IVec3 {
+    let half = CHUNK_SIZE / 2;
+    IVec3::new(
+        ((block.x + half) as f32 / CHUNK_SIZE as f32).floor() as i32,
+        ((block.y + half) as f32 / CHUNK_SIZE as f32).floor() as i32,
+        ((block.z + half) as f32 / CHUNK_SIZE as f32).floor() as i32,
+    )
+}
+
+fn mark_edited_chunk_range(
+    edited_chunk_ranges: &Arc<Mutex<HashMap<(i32, i32, i32), (i32, i32)>>>,
+    block: IVec3,
+) {
+    let coord = world_to_chunk_coord(block);
+    let key = (coord.x, coord.y, coord.z);
+    let mut ranges = edited_chunk_ranges.lock().unwrap();
+    let entry = ranges.entry(key).or_insert((block.y, block.y));
+    entry.0 = entry.0.min(block.y);
+    entry.1 = entry.1.max(block.y);
+}
+
+fn invalidate_block_edit(
+    _gpu: &mut Gpu,
+    _loaded: &mut HashMap<(i32, i32, i32), i32>,
+    _requested: &mut HashMap<(i32, i32, i32), i32>,
+    dirty_chunks: &Arc<Mutex<HashMap<(i32, i32, i32), u64>>>,
+    request_queue: &SharedRequestQueue,
+    block: IVec3,
+    tree_like: bool,
+) {
+    const TREE_XZ_MARGIN: i32 = 3;
+
+    let coord = world_to_chunk_coord(block);
+    let chunk_min = IVec3::new(
+        coord.x * CHUNK_SIZE - CHUNK_SIZE / 2,
+        coord.y * CHUNK_SIZE - CHUNK_SIZE / 2,
+        coord.z * CHUNK_SIZE - CHUNK_SIZE / 2,
+    );
+    let local = block - chunk_min;
+
+    let mut affected = vec![coord];
+    if local.x == 0 {
+        affected.push(coord - IVec3::X);
+    } else if local.x == CHUNK_SIZE - 1 {
+        affected.push(coord + IVec3::X);
+    }
+    if local.y == 0 {
+        affected.push(coord - IVec3::Y);
+    } else if local.y == CHUNK_SIZE - 1 {
+        affected.push(coord + IVec3::Y);
+    }
+    if local.z == 0 {
+        affected.push(coord - IVec3::Z);
+    } else if local.z == CHUNK_SIZE - 1 {
+        affected.push(coord + IVec3::Z);
+    }
+
+    if tree_like {
+        let mut x_offsets = vec![0];
+        let mut z_offsets = vec![0];
+        if local.x < TREE_XZ_MARGIN {
+            x_offsets.push(-1);
+        }
+        if local.x >= CHUNK_SIZE - TREE_XZ_MARGIN {
+            x_offsets.push(1);
+        }
+        if local.z < TREE_XZ_MARGIN {
+            z_offsets.push(-1);
+        }
+        if local.z >= CHUNK_SIZE - TREE_XZ_MARGIN {
+            z_offsets.push(1);
+        }
+        for ox in &x_offsets {
+            for oz in &z_offsets {
+                affected.push(coord + IVec3::new(*ox, 0, *oz));
+            }
+        }
+    }
+
+    let mut unique = HashSet::new();
+    let mut dirty = dirty_chunks.lock().unwrap();
+    for c in affected {
+        if !unique.insert((c.x, c.y, c.z)) {
+            continue;
+        }
+        let key = (c.x, c.y, c.z);
+        let rev = dirty.entry(key).or_insert(0);
+        *rev = rev.saturating_add(1);
+        request_chunk_remesh_now(request_queue, c);
+    }
+}
+
 fn print_keybinds() {
     println!("--- NyraCraft Keybinds ---");
     println!("Movement: W/A/S/D | Jump: Space | Descend (fly): Shift");
+    println!("Mouse Left: Break block | Mouse Right: Place stone block");
     println!("F1 + F : Toggle face debug colors");
     println!("F1 + W : Toggle chunk wireframe");
     println!("F1 + P : Pause/resume chunk streaming");

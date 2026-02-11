@@ -24,9 +24,11 @@ pub fn default_blocks(_tiles_x: u32) -> Vec<BlockTexture> {
     let tile_grass_side = tile_from_slot(4);
     let tile_log_oak_top = tile_from_slot(5);
     let tile_log_oak = tile_from_slot(6);
+    let tile_leave_oak = tile_from_slot(8);
+    let tile_stone = tile_from_slot(9);
 
     let stone = BlockTexture {
-        tiles: [tile_undefined; 6],
+        tiles: [tile_stone; 6],
         rotations: [0, 0, 0, 0, 0, 0],
         transparent_mode: [0, 0, 0, 0, 0, 0],
     };
@@ -64,7 +66,7 @@ pub fn default_blocks(_tiles_x: u32) -> Vec<BlockTexture> {
     };
 
     let leaves = BlockTexture {
-        tiles: [tile_undefined; 6],
+        tiles: [tile_leave_oak; 6],
         rotations: [0, 0, 0, 0, 0, 0],
         transparent_mode: [2, 2, 2, 2, 2, 2],
     };

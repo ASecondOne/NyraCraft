@@ -132,11 +132,6 @@ impl WorldGen {
         })
     }
 
-    pub fn is_cave(&self, x: i32, y: i32, z: i32, height: i32) -> bool {
-        let _ = (x, y, z, height);
-        false
-    }
-
     pub fn block_id_full_at(&self, x: i32, y: i32, z: i32) -> i8 {
         if !self.in_world_bounds(x, z) {
             return -1;

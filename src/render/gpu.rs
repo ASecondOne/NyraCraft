@@ -16,7 +16,7 @@ struct SceneUniform {
     camera_pos: [f32; 4],
     tile_misc: [f32; 4],      // [tile_uv_x, tile_uv_y, chunk_size, colormap_scale]
     flags0: [u32; 4],         // [use_texture, tiles_x, debug_faces, debug_chunks]
-    flags1: [u32; 4],         // [occlusion_cull, grass_top_tile, grass_side_tile, reserved]
+    flags1: [u32; 4],         // [occlusion_cull, grass_top_tile, grass_side_tile, grass_overlay_tile]
     colormap_misc: [f32; 4],  // [colormap_strength, reserved, reserved, reserved]
 }
 
@@ -159,7 +159,7 @@ impl Gpu {
                 camera_pos: [0.0, 0.0, 0.0, 0.0],
                 tile_misc: [tile_uv_size[0], tile_uv_size[1], crate::world::CHUNK_SIZE as f32, 0.0015],
                 flags0: [style.use_texture as u32, tiles_x, 0, 0],
-                flags1: [0, 2, 3, 0],
+                flags1: [0, 2, 3, 6],
                 colormap_misc: [0.72, 0.0, 0.0, 0.0],
             };
 
@@ -399,7 +399,7 @@ impl Gpu {
                 camera_pos: [camera.position.x, camera.position.y, camera.position.z, 0.0],
                 tile_misc: [gpu.tile_uv_size[0], gpu.tile_uv_size[1], crate::world::CHUNK_SIZE as f32, 0.0015],
                 flags0: [self.style.use_texture as u32, gpu.tiles_x, debug_faces as u32, 0],
-                flags1: [0, 2, 3, 0],
+                flags1: [0, 2, 3, 6],
                 colormap_misc: [0.72, 0.0, 0.0, 0.0],
             };
 
