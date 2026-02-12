@@ -1,12 +1,13 @@
 use glam::{IVec3, Vec3};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex, RwLock};
+use std::path::Path;
 use std::process::Command;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
@@ -22,23 +23,70 @@ mod render;
 mod world;
 
 use app::streaming::{
-    CacheWriteMsg, MeshCacheEntry, PackedMeshData, SharedRequestQueue, WorkerResult,
-    chunk_coord_from_pos, estimate_mesh_memory_mb, is_solid_cached,
-    mesh_cache_dir, new_request_queue, pick_block, pop_request, print_stats, request_chunk_remesh_now, should_pack_far_lod,
-    stream_tick, try_load_cached_mesh, write_cached_mesh, pack_far_vertices,
+    CacheMeshView, CacheWriteMsg, EditedChunkRanges, PackedMeshData, SharedRequestQueue,
+    WorkerResult, apply_stream_results, block_id_full_cached, chunk_coord_from_pos,
+    estimate_mesh_memory_mb, is_solid_cached, mesh_cache_dir, new_request_queue, pick_block,
+    pop_request, print_stats, should_pack_far_lod, stream_tick, try_load_cached_mesh,
+    write_cached_mesh,
 };
-use player::{Camera, PlayerConfig, PlayerInput, PlayerState, update_player};
+use player::{
+    Camera, EditedBlocks, PlayerConfig, PlayerInput, PlayerState, block_id_with_edits,
+    handle_block_mouse_input, new_edited_blocks, update_player,
+};
 use render::Gpu;
+use render::mesh::pack_far_vertices;
 use render::{CubeStyle, TextureAtlas};
 use world::CHUNK_SIZE;
-use world::blocks::{
-    BLOCK_LEAVES, BLOCK_LOG, BLOCK_STONE, DEFAULT_TILES_X, build_block_index, default_blocks,
-};
+use world::blocks::{DEFAULT_TILES_X, build_block_index, default_blocks};
 use world::mesher::generate_chunk_mesh;
 use world::worldgen::{TreeSpec, WorldGen};
 
+type CoordKey = (i32, i32, i32);
+type DirtyChunks = Arc<Mutex<HashMap<CoordKey, u64>>>;
+const DIRTY_EDIT_CHUNK_HALO: i32 = 1;
+
+fn newest_atlas_input_mtime(script: &str, texture_dir: &str) -> Option<SystemTime> {
+    let mut newest = fs::metadata(script).ok()?.modified().ok()?;
+    let entries = fs::read_dir(texture_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if !ext.eq_ignore_ascii_case("png") && !ext.eq_ignore_ascii_case("tga") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if modified > newest {
+            newest = modified;
+        }
+    }
+    Some(newest)
+}
+
+fn atlas_is_up_to_date(script: &str, texture_dir: &str, atlas_path: &str) -> bool {
+    let Ok(atlas_mtime) = fs::metadata(atlas_path).and_then(|m| m.modified()) else {
+        return false;
+    };
+    let Some(input_mtime) = newest_atlas_input_mtime(script, texture_dir) else {
+        return false;
+    };
+    atlas_mtime >= input_mtime
+}
+
 fn generate_texture_atlas() {
     let script = "src/texturing/atlas_gen.py";
+    let texture_dir = "src/texturing/textures";
+    let atlas_path = "src/texturing/atlas_output/atlas.png";
+
+    if atlas_is_up_to_date(script, texture_dir, atlas_path) {
+        return;
+    }
 
     let try_run = |exe: &str| -> Result<(), String> {
         let status = Command::new(exe)
@@ -52,14 +100,13 @@ fn generate_texture_atlas() {
         }
     };
 
-    if try_run("python3").is_err() {
-        if let Err(e) = try_run("python") {
-            panic!("atlas generation failed: {e}");
-        }
+    if try_run("python3").is_err()
+        && let Err(e) = try_run("python")
+    {
+        panic!("atlas generation failed: {e}");
     }
 
-    let atlas_path = "src/texturing/atlas_output/atlas.png";
-    if !std::path::Path::new(atlas_path).exists() {
+    if !Path::new(atlas_path).exists() {
         panic!("atlas generation completed but atlas was not found at {atlas_path}");
     }
 }
@@ -83,12 +130,14 @@ fn main() {
     let tiles_x = DEFAULT_TILES_X;
     let blocks = default_blocks(tiles_x);
     let block_index = build_block_index(tiles_x);
-    eprintln!("Indexed {} block types:", block_index.len());
-    for entry in &block_index {
-        eprintln!(
-            "  item_id={} block_id={} name={} texture_index={}",
-            entry.item_id, entry.block_id, entry.name, entry.texture_index
-        );
+    if cfg!(debug_assertions) {
+        eprintln!("Indexed {} block types:", block_index.len());
+        for entry in &block_index {
+            eprintln!(
+                "  item_id={} block_id={} name={} texture_index={}",
+                entry.item_id, entry.block_id, entry.name, entry.texture_index
+            );
+        }
     }
 
     let seed: u32 = rand::random();
@@ -98,12 +147,9 @@ fn main() {
         world_gen.seed, world_gen.world_id
     );
 
-    let edited_blocks: Arc<RwLock<HashMap<(i32, i32, i32), i8>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-    let dirty_chunks: Arc<Mutex<HashMap<(i32, i32, i32), u64>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let edited_chunk_ranges: Arc<Mutex<HashMap<(i32, i32, i32), (i32, i32)>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let edited_blocks: EditedBlocks = new_edited_blocks();
+    let dirty_chunks: DirtyChunks = Arc::new(Mutex::new(HashMap::new()));
+    let edited_chunk_ranges: EditedChunkRanges = Arc::new(Mutex::new(HashMap::new()));
 
     let mut gpu = Gpu::new(window, style, Some(atlas));
 
@@ -178,7 +224,7 @@ fn main() {
             if !worldgen.in_world_bounds(x, z) {
                 return true;
             }
-            if let Some(id) = edited_blocks.read().unwrap().get(&(x, y, z)).copied() {
+            if let Some(id) = edited_blocks.read().unwrap().get(x, y, z) {
                 return id >= 0;
             }
             is_solid_cached(&worldgen, &height_cache, &tree_cache, x, y, z)
@@ -204,13 +250,18 @@ fn main() {
                     vertices,
                     indices,
                 } => {
-                    let entry = MeshCacheEntry {
-                        center,
-                        radius,
-                        vertices,
-                        indices,
-                    };
-                    write_cached_mesh(&cache_dir_writer, coord, step, mode, &entry);
+                    write_cached_mesh(
+                        &cache_dir_writer,
+                        coord,
+                        step,
+                        mode,
+                        CacheMeshView {
+                            center,
+                            radius,
+                            vertices: &vertices,
+                            indices: &indices,
+                        },
+                    );
                 }
             }
         }
@@ -218,8 +269,8 @@ fn main() {
     let blocks_gen = blocks.clone();
     let gen_thread = world_gen.clone();
     let worker_count = std::thread::available_parallelism()
-        .map(|n| (n.get() * 2).clamp(8, 32))
-        .unwrap_or(8);
+        .map(|n| n.get().saturating_sub(1).clamp(1, 12))
+        .unwrap_or(1);
     for _ in 0..worker_count {
         let request_queue = Arc::clone(&request_queue);
         let tx_res = tx_res.clone();
@@ -228,78 +279,82 @@ fn main() {
         let gen_thread = gen_thread.clone();
         let cache_dir = cache_dir.clone();
         let edited_blocks = Arc::clone(&edited_blocks);
-        let dirty_chunks = Arc::clone(&dirty_chunks);
         let edited_chunk_ranges = Arc::clone(&edited_chunk_ranges);
+        let dirty_chunks = Arc::clone(&dirty_chunks);
         thread::spawn(move || {
-            loop {
-                let Some(task) = pop_request(&request_queue) else {
-                    break;
-                };
+            while let Some(task) = pop_request(&request_queue) {
                 let coord = task.coord;
                 let step = task.step;
                 let mode = task.mode;
                 let coord_key = (coord.x, coord.y, coord.z);
                 let dirty_rev = dirty_chunks.lock().unwrap().get(&coord_key).copied();
-                if should_pack_far_lod(mode, step) && dirty_rev.is_none() {
-                    if let Some(cached) = try_load_cached_mesh(&cache_dir, coord, step, mode) {
-                        let _ = tx_res.send(cached.into_worker_result(coord, step, mode));
-                        continue;
+                let (overrides, override_range) = {
+                    let store = edited_blocks.read().unwrap();
+                    if store.has_any_edits() {
+                        (
+                            store.collect_chunk_halo(coord, DIRTY_EDIT_CHUNK_HALO),
+                            store.chunk_override_y_range(coord),
+                        )
+                    } else {
+                        (HashMap::new(), None)
                     }
-                }
-                let mesh = if dirty_rev.is_none() {
-                    let block_at = |x: i32, y: i32, z: i32| -> i8 {
-                        gen_thread.block_id_full_at(x, y, z)
-                    };
-                    generate_chunk_mesh(
-                        coord,
-                        &blocks_gen,
-                        &gen_thread,
-                        &block_at,
-                        None,
-                        step,
-                        mode,
-                    )
-                } else {
-                    let edit_range = edited_chunk_ranges.lock().unwrap().get(&coord_key).copied();
-                    let overrides = edited_blocks.read().unwrap().clone();
-                    let block_at = |x: i32, y: i32, z: i32| -> i8 {
-                        overrides
-                            .get(&(x, y, z))
-                            .copied()
-                            .unwrap_or_else(|| gen_thread.block_id_full_at(x, y, z))
-                    };
-                    generate_chunk_mesh(
-                        coord,
-                        &blocks_gen,
-                        &gen_thread,
-                        &block_at,
-                        edit_range,
-                        step,
-                        mode,
-                    )
                 };
+                let has_overrides = !overrides.is_empty();
+                if should_pack_far_lod(mode, step)
+                    && dirty_rev.is_none()
+                    && !has_overrides
+                    && let Some(cached) = try_load_cached_mesh(&cache_dir, coord, step, mode)
+                {
+                    let _ = tx_res.send(cached.into_worker_result(coord, step, mode));
+                    continue;
+                }
+
+                let mut edit_range = if dirty_rev.is_some() {
+                    edited_chunk_ranges.lock().unwrap().get(&coord_key).copied()
+                } else {
+                    None
+                };
+                if edit_range.is_none() {
+                    edit_range = override_range;
+                }
+
+                let height_cache = RefCell::new(HashMap::<(i32, i32), i32>::new());
+                let tree_cache = RefCell::new(HashMap::<(i32, i32), Option<TreeSpec>>::new());
+                let block_at = |x: i32, y: i32, z: i32| -> i8 {
+                    overrides.get(&(x, y, z)).copied().unwrap_or_else(|| {
+                        block_id_full_cached(&gen_thread, &height_cache, &tree_cache, x, y, z)
+                    })
+                };
+                let mesh = generate_chunk_mesh(
+                    coord,
+                    &blocks_gen,
+                    &gen_thread,
+                    &block_at,
+                    edit_range,
+                    step,
+                    mode,
+                );
                 if should_pack_far_lod(mode, step) {
-                    let packed_vertices = pack_far_vertices(&mesh.vertices);
-                    let packed_for_write = packed_vertices.clone();
-                    let indices_for_write = mesh.indices.clone();
+                    let packed_vertices = Arc::<[_]>::from(pack_far_vertices(&mesh.vertices));
+                    let packed_indices = Arc::<[_]>::from(mesh.indices);
                     let packed = PackedMeshData {
                         coord: mesh.coord,
                         step: mesh.step,
                         mode: mesh.mode,
                         center: mesh.center,
                         radius: mesh.radius,
-                        vertices: packed_vertices,
-                        indices: mesh.indices,
+                        vertices: Arc::clone(&packed_vertices),
+                        indices: Arc::clone(&packed_indices),
                     };
-                    if dirty_rev.is_none() {
+                    if dirty_rev.is_none() && !has_overrides {
                         let _ = tx_cache.send(CacheWriteMsg::Write {
                             coord: mesh.coord,
                             step: mesh.step,
                             mode: mesh.mode,
                             center: mesh.center,
                             radius: mesh.radius,
-                            vertices: packed_for_write,
-                            indices: indices_for_write,
+                            vertices: packed_vertices,
+                            indices: packed_indices,
                         });
                     }
                     let _ = tx_res.send(WorkerResult::Packed { packed, dirty_rev });
@@ -315,8 +370,8 @@ fn main() {
     let base_draw_radius = 72;
     let lod_near_radius = 16;
     let lod_mid_radius = 32;
-    let request_budget = 160;
-    let max_inflight = 2048usize;
+    let request_budget = 112;
+    let max_inflight = 1024usize;
     let surface_depth_chunks = 4;
     let initial_burst_radius = 4;
     let loaded_chunk_cap = 12000usize;
@@ -353,7 +408,7 @@ fn main() {
     let mut looked_hit: Option<(IVec3, i8, IVec3)> = None;
     let mut adaptive_request_budget = request_budget;
     let mut adaptive_pregen_budget = pregen_budget_per_tick;
-    let mut adaptive_max_apply_per_tick: usize = 24;
+    let mut adaptive_max_apply_per_tick: usize = 16;
     let mut adaptive_max_rebuilds_per_tick: usize = 3;
     let mut adaptive_draw_radius_cap = base_draw_radius;
     let mut last_camera_pos = camera.position;
@@ -404,6 +459,7 @@ fn main() {
                         &request_queue,
                         &rx_res,
                         &dirty_chunks,
+                        &edited_chunk_ranges,
                         base_render_radius,
                         max_render_radius,
                         adaptive_request_budget,
@@ -443,6 +499,39 @@ fn main() {
                     .map(|hit| (hit.block, hit.block_id, hit.place));
                     looked_block = looked_hit.map(|(block, block_id, _)| (block, block_id));
                     tps_ticks += 1;
+                }
+
+                if !pause_stream {
+                    let dirty_pending = dirty_chunks.lock().unwrap().len();
+                    let apply_budget = if dirty_pending > 0 {
+                        adaptive_max_apply_per_tick.max(16)
+                    } else if !requested.is_empty() {
+                        (adaptive_max_apply_per_tick / 2).max(4)
+                    } else {
+                        2
+                    };
+                    let rebuild_budget = if dirty_pending > 0 {
+                        adaptive_max_rebuilds_per_tick + 4
+                    } else {
+                        adaptive_max_rebuilds_per_tick.max(1)
+                    };
+                    apply_stream_results(
+                        &mut gpu,
+                        &rx_res,
+                        &dirty_chunks,
+                        &edited_chunk_ranges,
+                        &mut loaded,
+                        &mut requested,
+                        player.position,
+                        pregen_center_chunk,
+                        pregen_radius_chunks,
+                        &mut pregen_chunks_created,
+                        loaded_chunk_cap,
+                        mesh_memory_cap_mb,
+                        apply_budget,
+                        rebuild_budget,
+                        true,
+                    );
                 }
 
                 fps_frames += 1;
@@ -623,62 +712,37 @@ fn main() {
             if !mouse_enabled {
                 return;
             }
-            let Some((target_block, target_id, place_block)) = looked_hit else {
-                return;
-            };
-            match button {
-                MouseButton::Left => {
-                    if block_id_with_edits(
-                        &world_gen,
-                        &edited_blocks,
-                        target_block.x,
-                        target_block.y,
-                        target_block.z,
-                    ) >= 0
-                    {
-                        edited_blocks.write().unwrap().insert(
-                            (target_block.x, target_block.y, target_block.z),
-                            -1,
-                        );
-                        mark_edited_chunk_range(&edited_chunk_ranges, target_block);
-                        let tree_like = target_id == BLOCK_LOG as i8 || target_id == BLOCK_LEAVES as i8;
-                        invalidate_block_edit(
-                            &mut gpu,
-                            &mut loaded,
-                            &mut requested,
-                            &dirty_chunks,
-                            &request_queue,
-                            target_block,
-                            tree_like,
-                        );
-                    }
-                }
-                MouseButton::Right => {
-                    let place_id = block_id_with_edits(
-                        &world_gen,
-                        &edited_blocks,
-                        place_block.x,
-                        place_block.y,
-                        place_block.z,
-                    );
-                    if place_id < 0 && world_gen.in_world_bounds(place_block.x, place_block.z) {
-                        edited_blocks.write().unwrap().insert(
-                            (place_block.x, place_block.y, place_block.z),
-                            BLOCK_STONE as i8,
-                        );
-                        mark_edited_chunk_range(&edited_chunk_ranges, place_block);
-                        invalidate_block_edit(
-                            &mut gpu,
-                            &mut loaded,
-                            &mut requested,
-                            &dirty_chunks,
-                            &request_queue,
-                            place_block,
-                            false,
-                        );
-                    }
-                }
-                _ => {}
+            let had_target = looked_hit.is_some();
+            handle_block_mouse_input(
+                button,
+                looked_hit,
+                &world_gen,
+                &edited_blocks,
+                &edited_chunk_ranges,
+                &dirty_chunks,
+                &request_queue,
+                player.position,
+                player_config.height,
+                player_config.radius,
+            );
+            if had_target && matches!(button, MouseButton::Left | MouseButton::Right) && !pause_stream {
+                apply_stream_results(
+                    &mut gpu,
+                    &rx_res,
+                    &dirty_chunks,
+                    &edited_chunk_ranges,
+                    &mut loaded,
+                    &mut requested,
+                    player.position,
+                    pregen_center_chunk,
+                    pregen_radius_chunks,
+                    &mut pregen_chunks_created,
+                    loaded_chunk_cap,
+                    mesh_memory_cap_mb,
+                    24,
+                    adaptive_max_rebuilds_per_tick.max(8),
+                    true,
+                );
             }
         }
         Event::DeviceEvent {
@@ -778,112 +842,6 @@ fn main() {
         }
         _ => {}
     });
-}
-
-
-fn block_id_with_edits(
-    world_gen: &WorldGen,
-    edited_blocks: &Arc<RwLock<HashMap<(i32, i32, i32), i8>>>,
-    x: i32,
-    y: i32,
-    z: i32,
-) -> i8 {
-    if let Some(id) = edited_blocks.read().unwrap().get(&(x, y, z)).copied() {
-        return id;
-    }
-    world_gen.block_id_full_at(x, y, z)
-}
-
-fn world_to_chunk_coord(block: IVec3) -> IVec3 {
-    let half = CHUNK_SIZE / 2;
-    IVec3::new(
-        ((block.x + half) as f32 / CHUNK_SIZE as f32).floor() as i32,
-        ((block.y + half) as f32 / CHUNK_SIZE as f32).floor() as i32,
-        ((block.z + half) as f32 / CHUNK_SIZE as f32).floor() as i32,
-    )
-}
-
-fn mark_edited_chunk_range(
-    edited_chunk_ranges: &Arc<Mutex<HashMap<(i32, i32, i32), (i32, i32)>>>,
-    block: IVec3,
-) {
-    let coord = world_to_chunk_coord(block);
-    let key = (coord.x, coord.y, coord.z);
-    let mut ranges = edited_chunk_ranges.lock().unwrap();
-    let entry = ranges.entry(key).or_insert((block.y, block.y));
-    entry.0 = entry.0.min(block.y);
-    entry.1 = entry.1.max(block.y);
-}
-
-fn invalidate_block_edit(
-    _gpu: &mut Gpu,
-    _loaded: &mut HashMap<(i32, i32, i32), i32>,
-    _requested: &mut HashMap<(i32, i32, i32), i32>,
-    dirty_chunks: &Arc<Mutex<HashMap<(i32, i32, i32), u64>>>,
-    request_queue: &SharedRequestQueue,
-    block: IVec3,
-    tree_like: bool,
-) {
-    const TREE_XZ_MARGIN: i32 = 3;
-
-    let coord = world_to_chunk_coord(block);
-    let chunk_min = IVec3::new(
-        coord.x * CHUNK_SIZE - CHUNK_SIZE / 2,
-        coord.y * CHUNK_SIZE - CHUNK_SIZE / 2,
-        coord.z * CHUNK_SIZE - CHUNK_SIZE / 2,
-    );
-    let local = block - chunk_min;
-
-    let mut affected = vec![coord];
-    if local.x == 0 {
-        affected.push(coord - IVec3::X);
-    } else if local.x == CHUNK_SIZE - 1 {
-        affected.push(coord + IVec3::X);
-    }
-    if local.y == 0 {
-        affected.push(coord - IVec3::Y);
-    } else if local.y == CHUNK_SIZE - 1 {
-        affected.push(coord + IVec3::Y);
-    }
-    if local.z == 0 {
-        affected.push(coord - IVec3::Z);
-    } else if local.z == CHUNK_SIZE - 1 {
-        affected.push(coord + IVec3::Z);
-    }
-
-    if tree_like {
-        let mut x_offsets = vec![0];
-        let mut z_offsets = vec![0];
-        if local.x < TREE_XZ_MARGIN {
-            x_offsets.push(-1);
-        }
-        if local.x >= CHUNK_SIZE - TREE_XZ_MARGIN {
-            x_offsets.push(1);
-        }
-        if local.z < TREE_XZ_MARGIN {
-            z_offsets.push(-1);
-        }
-        if local.z >= CHUNK_SIZE - TREE_XZ_MARGIN {
-            z_offsets.push(1);
-        }
-        for ox in &x_offsets {
-            for oz in &z_offsets {
-                affected.push(coord + IVec3::new(*ox, 0, *oz));
-            }
-        }
-    }
-
-    let mut unique = HashSet::new();
-    let mut dirty = dirty_chunks.lock().unwrap();
-    for c in affected {
-        if !unique.insert((c.x, c.y, c.z)) {
-            continue;
-        }
-        let key = (c.x, c.y, c.z);
-        let rev = dirty.entry(key).or_insert(0);
-        *rev = rev.saturating_add(1);
-        request_chunk_remesh_now(request_queue, c);
-    }
 }
 
 fn print_keybinds() {

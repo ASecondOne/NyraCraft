@@ -1,6 +1,6 @@
 use crate::world::CHUNK_SIZE;
-use noise::{NoiseFn, Perlin};
 use crate::world::blocks::{BLOCK_DIRT, BLOCK_GRASS, BLOCK_LEAVES, BLOCK_LOG, BLOCK_STONE};
+use noise::{NoiseFn, Perlin};
 
 pub const WORLD_SIZE_CHUNKS: i32 = 1000;
 pub const WORLD_HALF_SIZE_CHUNKS: i32 = WORLD_SIZE_CHUNKS / 2;
@@ -74,22 +74,31 @@ impl WorldGen {
         let fx = x as f64 + self.offset_x;
         let fz = z as f64 + self.offset_z;
 
-        let biome_n = self.biome_perlin.get([fx * self.biome_freq, fz * self.biome_freq]);
+        let biome_n = self
+            .biome_perlin
+            .get([fx * self.biome_freq, fz * self.biome_freq]);
         let mountain_w = smoothstep(0.20, 0.80, biome_n);
         let plains_w = 1.0 - mountain_w;
 
-        let plains_low = self.perlin.get([fx * self.plains_freq, fz * self.plains_freq]);
+        let plains_low = self
+            .perlin
+            .get([fx * self.plains_freq, fz * self.plains_freq]);
         let plains_high = self
             .perlin
             .get([fx * self.plains_freq * 2.0, fz * self.plains_freq * 2.0]);
-        let plains_h =
-            self.base_height as f64 + plains_low * self.plains_amp + plains_high * (self.plains_amp * 0.35);
+        let plains_h = self.base_height as f64
+            + plains_low * self.plains_amp
+            + plains_high * (self.plains_amp * 0.35);
 
-        let mountain_n = self.mountain_perlin.get([fx * self.mountain_freq, fz * self.mountain_freq]);
+        let mountain_n = self
+            .mountain_perlin
+            .get([fx * self.mountain_freq, fz * self.mountain_freq]);
         let ridged = (1.0 - mountain_n.abs()).powf(2.0);
         let mountain_h = self.base_height as f64 + 8.0 + ridged * self.mountain_amp;
 
-        let cliffs_n = self.cliffs_perlin.get([fx * self.cliffs_freq, fz * self.cliffs_freq]);
+        let cliffs_n = self
+            .cliffs_perlin
+            .get([fx * self.cliffs_freq, fz * self.cliffs_freq]);
         let cliffs_h = cliffs_n * self.cliffs_amp - cliffs_n.abs() * self.cliffs_depth;
 
         let mut height = plains_h * plains_w + mountain_h * mountain_w;
@@ -173,7 +182,6 @@ impl WorldGen {
         }
         -1
     }
-
 }
 
 fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {

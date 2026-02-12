@@ -104,7 +104,13 @@ pub fn load_atlas_texture(
         .unwrap_or_else(|e| panic!("failed to open atlas {}: {e}", atlas.path));
     let rgba = image.to_rgba8();
     let (width, height) = rgba.dimensions();
-    let sampled = create_texture_from_rgba(device, queue, "atlas_texture", &rgba, wgpu::FilterMode::Nearest);
+    let sampled = create_texture_from_rgba(
+        device,
+        queue,
+        "atlas_texture",
+        &rgba,
+        wgpu::FilterMode::Nearest,
+    );
 
     let tiles_x = width / atlas.tile_size;
     let tiles_y = height / atlas.tile_size;
@@ -127,7 +133,10 @@ fn first_png_in_dir(dir: &Path) -> Option<PathBuf> {
         .ok()?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("png")))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        })
         .collect();
     files.sort();
     files.into_iter().next()
@@ -165,7 +174,13 @@ pub fn load_grass_colormap_texture(device: &wgpu::Device, queue: &wgpu::Queue) -
 
 pub fn create_dummy_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> AtlasTexture {
     let fallback = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]));
-    let sampled = create_texture_from_rgba(device, queue, "dummy_texture", &fallback, wgpu::FilterMode::Nearest);
+    let sampled = create_texture_from_rgba(
+        device,
+        queue,
+        "dummy_texture",
+        &fallback,
+        wgpu::FilterMode::Nearest,
+    );
 
     AtlasTexture {
         view: sampled.view,

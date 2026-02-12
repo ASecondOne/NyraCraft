@@ -41,13 +41,19 @@ where
         coord.y * CHUNK_SIZE,
         coord.z * CHUNK_SIZE,
     );
-    let size = CHUNK_SIZE as i32;
+    let size = CHUNK_SIZE;
     let half = CHUNK_SIZE / 2;
     let height_cache = build_height_cache(worldgen, origin, size, half);
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-
     let step = step.max(1);
+    let grid = (size / step).max(1);
+    let est_faces = match mode {
+        MeshMode::Full => (grid * grid * 12).max(1024),
+        MeshMode::SurfaceSides => (grid * grid * 8).max(512),
+        MeshMode::SurfaceOnly => (grid * grid * 2).max(256),
+    } as usize;
+    let mut vertices = Vec::with_capacity(est_faces * 4);
+    let mut indices = Vec::with_capacity(est_faces * 6);
+
     let use_texture = if mode == MeshMode::SurfaceOnly { 0 } else { 1 };
 
     let chunk_min_y = origin.y - half;
@@ -351,8 +357,8 @@ where
 
             let mut y_start = chunk_min_y;
             let mut y_end = height.min(chunk_max_y);
-            if let Some((edit_min_y, edit_max_y)) = edited_y_range {
-                y_start = y_start.min(edit_min_y - 1);
+            if let Some((_, edit_max_y)) = edited_y_range {
+                // Dirty remeshes must include placed blocks above terrain height.
                 y_end = y_end.max(edit_max_y + 1);
             }
             y_start = y_start.max(chunk_min_y);
@@ -470,101 +476,101 @@ where
             if height >= chunk_min_y && height <= chunk_max_y {
                 let block_id = block_at(wx, height, wz);
                 if block_id >= 0 {
-                        let block = &blocks[block_id as usize];
-                        let wy = height;
-                        let sx = 1;
-                        let sy = 1;
-                        let sz = 1;
-                        if is_air(IVec3::new(wx + 1, wy, wz), block_at) {
-                            emit_face(
-                                &mut vertices,
-                                &mut indices,
-                                block,
-                                0,
-                                wx,
-                                wy,
-                                wz,
-                                sx,
-                                sy,
-                                sz,
-                                use_texture,
-                            );
-                        }
-                        if is_air(IVec3::new(wx - 1, wy, wz), block_at) {
-                            emit_face(
-                                &mut vertices,
-                                &mut indices,
-                                block,
-                                1,
-                                wx,
-                                wy,
-                                wz,
-                                sx,
-                                sy,
-                                sz,
-                                use_texture,
-                            );
-                        }
-                        if is_air(IVec3::new(wx, wy + 1, wz), block_at) {
-                            emit_face(
-                                &mut vertices,
-                                &mut indices,
-                                block,
-                                2,
-                                wx,
-                                wy,
-                                wz,
-                                sx,
-                                sy,
-                                sz,
-                                use_texture,
-                            );
-                        }
-                        if is_air(IVec3::new(wx, wy - 1, wz), block_at) {
-                            emit_face(
-                                &mut vertices,
-                                &mut indices,
-                                block,
-                                3,
-                                wx,
-                                wy,
-                                wz,
-                                sx,
-                                sy,
-                                sz,
-                                use_texture,
-                            );
-                        }
-                        if is_air(IVec3::new(wx, wy, wz + 1), block_at) {
-                            emit_face(
-                                &mut vertices,
-                                &mut indices,
-                                block,
-                                4,
-                                wx,
-                                wy,
-                                wz,
-                                sx,
-                                sy,
-                                sz,
-                                use_texture,
-                            );
-                        }
-                        if is_air(IVec3::new(wx, wy, wz - 1), block_at) {
-                            emit_face(
-                                &mut vertices,
-                                &mut indices,
-                                block,
-                                5,
-                                wx,
-                                wy,
-                                wz,
-                                sx,
-                                sy,
-                                sz,
-                                use_texture,
-                            );
-                        }
+                    let block = &blocks[block_id as usize];
+                    let wy = height;
+                    let sx = 1;
+                    let sy = 1;
+                    let sz = 1;
+                    if is_air(IVec3::new(wx + 1, wy, wz), block_at) {
+                        emit_face(
+                            &mut vertices,
+                            &mut indices,
+                            block,
+                            0,
+                            wx,
+                            wy,
+                            wz,
+                            sx,
+                            sy,
+                            sz,
+                            use_texture,
+                        );
+                    }
+                    if is_air(IVec3::new(wx - 1, wy, wz), block_at) {
+                        emit_face(
+                            &mut vertices,
+                            &mut indices,
+                            block,
+                            1,
+                            wx,
+                            wy,
+                            wz,
+                            sx,
+                            sy,
+                            sz,
+                            use_texture,
+                        );
+                    }
+                    if is_air(IVec3::new(wx, wy + 1, wz), block_at) {
+                        emit_face(
+                            &mut vertices,
+                            &mut indices,
+                            block,
+                            2,
+                            wx,
+                            wy,
+                            wz,
+                            sx,
+                            sy,
+                            sz,
+                            use_texture,
+                        );
+                    }
+                    if is_air(IVec3::new(wx, wy - 1, wz), block_at) {
+                        emit_face(
+                            &mut vertices,
+                            &mut indices,
+                            block,
+                            3,
+                            wx,
+                            wy,
+                            wz,
+                            sx,
+                            sy,
+                            sz,
+                            use_texture,
+                        );
+                    }
+                    if is_air(IVec3::new(wx, wy, wz + 1), block_at) {
+                        emit_face(
+                            &mut vertices,
+                            &mut indices,
+                            block,
+                            4,
+                            wx,
+                            wy,
+                            wz,
+                            sx,
+                            sy,
+                            sz,
+                            use_texture,
+                        );
+                    }
+                    if is_air(IVec3::new(wx, wy, wz - 1), block_at) {
+                        emit_face(
+                            &mut vertices,
+                            &mut indices,
+                            block,
+                            5,
+                            wx,
+                            wy,
+                            wz,
+                            sx,
+                            sy,
+                            sz,
+                            use_texture,
+                        );
+                    }
                 }
             }
             x += step;
@@ -596,8 +602,7 @@ where
                             continue;
                         }
                         let n = IVec3::new(wx + 1, wy, wz);
-                        if is_air(n, block_at)
-                        {
+                        if is_air(n, block_at) {
                             emit_face(
                                 &mut vertices,
                                 &mut indices,
@@ -613,8 +618,7 @@ where
                             );
                         }
                         let n = IVec3::new(wx - 1, wy, wz);
-                        if is_air(n, block_at)
-                        {
+                        if is_air(n, block_at) {
                             emit_face(
                                 &mut vertices,
                                 &mut indices,
@@ -630,8 +634,7 @@ where
                             );
                         }
                         let n = IVec3::new(wx, wy + 1, wz);
-                        if is_air(n, block_at)
-                        {
+                        if is_air(n, block_at) {
                             emit_face(
                                 &mut vertices,
                                 &mut indices,
@@ -647,8 +650,7 @@ where
                             );
                         }
                         let n = IVec3::new(wx, wy - 1, wz);
-                        if is_air(n, block_at)
-                        {
+                        if is_air(n, block_at) {
                             emit_face(
                                 &mut vertices,
                                 &mut indices,
@@ -664,8 +666,7 @@ where
                             );
                         }
                         let n = IVec3::new(wx, wy, wz + 1);
-                        if is_air(n, block_at)
-                        {
+                        if is_air(n, block_at) {
                             emit_face(
                                 &mut vertices,
                                 &mut indices,
@@ -681,8 +682,7 @@ where
                             );
                         }
                         let n = IVec3::new(wx, wy, wz - 1);
-                        if is_air(n, block_at)
-                        {
+                        if is_air(n, block_at) {
                             emit_face(
                                 &mut vertices,
                                 &mut indices,
@@ -726,8 +726,7 @@ where
                                         continue;
                                     }
                                     let n = IVec3::new(lx + 1, ly, lz);
-                                    if is_air(n, block_at)
-                                    {
+                                    if is_air(n, block_at) {
                                         emit_face(
                                             &mut vertices,
                                             &mut indices,
@@ -743,8 +742,7 @@ where
                                         );
                                     }
                                     let n = IVec3::new(lx - 1, ly, lz);
-                                    if is_air(n, block_at)
-                                    {
+                                    if is_air(n, block_at) {
                                         emit_face(
                                             &mut vertices,
                                             &mut indices,
@@ -760,8 +758,7 @@ where
                                         );
                                     }
                                     let n = IVec3::new(lx, ly + 1, lz);
-                                    if is_air(n, block_at)
-                                    {
+                                    if is_air(n, block_at) {
                                         emit_face(
                                             &mut vertices,
                                             &mut indices,
@@ -777,8 +774,7 @@ where
                                         );
                                     }
                                     let n = IVec3::new(lx, ly - 1, lz);
-                                    if is_air(n, block_at)
-                                    {
+                                    if is_air(n, block_at) {
                                         emit_face(
                                             &mut vertices,
                                             &mut indices,
@@ -794,8 +790,7 @@ where
                                         );
                                     }
                                     let n = IVec3::new(lx, ly, lz + 1);
-                                    if is_air(n, block_at)
-                                    {
+                                    if is_air(n, block_at) {
                                         emit_face(
                                             &mut vertices,
                                             &mut indices,
@@ -811,8 +806,7 @@ where
                                         );
                                     }
                                     let n = IVec3::new(lx, ly, lz - 1);
-                                    if is_air(n, block_at)
-                                    {
+                                    if is_air(n, block_at) {
                                         emit_face(
                                             &mut vertices,
                                             &mut indices,

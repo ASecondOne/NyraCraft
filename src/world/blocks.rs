@@ -18,7 +18,7 @@ pub struct BlockIndexEntry {
 
 pub fn default_blocks(_tiles_x: u32) -> Vec<BlockTexture> {
     // Atlas slots are 1-based in filenames. We store zero-based tile indices.
-    let tile_undefined = tile_from_slot(1);
+    let _tile_undefined = tile_from_slot(1);
     let tile_dirt = tile_from_slot(2);
     let tile_grass_top = tile_from_slot(3);
     let tile_grass_side = tile_from_slot(4);
@@ -30,7 +30,7 @@ pub fn default_blocks(_tiles_x: u32) -> Vec<BlockTexture> {
     let stone = BlockTexture {
         tiles: [tile_stone; 6],
         rotations: [0, 0, 0, 0, 0, 0],
-        transparent_mode: [0, 0, 0, 0, 0, 0],
+        transparent_mode: [3, 3, 0, 0, 0, 0],
     };
 
     let dirt = BlockTexture {
@@ -54,12 +54,12 @@ pub fn default_blocks(_tiles_x: u32) -> Vec<BlockTexture> {
 
     let log = BlockTexture {
         tiles: [
-            tile_log_oak,      // +X
-            tile_log_oak,      // -X
-            tile_log_oak_top,  // +Y (top)
-            tile_log_oak_top,  // -Y (bottom)
-            tile_log_oak,      // +Z
-            tile_log_oak,      // -Z
+            tile_log_oak,     // +X
+            tile_log_oak,     // -X
+            tile_log_oak_top, // +Y (top)
+            tile_log_oak_top, // -Y (bottom)
+            tile_log_oak,     // +Z
+            tile_log_oak,     // -Z
         ],
         rotations: [3, 3, 0, 0, 0, 0],
         transparent_mode: [0, 0, 0, 0, 0, 0],

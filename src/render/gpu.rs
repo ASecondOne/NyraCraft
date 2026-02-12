@@ -1,12 +1,15 @@
 use crate::player::Camera;
-use crate::render::atlas::TextureAtlas;
 use crate::render::CubeStyle;
-use crate::render::mesh::ChunkVertex;
-use crate::render::texture::{AtlasTexture, create_dummy_texture, load_atlas_texture, load_grass_colormap_texture};
+use crate::render::atlas::TextureAtlas;
+use crate::render::mesh::{ChunkVertex, PackedFarVertex};
+use crate::render::texture::{
+    AtlasTexture, create_dummy_texture, load_atlas_texture, load_grass_colormap_texture,
+};
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat4, Vec2, Vec3};
 use self_cell::self_cell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -14,37 +17,46 @@ use wgpu::util::DeviceExt;
 struct SceneUniform {
     mvp: [[f32; 4]; 4],
     camera_pos: [f32; 4],
-    tile_misc: [f32; 4],      // [tile_uv_x, tile_uv_y, chunk_size, colormap_scale]
-    flags0: [u32; 4],         // [use_texture, tiles_x, debug_faces, debug_chunks]
-    flags1: [u32; 4],         // [occlusion_cull, grass_top_tile, grass_side_tile, grass_overlay_tile]
-    colormap_misc: [f32; 4],  // [colormap_strength, reserved, reserved, reserved]
+    tile_misc: [f32; 4],     // [tile_uv_x, tile_uv_y, chunk_size, colormap_scale]
+    flags0: [u32; 4],        // [use_texture, tiles_x, debug_faces, debug_chunks]
+    flags1: [u32; 4], // [occlusion_cull, grass_top_tile, grass_side_tile, grass_overlay_tile]
+    colormap_misc: [f32; 4], // [colormap_strength, reserved, reserved, reserved]
 }
 
-
-
 struct SuperChunkGpuMesh {
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    index_count: u32,
+    raw_vertex_buffer: Option<wgpu::Buffer>,
+    raw_index_buffer: Option<wgpu::Buffer>,
+    raw_index_count: u32,
+    packed_vertex_buffer: Option<wgpu::Buffer>,
+    packed_index_buffer: Option<wgpu::Buffer>,
+    packed_index_count: u32,
     center: Vec3,
     radius: f32,
     line_buffer: wgpu::Buffer,
     line_count: u32,
-    slots: HashMap<IVec3, ChunkSlot>,
-    vertex_capacity: u32,
-}
-
-struct CpuChunkMesh {
-    vertices: Vec<ChunkVertex>,
-    indices: Vec<u32>,
-}
-
-struct PendingUpdate {
-    vertices: Vec<ChunkVertex>,
-    indices: Vec<u32>,
+    raw_slots: HashMap<IVec3, ChunkSlot>,
+    packed_slots: HashMap<IVec3, ChunkSlot>,
+    raw_vertex_capacity: u32,
+    packed_vertex_capacity: u32,
 }
 
 #[derive(Clone)]
+enum ChunkVertices {
+    Raw(Arc<[ChunkVertex]>),
+    PackedFar(Arc<[PackedFarVertex]>),
+}
+
+struct CpuChunkMesh {
+    vertices: ChunkVertices,
+    indices: Arc<[u32]>,
+}
+
+struct PendingUpdate {
+    vertices: ChunkVertices,
+    indices: Arc<[u32]>,
+}
+
+#[derive(Clone, Copy)]
 struct ChunkSlot {
     vertex_offset: u32,
     vertex_capacity: u32,
@@ -54,13 +66,13 @@ struct ChunkSlot {
 
 const SUPER_CHUNK_SIZE: i32 = 4;
 
-#[allow(dead_code)]
 struct GpuInner<'a> {
     surface: wgpu::Surface<'a>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     render_pipeline: wgpu::RenderPipeline,
+    packed_render_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     depth_view: wgpu::TextureView,
     uniform_buffer: wgpu::Buffer,
@@ -100,27 +112,34 @@ pub struct GpuStats {
     pub pending_updates: usize,
     pub pending_queue: usize,
     pub total_indices: u64,
-    pub total_vertices_capacity: u64,
+    pub total_raw_vertices_capacity: u64,
+    pub total_packed_vertices_capacity: u64,
 }
 
 impl Gpu {
-    pub fn new(window: winit::window::Window, style: CubeStyle, atlas: Option<TextureAtlas>) -> Self {
+    pub fn new(
+        window: winit::window::Window,
+        style: CubeStyle,
+        atlas: Option<TextureAtlas>,
+    ) -> Self {
         let cell = GpuCell::new(window, |window| {
             let size = window.inner_size();
 
             let instance = wgpu::Instance::default();
             let surface = instance.create_surface(window).unwrap();
 
-            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: Some(&surface),
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-            }))
-            .unwrap();
+            let adapter =
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    compatible_surface: Some(&surface),
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                }))
+                .unwrap();
 
-            let (device, queue) =
-                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
-                    .unwrap();
+            let (device, queue) = pollster::block_on(
+                adapter.request_device(&wgpu::DeviceDescriptor::default(), None),
+            )
+            .unwrap();
 
             let caps = surface.get_capabilities(&adapter);
             let format = caps.formats[0];
@@ -157,7 +176,12 @@ impl Gpu {
             let uniform = SceneUniform {
                 mvp: Mat4::IDENTITY.to_cols_array_2d(),
                 camera_pos: [0.0, 0.0, 0.0, 0.0],
-                tile_misc: [tile_uv_size[0], tile_uv_size[1], crate::world::CHUNK_SIZE as f32, 0.0015],
+                tile_misc: [
+                    tile_uv_size[0],
+                    tile_uv_size[1],
+                    crate::world::CHUNK_SIZE as f32,
+                    0.0015,
+                ],
                 flags0: [style.use_texture as u32, tiles_x, 0, 0],
                 flags1: [0, 2, 3, 6],
                 colormap_misc: [0.72, 0.0, 0.0, 0.0],
@@ -289,6 +313,40 @@ impl Gpu {
                 multiview: None,
             });
 
+            let packed_render_pipeline =
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("cube_packed_pipeline"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: "vs_main_packed",
+                        buffers: &[PackedFarVertex::layout()],
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        cull_mode: Some(wgpu::Face::Back),
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth24Plus,
+                        depth_write_enabled: true,
+                        depth_compare: wgpu::CompareFunction::Less,
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: "fs_main",
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: config.format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    multiview: None,
+                });
+
             let line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("line_shader"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/lines.wgsl").into()),
@@ -348,6 +406,7 @@ impl Gpu {
                 queue,
                 config,
                 render_pipeline,
+                packed_render_pipeline,
                 line_pipeline,
                 depth_view,
                 uniform_buffer,
@@ -397,8 +456,18 @@ impl Gpu {
             let uniform = SceneUniform {
                 mvp: mvp.to_cols_array_2d(),
                 camera_pos: [camera.position.x, camera.position.y, camera.position.z, 0.0],
-                tile_misc: [gpu.tile_uv_size[0], gpu.tile_uv_size[1], crate::world::CHUNK_SIZE as f32, 0.0015],
-                flags0: [self.style.use_texture as u32, gpu.tiles_x, debug_faces as u32, 0],
+                tile_misc: [
+                    gpu.tile_uv_size[0],
+                    gpu.tile_uv_size[1],
+                    crate::world::CHUNK_SIZE as f32,
+                    0.0015,
+                ],
+                flags0: [
+                    self.style.use_texture as u32,
+                    gpu.tiles_x,
+                    debug_faces as u32,
+                    0,
+                ],
                 flags1: [0, 2, 3, 6],
                 colormap_misc: [0.72, 0.0, 0.0, 0.0],
             };
@@ -459,9 +528,37 @@ impl Gpu {
                     let Some(chunk) = gpu.super_chunks.get(coord) else {
                         continue;
                     };
-                    rpass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
-                    rpass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    rpass.draw_indexed(0..chunk.index_count, 0, 0..1);
+                    if chunk.raw_index_count == 0 {
+                        continue;
+                    }
+                    let (Some(vertex_buffer), Some(index_buffer)) = (
+                        chunk.raw_vertex_buffer.as_ref(),
+                        chunk.raw_index_buffer.as_ref(),
+                    ) else {
+                        continue;
+                    };
+                    rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    rpass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    rpass.draw_indexed(0..chunk.raw_index_count, 0, 0..1);
+                }
+
+                rpass.set_pipeline(&gpu.packed_render_pipeline);
+                for coord in &gpu.visible_supers {
+                    let Some(chunk) = gpu.super_chunks.get(coord) else {
+                        continue;
+                    };
+                    if chunk.packed_index_count == 0 {
+                        continue;
+                    }
+                    let (Some(vertex_buffer), Some(index_buffer)) = (
+                        chunk.packed_vertex_buffer.as_ref(),
+                        chunk.packed_index_buffer.as_ref(),
+                    ) else {
+                        continue;
+                    };
+                    rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    rpass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    rpass.draw_indexed(0..chunk.packed_index_count, 0, 0..1);
                 }
 
                 if debug_chunks {
@@ -508,10 +605,12 @@ impl Gpu {
     pub fn stats(&self) -> GpuStats {
         self.cell.with_dependent(|_, gpu| {
             let mut total_indices = 0u64;
-            let mut total_vertices_capacity = 0u64;
+            let mut total_raw_vertices_capacity = 0u64;
+            let mut total_packed_vertices_capacity = 0u64;
             for chunk in gpu.super_chunks.values() {
-                total_indices += chunk.index_count as u64;
-                total_vertices_capacity += chunk.vertex_capacity as u64;
+                total_indices += chunk.raw_index_count as u64 + chunk.packed_index_count as u64;
+                total_raw_vertices_capacity += chunk.raw_vertex_capacity as u64;
+                total_packed_vertices_capacity += chunk.packed_vertex_capacity as u64;
             }
             GpuStats {
                 super_chunks: gpu.super_chunks.len(),
@@ -520,8 +619,23 @@ impl Gpu {
                 pending_updates: gpu.pending_updates.len(),
                 pending_queue: gpu.pending_queue.len(),
                 total_indices,
-                total_vertices_capacity,
+                total_raw_vertices_capacity,
+                total_packed_vertices_capacity,
             }
+        })
+    }
+
+    pub fn chunk_memory_bytes(&self, coord: IVec3) -> Option<u64> {
+        self.cell.with_dependent(|_, gpu| {
+            let super_coord = super_chunk_coord(coord);
+            let super_chunk = gpu.super_chunks.get(&super_coord)?;
+            if let Some(slot) = super_chunk.raw_slots.get(&coord) {
+                return Some(raw_slot_memory_bytes(slot));
+            }
+            if let Some(slot) = super_chunk.packed_slots.get(&coord) {
+                return Some(packed_slot_memory_bytes(slot));
+            }
+            None
         })
     }
 
@@ -533,19 +647,23 @@ impl Gpu {
         vertices: Vec<ChunkVertex>,
         indices: Vec<u32>,
     ) {
+        let vertices: Arc<[ChunkVertex]> = vertices.into();
+        let indices: Arc<[u32]> = indices.into();
         self.cell.with_dependent_mut(|_, gpu| {
-            let schedule_vertices = vertices.clone();
-            let schedule_indices = indices.clone();
-            gpu.chunks.insert(
-                coord,
-                CpuChunkMesh {
-                    vertices,
-                    indices,
-                },
-            );
-            if !schedule_superchunk_update(gpu, coord, schedule_vertices, schedule_indices) {
-                mark_super_dirty(gpu, super_chunk_coord(coord));
-            }
+            upsert_chunk_impl(gpu, coord, ChunkVertices::Raw(vertices), indices);
+        });
+    }
+
+    pub fn upsert_chunk_packed(
+        &mut self,
+        coord: IVec3,
+        _center: Vec3,
+        _radius: f32,
+        vertices: Arc<[PackedFarVertex]>,
+        indices: Arc<[u32]>,
+    ) {
+        self.cell.with_dependent_mut(|_, gpu| {
+            upsert_chunk_impl(gpu, coord, ChunkVertices::PackedFar(vertices), indices);
         });
     }
 
@@ -553,13 +671,45 @@ impl Gpu {
         self.cell.with_dependent_mut(|_, gpu| {
             gpu.chunks.remove(&coord);
             let super_coord = super_chunk_coord(coord);
-            let slot = gpu
-                .super_chunks
-                .get(&super_coord)
-                .and_then(|super_chunk| super_chunk.slots.get(&coord).cloned());
-            if let Some(slot) = slot {
+            let slot = gpu.super_chunks.get(&super_coord).and_then(|super_chunk| {
+                super_chunk
+                    .raw_slots
+                    .get(&coord)
+                    .copied()
+                    .map(|slot| (false, slot))
+                    .or_else(|| {
+                        super_chunk
+                            .packed_slots
+                            .get(&coord)
+                            .copied()
+                            .map(|slot| (true, slot))
+                    })
+            });
+            if let Some((is_packed, slot)) = slot {
                 if let Some(super_chunk) = gpu.super_chunks.get_mut(&super_coord) {
-                    clear_chunk_slot(&gpu.queue, super_chunk, coord, &slot);
+                    if is_packed {
+                        if let Some(index_buffer) = super_chunk.packed_index_buffer.as_ref() {
+                            clear_chunk_slot(
+                                &gpu.queue,
+                                index_buffer,
+                                &mut super_chunk.packed_slots,
+                                coord,
+                                &slot,
+                            );
+                        } else {
+                            mark_super_dirty(gpu, super_coord);
+                        }
+                    } else if let Some(index_buffer) = super_chunk.raw_index_buffer.as_ref() {
+                        clear_chunk_slot(
+                            &gpu.queue,
+                            index_buffer,
+                            &mut super_chunk.raw_slots,
+                            coord,
+                            &slot,
+                        );
+                    } else {
+                        mark_super_dirty(gpu, super_coord);
+                    }
                 } else {
                     mark_super_dirty(gpu, super_coord);
                 }
@@ -583,21 +733,20 @@ impl Gpu {
 
     pub fn rebuild_dirty_superchunks(&mut self, camera_pos: Vec3, budget: usize) {
         self.cell.with_dependent_mut(|_, gpu| {
-            for _ in 0..budget {
-                if gpu.dirty_supers.is_empty() {
+            if gpu.dirty_supers.is_empty() || budget == 0 {
+                return;
+            }
+            // Sort once by distance (descending), then pop nearest from the tail.
+            gpu.dirty_supers.sort_unstable_by(|a, b| {
+                let da = (super_chunk_center(*a) - camera_pos).length_squared();
+                let db = (super_chunk_center(*b) - camera_pos).length_squared();
+                db.total_cmp(&da)
+            });
+            let take = budget.min(gpu.dirty_supers.len());
+            for _ in 0..take {
+                let Some(coord) = gpu.dirty_supers.pop() else {
                     break;
-                }
-                let mut best_i = 0usize;
-                let mut best_dist = f32::MAX;
-                for (i, coord) in gpu.dirty_supers.iter().enumerate() {
-                    let center = super_chunk_center(*coord);
-                    let dist = (center - camera_pos).length_squared();
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_i = i;
-                    }
-                }
-                let coord = gpu.dirty_supers.swap_remove(best_i);
+                };
                 gpu.dirty_set.remove(&coord);
                 rebuild_superchunk(gpu, coord);
             }
@@ -608,6 +757,11 @@ impl Gpu {
         self.cell.with_dependent_mut(|_, gpu| {
             let draw_radius = draw_radius as f32 * crate::world::CHUNK_SIZE as f32;
             let draw_radius_sq = draw_radius * draw_radius;
+            let camera_forward = if camera.forward.length_squared() > 1.0e-8 {
+                camera.forward.normalize()
+            } else {
+                Vec3::new(0.0, 0.0, -1.0)
+            };
             gpu.visible_supers.clear();
             gpu.visible_supers.reserve(gpu.super_chunks.len());
             for (coord, chunk) in &gpu.super_chunks {
@@ -622,7 +776,7 @@ impl Gpu {
                     continue;
                 }
 
-                if !chunk_visible(camera.position, camera.forward, chunk) {
+                if !chunk_visible(camera.position, camera_forward, chunk) {
                     continue;
                 }
                 gpu.visible_supers.push(*coord);
@@ -662,12 +816,37 @@ fn mark_super_dirty(gpu: &mut GpuInner, coord: IVec3) {
     }
 }
 
+fn upsert_chunk_impl(
+    gpu: &mut GpuInner,
+    coord: IVec3,
+    vertices: ChunkVertices,
+    indices: Arc<[u32]>,
+) {
+    gpu.chunks.insert(
+        coord,
+        CpuChunkMesh {
+            vertices: vertices.clone(),
+            indices: Arc::clone(&indices),
+        },
+    );
+    if !schedule_superchunk_update(gpu, coord, vertices, indices) {
+        mark_super_dirty(gpu, super_chunk_coord(coord));
+    }
+}
+
 fn rebuild_superchunk(gpu: &mut GpuInner, coord: IVec3) {
-    let mut vertices: Vec<ChunkVertex> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-    let mut slots: HashMap<IVec3, ChunkSlot> = HashMap::new();
-    let mut vertex_cursor = 0u32;
-    let mut index_cursor = 0u32;
+    let mut raw_vertices: Vec<ChunkVertex> = Vec::new();
+    let mut raw_indices: Vec<u32> = Vec::new();
+    let mut raw_slots: HashMap<IVec3, ChunkSlot> = HashMap::new();
+    let mut raw_vertex_cursor = 0u32;
+    let mut raw_index_cursor = 0u32;
+
+    let mut packed_vertices: Vec<PackedFarVertex> = Vec::new();
+    let mut packed_indices: Vec<u32> = Vec::new();
+    let mut packed_slots: HashMap<IVec3, ChunkSlot> = HashMap::new();
+    let mut packed_vertex_cursor = 0u32;
+    let mut packed_index_cursor = 0u32;
+
     let origin = IVec3::new(
         coord.x * SUPER_CHUNK_SIZE,
         coord.y * SUPER_CHUNK_SIZE,
@@ -681,53 +860,127 @@ fn rebuild_superchunk(gpu: &mut GpuInner, coord: IVec3) {
                 let Some(chunk) = gpu.chunks.get(&c) else {
                     continue;
                 };
-                if chunk.vertices.is_empty() || chunk.indices.is_empty() {
+                let chunk_vertex_len = match &chunk.vertices {
+                    ChunkVertices::Raw(vertices) => vertices.len(),
+                    ChunkVertices::PackedFar(vertices) => vertices.len(),
+                };
+                if chunk_vertex_len == 0 || chunk.indices.is_empty() {
                     continue;
                 }
-                let vertex_capacity = next_pow2_u32(chunk.vertices.len().max(1) as u32);
+                let vertex_capacity = next_pow2_u32(chunk_vertex_len.max(1) as u32);
                 let mut index_capacity = next_pow2_u32(chunk.indices.len().max(3) as u32);
-                if index_capacity % 3 != 0 {
+                if !index_capacity.is_multiple_of(3) {
                     index_capacity += 3 - (index_capacity % 3);
                 }
-                let slot = ChunkSlot {
-                    vertex_offset: vertex_cursor,
-                    vertex_capacity,
-                    index_offset: index_cursor,
-                    index_capacity,
-                };
-                slots.insert(c, slot.clone());
+                match &chunk.vertices {
+                    ChunkVertices::Raw(raw) => {
+                        let slot = ChunkSlot {
+                            vertex_offset: raw_vertex_cursor,
+                            vertex_capacity,
+                            index_offset: raw_index_cursor,
+                            index_capacity,
+                        };
+                        raw_slots.insert(c, slot);
 
-                vertices.extend_from_slice(&chunk.vertices);
-                vertices.resize((vertex_cursor + vertex_capacity) as usize, ChunkVertex::zeroed());
+                        raw_vertices.extend_from_slice(raw);
+                        raw_vertices.resize(
+                            (raw_vertex_cursor + vertex_capacity) as usize,
+                            ChunkVertex::zeroed(),
+                        );
 
-                indices.extend(chunk.indices.iter().map(|i| i + vertex_cursor));
-                let pad = index_capacity.saturating_sub(chunk.indices.len() as u32);
-                if pad > 0 {
-                    let degenerate = vertex_cursor;
-                    indices.extend(std::iter::repeat(degenerate).take(pad as usize));
+                        raw_indices.extend(chunk.indices.iter().map(|i| i + raw_vertex_cursor));
+                        let pad = index_capacity.saturating_sub(chunk.indices.len() as u32);
+                        if pad > 0 {
+                            raw_indices
+                                .extend(std::iter::repeat_n(raw_vertex_cursor, pad as usize));
+                        }
+                        raw_vertex_cursor += vertex_capacity;
+                        raw_index_cursor += index_capacity;
+                    }
+                    ChunkVertices::PackedFar(packed) => {
+                        let slot = ChunkSlot {
+                            vertex_offset: packed_vertex_cursor,
+                            vertex_capacity,
+                            index_offset: packed_index_cursor,
+                            index_capacity,
+                        };
+                        packed_slots.insert(c, slot);
+
+                        packed_vertices.extend_from_slice(packed);
+                        packed_vertices.resize(
+                            (packed_vertex_cursor + vertex_capacity) as usize,
+                            PackedFarVertex::zeroed(),
+                        );
+
+                        packed_indices
+                            .extend(chunk.indices.iter().map(|i| i + packed_vertex_cursor));
+                        let pad = index_capacity.saturating_sub(chunk.indices.len() as u32);
+                        if pad > 0 {
+                            packed_indices
+                                .extend(std::iter::repeat_n(packed_vertex_cursor, pad as usize));
+                        }
+                        packed_vertex_cursor += vertex_capacity;
+                        packed_index_cursor += index_capacity;
+                    }
                 }
-
-                vertex_cursor += vertex_capacity;
-                index_cursor += index_capacity;
             }
         }
     }
 
-    if vertices.is_empty() || indices.is_empty() {
+    if raw_indices.is_empty() && packed_indices.is_empty() {
         gpu.super_chunks.remove(&coord);
         return;
     }
 
-    let vertex_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("super_chunk_vertex_buffer"),
-        contents: bytemuck::cast_slice(&vertices),
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-    });
-    let index_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("super_chunk_index_buffer"),
-        contents: bytemuck::cast_slice(&indices),
-        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-    });
+    let raw_vertex_buffer = if raw_vertices.is_empty() {
+        None
+    } else {
+        Some(
+            gpu.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("super_chunk_vertex_buffer_raw"),
+                    contents: bytemuck::cast_slice(&raw_vertices),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                }),
+        )
+    };
+    let raw_index_buffer = if raw_indices.is_empty() {
+        None
+    } else {
+        Some(
+            gpu.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("super_chunk_index_buffer_raw"),
+                    contents: bytemuck::cast_slice(&raw_indices),
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                }),
+        )
+    };
+
+    let packed_vertex_buffer = if packed_vertices.is_empty() {
+        None
+    } else {
+        Some(
+            gpu.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("super_chunk_vertex_buffer_packed"),
+                    contents: bytemuck::cast_slice(&packed_vertices),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                }),
+        )
+    };
+    let packed_index_buffer = if packed_indices.is_empty() {
+        None
+    } else {
+        Some(
+            gpu.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("super_chunk_index_buffer_packed"),
+                    contents: bytemuck::cast_slice(&packed_indices),
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                }),
+        )
+    };
 
     let size = SUPER_CHUNK_SIZE as f32 * crate::world::CHUNK_SIZE as f32;
     let half = size * 0.5;
@@ -735,24 +988,31 @@ fn rebuild_superchunk(gpu: &mut GpuInner, coord: IVec3) {
     let radius = half * (3.0f32).sqrt();
 
     let line_vertices = super_chunk_wireframe_vertices(coord);
-    let line_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("super_chunk_line_buffer"),
-        contents: bytemuck::cast_slice(&line_vertices),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
+    let line_buffer = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("super_chunk_line_buffer"),
+            contents: bytemuck::cast_slice(&line_vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
 
     gpu.super_chunks.insert(
         coord,
         SuperChunkGpuMesh {
-            vertex_buffer,
-            index_buffer,
-            index_count: indices.len() as u32,
+            raw_vertex_buffer,
+            raw_index_buffer,
+            raw_index_count: raw_indices.len() as u32,
+            packed_vertex_buffer,
+            packed_index_buffer,
+            packed_index_count: packed_indices.len() as u32,
             center,
             radius,
             line_buffer,
             line_count: line_vertices.len() as u32,
-            slots,
-            vertex_capacity: vertex_cursor,
+            raw_slots,
+            packed_slots,
+            raw_vertex_capacity: raw_vertex_cursor,
+            packed_vertex_capacity: packed_vertex_cursor,
         },
     );
 }
@@ -786,11 +1046,8 @@ fn super_chunk_wireframe_vertices(coord: IVec3) -> Vec<[f32; 3]> {
     let p111 = [max.x, max.y, max.z];
 
     vec![
-        p000, p001, p000, p010, p000, p100,
-        p111, p110, p111, p101, p111, p011,
-        p001, p011, p001, p101,
-        p010, p011, p010, p110,
-        p100, p101, p100, p110,
+        p000, p001, p000, p010, p000, p100, p111, p110, p111, p101, p111, p011, p001, p011, p001,
+        p101, p010, p011, p010, p110, p100, p101, p100, p110,
     ]
 }
 
@@ -840,7 +1097,10 @@ fn block_outline_vertices(coord: IVec3) -> Vec<[f32; 3]> {
     vertices
 }
 
-fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+fn create_depth_view(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth_texture"),
         size: wgpu::Extent3d {
@@ -859,16 +1119,19 @@ fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration)
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-fn chunk_visible(camera_pos: Vec3, camera_forward: Vec3, chunk: &SuperChunkGpuMesh) -> bool {
+fn chunk_visible(
+    camera_pos: Vec3,
+    camera_forward_normalized: Vec3,
+    chunk: &SuperChunkGpuMesh,
+) -> bool {
     let to_center = chunk.center - camera_pos;
     let dist_sq = to_center.length_squared();
     if dist_sq <= chunk.radius * chunk.radius {
         return true;
     }
     let dist = dist_sq.sqrt();
-    let forward = camera_forward.normalize();
     let dir = to_center / dist;
-    let dot = forward.dot(dir);
+    let dot = camera_forward_normalized.dot(dir);
     if dot <= 0.0 {
         return false;
     }
@@ -882,40 +1145,85 @@ fn next_pow2_u32(v: u32) -> u32 {
     v.next_power_of_two().max(1)
 }
 
+fn raw_slot_memory_bytes(slot: &ChunkSlot) -> u64 {
+    slot.vertex_capacity as u64 * std::mem::size_of::<ChunkVertex>() as u64
+        + slot.index_capacity as u64 * std::mem::size_of::<u32>() as u64
+}
+
+fn packed_slot_memory_bytes(slot: &ChunkSlot) -> u64 {
+    slot.vertex_capacity as u64 * std::mem::size_of::<PackedFarVertex>() as u64
+        + slot.index_capacity as u64 * std::mem::size_of::<u32>() as u64
+}
+
 fn schedule_superchunk_update(
     gpu: &mut GpuInner,
     coord: IVec3,
-    vertices: Vec<ChunkVertex>,
-    indices: Vec<u32>,
+    vertices: ChunkVertices,
+    indices: Arc<[u32]>,
 ) -> bool {
     let super_coord = super_chunk_coord(coord);
-    let Some(slot) = gpu
-        .super_chunks
-        .get(&super_coord)
-        .and_then(|super_chunk| super_chunk.slots.get(&coord).cloned())
+    let Some((slot, is_packed)) =
+        gpu.super_chunks
+            .get(&super_coord)
+            .and_then(|super_chunk| match &vertices {
+                ChunkVertices::Raw(_) => super_chunk
+                    .raw_slots
+                    .get(&coord)
+                    .copied()
+                    .map(|slot| (slot, false)),
+                ChunkVertices::PackedFar(_) => super_chunk
+                    .packed_slots
+                    .get(&coord)
+                    .copied()
+                    .map(|slot| (slot, true)),
+            })
     else {
         return false;
     };
-    if vertices.is_empty() || indices.is_empty() {
+    let vertex_count = match &vertices {
+        ChunkVertices::Raw(raw) => raw.len(),
+        ChunkVertices::PackedFar(packed) => packed.len(),
+    };
+    if vertex_count == 0 || indices.is_empty() {
         let Some(super_chunk) = gpu.super_chunks.get_mut(&super_coord) else {
             return false;
         };
-        clear_chunk_slot(&gpu.queue, super_chunk, coord, &slot);
+        if is_packed {
+            if let Some(index_buffer) = super_chunk.packed_index_buffer.as_ref() {
+                clear_chunk_slot(
+                    &gpu.queue,
+                    index_buffer,
+                    &mut super_chunk.packed_slots,
+                    coord,
+                    &slot,
+                );
+            } else {
+                return false;
+            }
+        } else if let Some(index_buffer) = super_chunk.raw_index_buffer.as_ref() {
+            clear_chunk_slot(
+                &gpu.queue,
+                index_buffer,
+                &mut super_chunk.raw_slots,
+                coord,
+                &slot,
+            );
+        } else {
+            return false;
+        }
         return true;
     }
-    if vertices.len() as u32 > slot.vertex_capacity {
+    if vertex_count as u32 > slot.vertex_capacity {
         return false;
     }
     if indices.len() as u32 > slot.index_capacity {
         return false;
     }
-    if gpu.pending_updates.insert(
-        coord,
-        PendingUpdate {
-            vertices,
-            indices,
-        },
-    ).is_none() {
+    if gpu
+        .pending_updates
+        .insert(coord, PendingUpdate { vertices, indices })
+        .is_none()
+    {
         gpu.pending_queue.push_back(coord);
     }
     true
@@ -923,19 +1231,16 @@ fn schedule_superchunk_update(
 
 fn clear_chunk_slot(
     queue: &wgpu::Queue,
-    super_chunk: &mut SuperChunkGpuMesh,
+    index_buffer: &wgpu::Buffer,
+    slots: &mut HashMap<IVec3, ChunkSlot>,
     coord: IVec3,
     slot: &ChunkSlot,
 ) {
     let zero_indices = vec![slot.vertex_offset; slot.index_capacity as usize];
     let i_start = slot.index_offset as wgpu::BufferAddress
         * std::mem::size_of::<u32>() as wgpu::BufferAddress;
-    queue.write_buffer(
-        &super_chunk.index_buffer,
-        i_start,
-        bytemuck::cast_slice(&zero_indices),
-    );
-    super_chunk.slots.remove(&coord);
+    queue.write_buffer(index_buffer, i_start, bytemuck::cast_slice(&zero_indices));
+    slots.remove(&coord);
 }
 
 fn apply_pending_uploads(gpu: &mut GpuInner, budget: usize) {
@@ -947,28 +1252,71 @@ fn apply_pending_uploads(gpu: &mut GpuInner, budget: usize) {
             continue;
         };
         let super_coord = super_chunk_coord(coord);
-        let Some(super_chunk) = gpu.super_chunks.get(&super_coord) else {
+        let Some((slot, is_packed)) =
+            gpu.super_chunks
+                .get(&super_coord)
+                .and_then(|super_chunk| match &update.vertices {
+                    ChunkVertices::Raw(_) => super_chunk
+                        .raw_slots
+                        .get(&coord)
+                        .copied()
+                        .map(|slot| (slot, false)),
+                    ChunkVertices::PackedFar(_) => super_chunk
+                        .packed_slots
+                        .get(&coord)
+                        .copied()
+                        .map(|slot| (slot, true)),
+                })
+        else {
             mark_super_dirty(gpu, super_coord);
             continue;
         };
-        let Some(slot) = super_chunk.slots.get(&coord).cloned() else {
-            mark_super_dirty(gpu, super_coord);
-            continue;
+        let vertex_count = match &update.vertices {
+            ChunkVertices::Raw(raw) => raw.len(),
+            ChunkVertices::PackedFar(packed) => packed.len(),
         };
-        if update.vertices.len() as u32 > slot.vertex_capacity
+        if vertex_count as u32 > slot.vertex_capacity
             || update.indices.len() as u32 > slot.index_capacity
         {
             mark_super_dirty(gpu, super_coord);
             continue;
         }
 
-        let v_start = slot.vertex_offset as wgpu::BufferAddress
-            * std::mem::size_of::<ChunkVertex>() as wgpu::BufferAddress;
-        gpu.queue.write_buffer(
-            &super_chunk.vertex_buffer,
-            v_start,
-            bytemuck::cast_slice(&update.vertices),
-        );
+        if is_packed {
+            let Some(vertex_buffer) = gpu
+                .super_chunks
+                .get(&super_coord)
+                .and_then(|super_chunk| super_chunk.packed_vertex_buffer.as_ref())
+            else {
+                mark_super_dirty(gpu, super_coord);
+                continue;
+            };
+            let ChunkVertices::PackedFar(packed) = &update.vertices else {
+                mark_super_dirty(gpu, super_coord);
+                continue;
+            };
+            let v_start = slot.vertex_offset as wgpu::BufferAddress
+                * std::mem::size_of::<PackedFarVertex>() as wgpu::BufferAddress;
+            gpu.queue
+                .write_buffer(vertex_buffer, v_start, bytemuck::cast_slice(packed));
+        } else {
+            let Some(vertex_buffer) = gpu
+                .super_chunks
+                .get(&super_coord)
+                .and_then(|super_chunk| super_chunk.raw_vertex_buffer.as_ref())
+            else {
+                mark_super_dirty(gpu, super_coord);
+                continue;
+            };
+            let ChunkVertices::Raw(raw) = &update.vertices else {
+                mark_super_dirty(gpu, super_coord);
+                continue;
+            };
+            let v_start = slot.vertex_offset as wgpu::BufferAddress
+                * std::mem::size_of::<ChunkVertex>() as wgpu::BufferAddress;
+            gpu.queue
+                .write_buffer(vertex_buffer, v_start, bytemuck::cast_slice(raw));
+        }
 
         gpu.staged_indices.clear();
         if gpu.staged_indices.capacity() < slot.index_capacity as usize {
@@ -977,15 +1325,27 @@ fn apply_pending_uploads(gpu: &mut GpuInner, budget: usize) {
         }
         gpu.staged_indices
             .extend(update.indices.iter().map(|i| i + slot.vertex_offset));
-        let pad = slot.index_capacity.saturating_sub(update.indices.len() as u32);
+        let pad = slot
+            .index_capacity
+            .saturating_sub(update.indices.len() as u32);
         if pad > 0 {
             gpu.staged_indices
-                .extend(std::iter::repeat(slot.vertex_offset).take(pad as usize));
+                .extend(std::iter::repeat_n(slot.vertex_offset, pad as usize));
         }
         let i_start = slot.index_offset as wgpu::BufferAddress
             * std::mem::size_of::<u32>() as wgpu::BufferAddress;
+        let Some(index_buffer) = gpu.super_chunks.get(&super_coord).and_then(|super_chunk| {
+            if is_packed {
+                super_chunk.packed_index_buffer.as_ref()
+            } else {
+                super_chunk.raw_index_buffer.as_ref()
+            }
+        }) else {
+            mark_super_dirty(gpu, super_coord);
+            continue;
+        };
         gpu.queue.write_buffer(
-            &super_chunk.index_buffer,
+            index_buffer,
             i_start,
             bytemuck::cast_slice(&gpu.staged_indices),
         );

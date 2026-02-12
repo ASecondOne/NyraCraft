@@ -1,4 +1,3 @@
-use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Vec3};
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -10,12 +9,12 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use crate::render::mesh::ChunkVertex;
+use crate::render::mesh::{ChunkVertex, PackedFarVertex};
 use crate::render::{Gpu, GpuStats};
+use crate::world::CHUNK_SIZE;
 use crate::world::blocks::block_name_by_id;
 use crate::world::mesher::{MeshData, MeshMode};
-use crate::world::worldgen::{TreeSpec, WorldGen, WORLD_HALF_SIZE_CHUNKS};
-use crate::world::CHUNK_SIZE;
+use crate::world::worldgen::{TreeSpec, WORLD_HALF_SIZE_CHUNKS, WorldGen};
 
 pub enum WorkerResult {
     Raw {
@@ -35,8 +34,8 @@ pub struct PackedMeshData {
     pub mode: MeshMode,
     pub center: Vec3,
     pub radius: f32,
-    pub vertices: Vec<PackedFarVertex>,
-    pub indices: Vec<u32>,
+    pub vertices: Arc<[PackedFarVertex]>,
+    pub indices: Arc<[u32]>,
 }
 
 pub enum CacheWriteMsg {
@@ -46,8 +45,8 @@ pub enum CacheWriteMsg {
         mode: MeshMode,
         center: Vec3,
         radius: f32,
-        vertices: Vec<PackedFarVertex>,
-        indices: Vec<u32>,
+        vertices: Arc<[PackedFarVertex]>,
+        indices: Arc<[u32]>,
     },
 }
 
@@ -58,6 +57,13 @@ pub struct RequestTask {
     pub coord: IVec3,
     pub step: i32,
     pub mode: MeshMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestClass {
+    Edit,
+    Near,
+    Far,
 }
 
 impl PartialEq for RequestTask {
@@ -83,17 +89,34 @@ impl Ord for RequestTask {
 }
 
 pub struct RequestQueueState {
-    pub heap: BinaryHeap<RequestTask>,
+    pub edit_heap: BinaryHeap<RequestTask>,
+    pub near_heap: BinaryHeap<RequestTask>,
+    pub far_heap: BinaryHeap<RequestTask>,
+    pub latest_task_by_chunk: HashMap<ChunkKey, PendingTaskMeta>,
     pub next_seq: u64,
     pub closed: bool,
 }
 
+#[derive(Clone, Copy)]
+pub struct PendingTaskMeta {
+    pub seq: u64,
+    pub class: RequestClass,
+    pub mode: MeshMode,
+    pub step: i32,
+}
+
 pub type SharedRequestQueue = Arc<(Mutex<RequestQueueState>, Condvar)>;
+type ChunkKey = (i32, i32, i32);
+pub type DirtyChunks = Arc<Mutex<HashMap<ChunkKey, u64>>>;
+pub type EditedChunkRanges = Arc<Mutex<HashMap<ChunkKey, (i32, i32)>>>;
 
 pub fn new_request_queue() -> SharedRequestQueue {
     Arc::new((
         Mutex::new(RequestQueueState {
-            heap: BinaryHeap::new(),
+            edit_heap: BinaryHeap::new(),
+            near_heap: BinaryHeap::new(),
+            far_heap: BinaryHeap::new(),
+            latest_task_by_chunk: HashMap::new(),
             next_seq: 0,
             closed: false,
         }),
@@ -104,24 +127,18 @@ pub fn new_request_queue() -> SharedRequestQueue {
 const MESH_CACHE_MAGIC: &[u8; 4] = b"MSH1";
 const CACHE_ENCODING_PACKED_FAR: u8 = 1;
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct PackedFarVertex {
-    position: [i16; 3],
-    uv: [u16; 2],
-    tile: u16,
-    face: u8,
-    rotation: u8,
-    use_texture: u8,
-    transparent_mode: u8,
-    color: [u8; 4],
-}
-
 pub struct MeshCacheEntry {
     pub center: Vec3,
     pub radius: f32,
     pub vertices: Vec<PackedFarVertex>,
     pub indices: Vec<u32>,
+}
+
+pub struct CacheMeshView<'a> {
+    pub center: Vec3,
+    pub radius: f32,
+    pub vertices: &'a [PackedFarVertex],
+    pub indices: &'a [u32],
 }
 
 impl MeshCacheEntry {
@@ -133,8 +150,8 @@ impl MeshCacheEntry {
                 mode,
                 center: self.center,
                 radius: self.radius,
-                vertices: self.vertices,
-                indices: self.indices,
+                vertices: self.vertices.into(),
+                indices: self.indices.into(),
             },
             dirty_rev: None,
         }
@@ -151,10 +168,8 @@ pub fn chunk_coord_from_pos(pos: Vec3) -> IVec3 {
 }
 
 fn in_world_chunk_bounds(cx: i32, cz: i32) -> bool {
-    cx >= -WORLD_HALF_SIZE_CHUNKS
-        && cx < WORLD_HALF_SIZE_CHUNKS
-        && cz >= -WORLD_HALF_SIZE_CHUNKS
-        && cz < WORLD_HALF_SIZE_CHUNKS
+    (-WORLD_HALF_SIZE_CHUNKS..WORLD_HALF_SIZE_CHUNKS).contains(&cx)
+        && (-WORLD_HALF_SIZE_CHUNKS..WORLD_HALF_SIZE_CHUNKS).contains(&cz)
 }
 
 fn height_at_cached(
@@ -234,6 +249,53 @@ pub fn is_solid_cached(
     false
 }
 
+pub fn block_id_full_cached(
+    world_gen: &WorldGen,
+    height_cache: &RefCell<HashMap<(i32, i32), i32>>,
+    tree_cache: &RefCell<HashMap<(i32, i32), Option<TreeSpec>>>,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> i8 {
+    if !world_gen.in_world_bounds(x, z) {
+        return -1;
+    }
+
+    let height = height_at_cached(world_gen, height_cache, x, z);
+    if y <= height {
+        return world_gen.block_id_at(x, y, z, height);
+    }
+
+    let max_leaf_r = 3;
+    for tz in (z - max_leaf_r)..=(z + max_leaf_r) {
+        for tx in (x - max_leaf_r)..=(x + max_leaf_r) {
+            let Some(tree) = tree_at_cached(world_gen, height_cache, tree_cache, tx, tz) else {
+                continue;
+            };
+
+            let trunk_end = tree.base_y + tree.trunk_h;
+            if x == tx && z == tz && y >= tree.base_y && y < trunk_end {
+                return crate::world::blocks::BLOCK_LOG as i8;
+            }
+
+            let dy = y - trunk_end;
+            if dy < -tree.leaf_r || dy > tree.leaf_r {
+                continue;
+            }
+            let dx = x - tx;
+            let dz = z - tz;
+            if dx * dx + dy * dy + dz * dz <= tree.leaf_r * tree.leaf_r {
+                if dx == 0 && dz == 0 && y >= tree.base_y && y < trunk_end {
+                    continue;
+                }
+                return crate::world::blocks::BLOCK_LEAVES as i8;
+            }
+        }
+    }
+
+    -1
+}
+
 fn ring_length(r: i32) -> i32 {
     if r == 0 { 1 } else { 8 * r }
 }
@@ -255,70 +317,6 @@ fn ring_coord(r: i32, i: i32) -> (i32, i32) {
 
 pub fn should_pack_far_lod(mode: MeshMode, step: i32) -> bool {
     mode == MeshMode::SurfaceOnly || step >= 6
-}
-
-fn quantize_unorm01_to_u8(v: f32) -> u8 {
-    (v.clamp(0.0, 1.0) * 255.0).round() as u8
-}
-
-fn quantize_uv_to_u16(v: f32) -> u16 {
-    (v.clamp(-8.0, 8.0) * 4096.0).round() as i32 as u16
-}
-
-fn dequantize_uv_from_u16(v: u16) -> f32 {
-    (v as i16 as f32) / 4096.0
-}
-
-pub fn pack_far_vertices(vertices: &[ChunkVertex]) -> Vec<PackedFarVertex> {
-    let mut packed = Vec::with_capacity(vertices.len());
-    for v in vertices {
-        packed.push(PackedFarVertex {
-            position: [
-                v.position[0].round() as i16,
-                v.position[1].round() as i16,
-                v.position[2].round() as i16,
-            ],
-            uv: [quantize_uv_to_u16(v.uv[0]), quantize_uv_to_u16(v.uv[1])],
-            tile: v.tile.min(u16::MAX as u32) as u16,
-            face: v.face.min(u8::MAX as u32) as u8,
-            rotation: v.rotation.min(u8::MAX as u32) as u8,
-            use_texture: v.use_texture.min(u8::MAX as u32) as u8,
-            transparent_mode: v.transparent_mode.min(u8::MAX as u32) as u8,
-            color: [
-                quantize_unorm01_to_u8(v.color[0]),
-                quantize_unorm01_to_u8(v.color[1]),
-                quantize_unorm01_to_u8(v.color[2]),
-                quantize_unorm01_to_u8(v.color[3]),
-            ],
-        });
-    }
-    packed
-}
-
-fn unpack_far_vertices(vertices: &[PackedFarVertex]) -> Vec<ChunkVertex> {
-    let mut unpacked = Vec::with_capacity(vertices.len());
-    for v in vertices {
-        unpacked.push(ChunkVertex {
-            position: [
-                v.position[0] as f32,
-                v.position[1] as f32,
-                v.position[2] as f32,
-            ],
-            uv: [dequantize_uv_from_u16(v.uv[0]), dequantize_uv_from_u16(v.uv[1])],
-            tile: v.tile as u32,
-            face: v.face as u32,
-            rotation: v.rotation as u32,
-            use_texture: v.use_texture as u32,
-            transparent_mode: v.transparent_mode as u32,
-            color: [
-                v.color[0] as f32 / 255.0,
-                v.color[1] as f32 / 255.0,
-                v.color[2] as f32 / 255.0,
-                v.color[3] as f32 / 255.0,
-            ],
-        });
-    }
-    unpacked
 }
 
 pub fn mesh_cache_dir(world_id: u64) -> PathBuf {
@@ -364,22 +362,25 @@ fn read_f32_le(data: &[u8], cursor: &mut usize) -> Option<f32> {
     Some(f32::from_le_bytes(buf))
 }
 
-fn serialize_cache_entry(entry: &MeshCacheEntry) -> Vec<u8> {
-    let mut out = Vec::with_capacity(
-        48 + entry.vertices.len() * std::mem::size_of::<PackedFarVertex>()
-            + entry.indices.len() * std::mem::size_of::<u32>(),
-    );
+fn serialize_cache_entry(
+    center: Vec3,
+    radius: f32,
+    vertices: &[PackedFarVertex],
+    indices: &[u32],
+) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(48 + std::mem::size_of_val(vertices) + std::mem::size_of_val(indices));
     out.extend_from_slice(MESH_CACHE_MAGIC);
     out.push(CACHE_ENCODING_PACKED_FAR);
     out.extend_from_slice(&[0_u8; 3]);
-    write_f32_le(&mut out, entry.center.x);
-    write_f32_le(&mut out, entry.center.y);
-    write_f32_le(&mut out, entry.center.z);
-    write_f32_le(&mut out, entry.radius);
-    write_u32_le(&mut out, entry.vertices.len() as u32);
-    write_u32_le(&mut out, entry.indices.len() as u32);
-    out.extend_from_slice(bytemuck::cast_slice(&entry.vertices));
-    out.extend_from_slice(bytemuck::cast_slice(&entry.indices));
+    write_f32_le(&mut out, center.x);
+    write_f32_le(&mut out, center.y);
+    write_f32_le(&mut out, center.z);
+    write_f32_le(&mut out, radius);
+    write_u32_le(&mut out, vertices.len() as u32);
+    write_u32_le(&mut out, indices.len() as u32);
+    out.extend_from_slice(bytemuck::cast_slice(vertices));
+    out.extend_from_slice(bytemuck::cast_slice(indices));
     out
 }
 
@@ -427,39 +428,194 @@ pub fn try_load_cached_mesh(
     parse_cache_entry(&bytes)
 }
 
-pub fn write_cached_mesh(cache_dir: &Path, coord: IVec3, step: i32, mode: MeshMode, entry: &MeshCacheEntry) {
+pub fn write_cached_mesh(
+    cache_dir: &Path,
+    coord: IVec3,
+    step: i32,
+    mode: MeshMode,
+    mesh: CacheMeshView<'_>,
+) {
     let path = mesh_cache_path(cache_dir, coord, step, mode);
     let tmp_path = path.with_extension("tmp");
-    let bytes = serialize_cache_entry(entry);
+    let bytes = serialize_cache_entry(mesh.center, mesh.radius, mesh.vertices, mesh.indices);
     if fs::write(&tmp_path, bytes).is_ok() {
         let _ = fs::rename(&tmp_path, &path);
     }
 }
 
-fn enqueue_request(queue: &SharedRequestQueue, coord: IVec3, step: i32, mode: MeshMode, priority: i32) {
+fn enqueue_request(
+    queue: &SharedRequestQueue,
+    coord: IVec3,
+    step: i32,
+    mode: MeshMode,
+    class: RequestClass,
+    priority: i32,
+) {
     let (lock, cvar) = &**queue;
     let mut state = lock.lock().unwrap();
+    let key = (coord.x, coord.y, coord.z);
+    if let Some(existing) = state.latest_task_by_chunk.get(&key).copied()
+        && !should_replace_pending(existing, class, mode, step)
+    {
+        return;
+    }
     let seq = state.next_seq;
     state.next_seq = state.next_seq.wrapping_add(1);
-    state.heap.push(RequestTask {
+    state.latest_task_by_chunk.insert(
+        key,
+        PendingTaskMeta {
+            seq,
+            class,
+            mode,
+            step,
+        },
+    );
+    let task = RequestTask {
         priority,
         seq,
         coord,
         step,
         mode,
-    });
+    };
+    match class {
+        RequestClass::Edit => state.edit_heap.push(task),
+        RequestClass::Near => state.near_heap.push(task),
+        RequestClass::Far => state.far_heap.push(task),
+    }
     cvar.notify_one();
 }
 
 pub fn request_chunk_remesh_now(queue: &SharedRequestQueue, coord: IVec3) {
-    enqueue_request(queue, coord, 1, MeshMode::Full, 1_000_000_000);
+    enqueue_request(
+        queue,
+        coord,
+        1,
+        MeshMode::Full,
+        RequestClass::Edit,
+        i32::MAX,
+    );
+}
+
+fn pop_fresh_from_heap(
+    heap: &mut BinaryHeap<RequestTask>,
+    latest_task_by_chunk: &mut HashMap<ChunkKey, PendingTaskMeta>,
+) -> Option<RequestTask> {
+    while let Some(task) = heap.pop() {
+        let key = (task.coord.x, task.coord.y, task.coord.z);
+        let Some(latest) = latest_task_by_chunk.get(&key).copied() else {
+            continue;
+        };
+        if task.seq != latest.seq {
+            continue;
+        }
+        latest_task_by_chunk.remove(&key);
+        return Some(task);
+    }
+    None
+}
+
+fn class_rank(class: RequestClass) -> i32 {
+    match class {
+        RequestClass::Edit => 3,
+        RequestClass::Near => 2,
+        RequestClass::Far => 1,
+    }
+}
+
+fn mode_rank(mode: MeshMode) -> i32 {
+    match mode {
+        MeshMode::Full => 3,
+        MeshMode::SurfaceSides => 2,
+        MeshMode::SurfaceOnly => 1,
+    }
+}
+
+fn should_replace_pending(
+    existing: PendingTaskMeta,
+    new_class: RequestClass,
+    new_mode: MeshMode,
+    new_step: i32,
+) -> bool {
+    let existing_class_rank = class_rank(existing.class);
+    let new_class_rank = class_rank(new_class);
+    if new_class_rank > existing_class_rank {
+        return true;
+    }
+    if new_class_rank < existing_class_rank {
+        return false;
+    }
+
+    let existing_mode_rank = mode_rank(existing.mode);
+    let new_mode_rank = mode_rank(new_mode);
+    if new_mode_rank > existing_mode_rank {
+        return true;
+    }
+    if new_mode_rank < existing_mode_rank {
+        return false;
+    }
+
+    // Lower step means higher quality.
+    if new_step < existing.step {
+        return true;
+    }
+    if new_step > existing.step {
+        return false;
+    }
+
+    // Same class/quality: allow refreshing priority.
+    true
+}
+
+fn pop_adaptive(state: &mut RequestQueueState) -> Option<RequestTask> {
+    let edit_len = state.edit_heap.len();
+    let near_len = state.near_heap.len();
+    let far_len = state.far_heap.len();
+
+    if edit_len + near_len + far_len == 0 {
+        return None;
+    }
+
+    // Hard top priority for edits.
+    if edit_len > 0 {
+        if let Some(task) =
+            pop_fresh_from_heap(&mut state.edit_heap, &mut state.latest_task_by_chunk)
+        {
+            return Some(task);
+        }
+    }
+
+    // Near must always win over far.
+    if near_len > 0 {
+        if let Some(task) =
+            pop_fresh_from_heap(&mut state.near_heap, &mut state.latest_task_by_chunk)
+        {
+            return Some(task);
+        }
+    }
+
+    if far_len > 0 {
+        if let Some(task) =
+            pop_fresh_from_heap(&mut state.far_heap, &mut state.latest_task_by_chunk)
+        {
+            return Some(task);
+        }
+    }
+
+    if edit_len > 0 {
+        if let Some(task) =
+            pop_fresh_from_heap(&mut state.edit_heap, &mut state.latest_task_by_chunk)
+        {
+            return Some(task);
+        }
+    }
+    None
 }
 
 pub fn pop_request(queue: &SharedRequestQueue) -> Option<RequestTask> {
     let (lock, cvar) = &**queue;
     let mut state = lock.lock().unwrap();
     loop {
-        if let Some(task) = state.heap.pop() {
+        if let Some(task) = pop_adaptive(&mut state) {
             return Some(task);
         }
         if state.closed {
@@ -506,32 +662,122 @@ pub fn pick_block(
     max_dist: f32,
     mut block_at: impl FnMut(i32, i32, i32) -> i8,
 ) -> Option<PickHit> {
-    let dir = forward.normalize();
-    let step = 0.1f32;
-    let mut t = step;
-    let mut last_block = IVec3::new(i32::MIN, i32::MIN, i32::MIN);
-    let mut prev_block = IVec3::new(
+    let dir_len_sq = forward.length_squared();
+    if dir_len_sq <= 1.0e-8 {
+        return None;
+    }
+    let dir = forward / dir_len_sq.sqrt();
+
+    let mut block = IVec3::new(
         camera_pos.x.floor() as i32,
         camera_pos.y.floor() as i32,
         camera_pos.z.floor() as i32,
     );
-    while t <= max_dist {
-        let pos = camera_pos + dir * t;
-        let block = IVec3::new(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
-        if block != last_block {
-            let block_id = block_at(block.x, block.y, block.z);
-            if block_id >= 0 {
-                return Some(PickHit {
-                    block,
-                    block_id,
-                    place: prev_block,
-                });
-            }
-            prev_block = block;
-            last_block = block;
-        }
-        t += step;
+
+    let step_x = if dir.x > 0.0 {
+        1
+    } else if dir.x < 0.0 {
+        -1
+    } else {
+        0
+    };
+    let step_y = if dir.y > 0.0 {
+        1
+    } else if dir.y < 0.0 {
+        -1
+    } else {
+        0
+    };
+    let step_z = if dir.z > 0.0 {
+        1
+    } else if dir.z < 0.0 {
+        -1
+    } else {
+        0
+    };
+    if step_x == 0 && step_y == 0 && step_z == 0 {
+        return None;
     }
+
+    let mut t_max_x = if step_x > 0 {
+        (block.x as f32 + 1.0 - camera_pos.x) / dir.x
+    } else if step_x < 0 {
+        (block.x as f32 - camera_pos.x) / dir.x
+    } else {
+        f32::INFINITY
+    };
+    let mut t_max_y = if step_y > 0 {
+        (block.y as f32 + 1.0 - camera_pos.y) / dir.y
+    } else if step_y < 0 {
+        (block.y as f32 - camera_pos.y) / dir.y
+    } else {
+        f32::INFINITY
+    };
+    let mut t_max_z = if step_z > 0 {
+        (block.z as f32 + 1.0 - camera_pos.z) / dir.z
+    } else if step_z < 0 {
+        (block.z as f32 - camera_pos.z) / dir.z
+    } else {
+        f32::INFINITY
+    };
+
+    if t_max_x < 0.0 {
+        t_max_x = 0.0;
+    }
+    if t_max_y < 0.0 {
+        t_max_y = 0.0;
+    }
+    if t_max_z < 0.0 {
+        t_max_z = 0.0;
+    }
+
+    let t_delta_x = if step_x != 0 {
+        1.0 / dir.x.abs()
+    } else {
+        f32::INFINITY
+    };
+    let t_delta_y = if step_y != 0 {
+        1.0 / dir.y.abs()
+    } else {
+        f32::INFINITY
+    };
+    let t_delta_z = if step_z != 0 {
+        1.0 / dir.z.abs()
+    } else {
+        f32::INFINITY
+    };
+
+    let mut t = 0.0_f32;
+    while t <= max_dist {
+        let prev_block = block;
+        if t_max_x <= t_max_y && t_max_x <= t_max_z {
+            t = t_max_x;
+            t_max_x += t_delta_x;
+            block.x += step_x;
+        } else if t_max_y <= t_max_z {
+            t = t_max_y;
+            t_max_y += t_delta_y;
+            block.y += step_y;
+        } else {
+            t = t_max_z;
+            t_max_z += t_delta_z;
+            block.z += step_z;
+        }
+
+        if t > max_dist {
+            break;
+        }
+
+        let block_id = block_at(block.x, block.y, block.z);
+        if block_id >= 0 {
+            return Some(PickHit {
+                block,
+                block_id,
+                place: prev_block,
+            });
+        }
+    }
+
     None
 }
 
@@ -607,7 +853,12 @@ fn needs_chunk_request(
     true
 }
 
-fn request_priority(player_pos: Vec3, camera_forward: Vec3, coord: (i32, i32, i32), lod: i32) -> i32 {
+fn request_priority(
+    player_pos: Vec3,
+    camera_forward: Vec3,
+    coord: (i32, i32, i32),
+    lod: i32,
+) -> i32 {
     let center = Vec3::new(
         (coord.0 * CHUNK_SIZE) as f32,
         (coord.1 * CHUNK_SIZE) as f32,
@@ -639,14 +890,16 @@ fn submit_chunk_request(
     coord: (i32, i32, i32),
     step: i32,
     mode: MeshMode,
-    lod: i32,
+    class: RequestClass,
 ) {
+    let lod = pack_lod(mode, step);
     let priority = request_priority(player_pos, camera_forward, coord, lod);
     enqueue_request(
         req_queue,
         IVec3::new(coord.0, coord.1, coord.2),
         step,
         mode,
+        class,
         priority,
     );
     requested.insert(coord, lod);
@@ -658,7 +911,6 @@ fn depth_for_dist(base_depth: i32, dist: i32) -> i32 {
     depth -= tiers * 3;
     depth.clamp(2, base_depth)
 }
-
 
 pub fn print_stats(
     stats: &GpuStats,
@@ -701,12 +953,7 @@ pub fn print_stats(
     );
     println!(
         "player: ({:>7.2}, {:>7.2}, {:>7.2}) | chunk: ({:>4}, {:>4}, {:>4})",
-        player_pos.x,
-        player_pos.y,
-        player_pos.z,
-        current_chunk.x,
-        current_chunk.y,
-        current_chunk.z,
+        player_pos.x, player_pos.y, player_pos.z, current_chunk.x, current_chunk.y, current_chunk.z,
     );
 
     if let Some((block, block_id)) = looked_block {
@@ -779,10 +1026,16 @@ fn progress_bar(fill: f32, width: usize) -> String {
     s
 }
 
-pub fn estimate_mesh_memory_mb(stats: &GpuStats) -> usize {
-    let vertex_bytes = stats.total_vertices_capacity * std::mem::size_of::<ChunkVertex>() as u64;
+fn estimate_mesh_memory_bytes(stats: &GpuStats) -> u64 {
+    let vertex_bytes =
+        stats.total_raw_vertices_capacity * std::mem::size_of::<ChunkVertex>() as u64
+            + stats.total_packed_vertices_capacity * std::mem::size_of::<PackedFarVertex>() as u64;
     let index_bytes = stats.total_indices * std::mem::size_of::<u32>() as u64;
-    ((vertex_bytes + index_bytes) / (1024 * 1024)) as usize
+    vertex_bytes + index_bytes
+}
+
+pub fn estimate_mesh_memory_mb(stats: &GpuStats) -> usize {
+    (estimate_mesh_memory_bytes(stats) / (1024 * 1024)) as usize
 }
 
 fn in_pregen_bounds(coord: (i32, i32, i32), center: IVec3, radius: i32) -> bool {
@@ -797,28 +1050,226 @@ fn enforce_memory_budget(
     loaded_chunk_cap: usize,
     mesh_memory_cap_mb: usize,
 ) {
-    let mut mesh_mem_mb = estimate_mesh_memory_mb(&gpu.stats());
-    if loaded.len() <= loaded_chunk_cap && mesh_mem_mb <= mesh_memory_cap_mb {
+    let mesh_cap_bytes = mesh_memory_cap_mb.saturating_mul(1024 * 1024) as u64;
+    let mut mesh_mem_bytes = estimate_mesh_memory_bytes(&gpu.stats());
+    if loaded.len() <= loaded_chunk_cap && mesh_mem_bytes <= mesh_cap_bytes {
         return;
     }
 
-    let mut coords: Vec<(i32, i32, i32)> = loaded.keys().copied().collect();
-    coords.sort_by_key(|(x, y, z)| {
-        let dx = x - current_chunk.x;
-        let dy = y - current_chunk.y;
-        let dz = z - current_chunk.z;
-        -(dx * dx + dy * dy + dz * dz)
-    });
+    let mut eviction_heap: BinaryHeap<(i64, ChunkKey)> = BinaryHeap::with_capacity(loaded.len());
+    for &coord in loaded.keys() {
+        let dx = (coord.0 - current_chunk.x) as i64;
+        let dy = (coord.1 - current_chunk.y) as i64;
+        let dz = (coord.2 - current_chunk.z) as i64;
+        let dist_sq = dx * dx + dy * dy + dz * dz;
+        eviction_heap.push((dist_sq, coord));
+    }
 
-    for coord in coords {
-        if loaded.len() <= loaded_chunk_cap && mesh_mem_mb <= mesh_memory_cap_mb {
+    while let Some((_, coord)) = eviction_heap.pop() {
+        if loaded.len() <= loaded_chunk_cap && mesh_mem_bytes <= mesh_cap_bytes {
             break;
         }
-        gpu.remove_chunk(IVec3::new(coord.0, coord.1, coord.2));
+        if !loaded.contains_key(&coord) {
+            continue;
+        }
+        let chunk_coord = IVec3::new(coord.0, coord.1, coord.2);
+        let removed_bytes = gpu.chunk_memory_bytes(chunk_coord);
+        gpu.remove_chunk(chunk_coord);
         loaded.remove(&coord);
         requested.remove(&coord);
-        mesh_mem_mb = estimate_mesh_memory_mb(&gpu.stats());
+        if let Some(bytes) = removed_bytes {
+            mesh_mem_bytes = mesh_mem_bytes.saturating_sub(bytes);
+        } else {
+            mesh_mem_bytes = estimate_mesh_memory_bytes(&gpu.stats());
+        }
     }
+}
+
+fn worker_result_key_and_rev(result: &WorkerResult) -> (ChunkKey, Option<u64>) {
+    match result {
+        WorkerResult::Raw { mesh, dirty_rev } => {
+            ((mesh.coord.x, mesh.coord.y, mesh.coord.z), *dirty_rev)
+        }
+        WorkerResult::Packed { packed, dirty_rev } => {
+            ((packed.coord.x, packed.coord.y, packed.coord.z), *dirty_rev)
+        }
+    }
+}
+
+fn apply_worker_result(
+    gpu: &mut Gpu,
+    result: WorkerResult,
+    dirty_chunks: &DirtyChunks,
+    edited_chunk_ranges: &EditedChunkRanges,
+    loaded: &mut HashMap<ChunkKey, i32>,
+    requested: &mut HashMap<ChunkKey, i32>,
+    pregen_center_chunk: IVec3,
+    pregen_radius_chunks: i32,
+    pregen_chunks_created: &mut usize,
+) -> bool {
+    let (k, dirty_rev) = worker_result_key_and_rev(&result);
+
+    let mut clear_edit_range = false;
+    {
+        let mut dirty_guard = dirty_chunks.lock().unwrap();
+        if let Some(current_rev) = dirty_guard.get(&k).copied() {
+            match dirty_rev {
+                Some(result_rev) if result_rev == current_rev => {
+                    dirty_guard.remove(&k);
+                    clear_edit_range = true;
+                }
+                _ => {
+                    return false;
+                }
+            }
+        } else if dirty_rev.is_some() {
+            // Dirty result with no current dirty marker is stale.
+            return false;
+        }
+    }
+
+    if clear_edit_range {
+        edited_chunk_ranges.lock().unwrap().remove(&k);
+    }
+
+    let lod = match result {
+        WorkerResult::Raw { mesh, .. } => {
+            gpu.upsert_chunk(
+                mesh.coord,
+                mesh.center,
+                mesh.radius,
+                mesh.vertices,
+                mesh.indices,
+            );
+            pack_lod(mesh.mode, mesh.step)
+        }
+        WorkerResult::Packed { packed, .. } => {
+            gpu.upsert_chunk_packed(
+                packed.coord,
+                packed.center,
+                packed.radius,
+                packed.vertices,
+                packed.indices,
+            );
+            pack_lod(packed.mode, packed.step)
+        }
+    };
+    let was_loaded = loaded.insert(k, lod).is_some();
+    if !was_loaded && in_pregen_bounds(k, pregen_center_chunk, pregen_radius_chunks) {
+        *pregen_chunks_created += 1;
+    }
+    requested.remove(&k);
+    true
+}
+
+pub fn apply_stream_results(
+    gpu: &mut Gpu,
+    rx_res: &mpsc::Receiver<WorkerResult>,
+    dirty_chunks: &DirtyChunks,
+    edited_chunk_ranges: &EditedChunkRanges,
+    loaded: &mut HashMap<ChunkKey, i32>,
+    requested: &mut HashMap<ChunkKey, i32>,
+    player_pos: Vec3,
+    pregen_center_chunk: IVec3,
+    pregen_radius_chunks: i32,
+    pregen_chunks_created: &mut usize,
+    loaded_chunk_cap: usize,
+    mesh_memory_cap_mb: usize,
+    max_apply_per_tick: usize,
+    max_rebuilds_per_tick: usize,
+    prioritize_dirty: bool,
+) {
+    let mut deferred_non_dirty: Vec<WorkerResult> = Vec::new();
+
+    if prioritize_dirty {
+        let fast_lane_budget = max_apply_per_tick.max(12);
+        let mut dirty_applied = 0usize;
+        let mut scanned = 0usize;
+        let scan_limit = max_apply_per_tick.saturating_mul(6).max(32);
+
+        while dirty_applied < fast_lane_budget
+            && scanned < scan_limit
+            && deferred_non_dirty.len() < max_apply_per_tick
+        {
+            let Ok(result) = rx_res.try_recv() else {
+                break;
+            };
+            scanned += 1;
+            let (_, dirty_rev) = worker_result_key_and_rev(&result);
+            if dirty_rev.is_some() {
+                if apply_worker_result(
+                    gpu,
+                    result,
+                    dirty_chunks,
+                    edited_chunk_ranges,
+                    loaded,
+                    requested,
+                    pregen_center_chunk,
+                    pregen_radius_chunks,
+                    pregen_chunks_created,
+                ) {
+                    dirty_applied += 1;
+                }
+            } else {
+                deferred_non_dirty.push(result);
+            }
+        }
+    }
+
+    let mut budget = max_apply_per_tick;
+    for result in deferred_non_dirty {
+        if budget == 0 {
+            break;
+        }
+        if apply_worker_result(
+            gpu,
+            result,
+            dirty_chunks,
+            edited_chunk_ranges,
+            loaded,
+            requested,
+            pregen_center_chunk,
+            pregen_radius_chunks,
+            pregen_chunks_created,
+        ) {
+            budget -= 1;
+        }
+    }
+
+    while budget > 0 {
+        let Ok(result) = rx_res.try_recv() else {
+            break;
+        };
+        if apply_worker_result(
+            gpu,
+            result,
+            dirty_chunks,
+            edited_chunk_ranges,
+            loaded,
+            requested,
+            pregen_center_chunk,
+            pregen_radius_chunks,
+            pregen_chunks_created,
+        ) {
+            budget -= 1;
+        }
+    }
+
+    let dirty_pending = dirty_chunks.lock().unwrap().len();
+    let rebuild_budget = if prioritize_dirty && dirty_pending > 0 {
+        max_rebuilds_per_tick.max(8)
+    } else {
+        max_rebuilds_per_tick
+    };
+    gpu.rebuild_dirty_superchunks(player_pos, rebuild_budget);
+    enforce_memory_budget(
+        gpu,
+        loaded,
+        requested,
+        chunk_coord_from_pos(player_pos),
+        loaded_chunk_cap,
+        mesh_memory_cap_mb,
+    );
 }
 
 pub fn stream_tick(
@@ -828,12 +1279,13 @@ pub fn stream_tick(
     current_chunk: &mut IVec3,
     ring_r: &mut i32,
     ring_i: &mut i32,
-    loaded: &mut HashMap<(i32, i32, i32), i32>,
-    requested: &mut HashMap<(i32, i32, i32), i32>,
+    loaded: &mut HashMap<ChunkKey, i32>,
+    requested: &mut HashMap<ChunkKey, i32>,
     column_height_cache: &mut HashMap<(i32, i32), i32>,
     req_queue: &SharedRequestQueue,
-    rx_res: &mpsc::Receiver<WorkerResult>,
-    dirty_chunks: &Arc<Mutex<HashMap<(i32, i32, i32), u64>>>,
+    _rx_res: &mpsc::Receiver<WorkerResult>,
+    _dirty_chunks: &DirtyChunks,
+    _edited_chunk_ranges: &EditedChunkRanges,
     base_render_radius: i32,
     max_render_radius: i32,
     request_budget: i32,
@@ -854,11 +1306,11 @@ pub fn stream_tick(
     pregen_ring_i: &mut i32,
     pregen_columns_done: &mut usize,
     pregen_chunks_requested: &mut usize,
-    pregen_chunks_created: &mut usize,
-    loaded_chunk_cap: usize,
-    mesh_memory_cap_mb: usize,
-    max_apply_per_tick: usize,
-    max_rebuilds_per_tick: usize,
+    _pregen_chunks_created: &mut usize,
+    _loaded_chunk_cap: usize,
+    _mesh_memory_cap_mb: usize,
+    _max_apply_per_tick: usize,
+    _max_rebuilds_per_tick: usize,
 ) {
     let new_chunk = chunk_coord_from_pos(player_pos);
     if new_chunk != *current_chunk {
@@ -903,69 +1355,15 @@ pub fn stream_tick(
         *force_reload = false;
     }
 
-    for _ in 0..max_apply_per_tick {
-        let Ok(result) = rx_res.try_recv() else { break; };
-        let (mesh, dirty_rev) = match result {
-            WorkerResult::Raw { mesh, dirty_rev } => (mesh, dirty_rev),
-            WorkerResult::Packed { packed, dirty_rev } => (
-                MeshData {
-                    coord: packed.coord,
-                    step: packed.step,
-                    mode: packed.mode,
-                    center: packed.center,
-                    radius: packed.radius,
-                    vertices: unpack_far_vertices(&packed.vertices),
-                    indices: packed.indices,
-                },
-                dirty_rev,
-            ),
-        };
-        let k = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
-
-        let mut dirty_guard = dirty_chunks.lock().unwrap();
-        if let Some(current_rev) = dirty_guard.get(&k).copied() {
-            match dirty_rev {
-                Some(result_rev) if result_rev == current_rev => {
-                    dirty_guard.remove(&k);
-                }
-                _ => {
-                    continue;
-                }
-            }
-        }
-        drop(dirty_guard);
-
-        gpu.upsert_chunk(
-            mesh.coord,
-            mesh.center,
-            mesh.radius,
-            mesh.vertices,
-            mesh.indices,
-        );
-        let was_loaded = loaded.insert(k, pack_lod(mesh.mode, mesh.step)).is_some();
-        if !was_loaded && in_pregen_bounds(k, pregen_center_chunk, pregen_radius_chunks) {
-            *pregen_chunks_created += 1;
-        }
-        requested.remove(&k);
-    }
-    gpu.rebuild_dirty_superchunks(player_pos, max_rebuilds_per_tick);
-    enforce_memory_budget(
-        gpu,
-        loaded,
-        requested,
-        *current_chunk,
-        loaded_chunk_cap,
-        mesh_memory_cap_mb,
-    );
-
     if !*pregen_active
         && requested.is_empty()
         && *ring_r > render_radius
-        && (player_pos - Vec3::new(
-            current_chunk.x as f32 * CHUNK_SIZE as f32,
-            current_chunk.y as f32 * CHUNK_SIZE as f32,
-            current_chunk.z as f32 * CHUNK_SIZE as f32,
-        ))
+        && (player_pos
+            - Vec3::new(
+                current_chunk.x as f32 * CHUNK_SIZE as f32,
+                current_chunk.y as f32 * CHUNK_SIZE as f32,
+                current_chunk.z as f32 * CHUNK_SIZE as f32,
+            ))
         .length_squared()
             < 4.0
     {
@@ -973,10 +1371,13 @@ pub fn stream_tick(
     }
 
     if *pregen_active {
+        // Keep headroom for near-player requests so far pregen cannot starve them.
+        let near_reserve = (max_inflight / 4).clamp(64, 512);
+        let pregen_inflight_cap = max_inflight.saturating_sub(near_reserve).max(1);
         let mut budget = pregen_budget_per_tick.max(0);
         while budget > 0 && *pregen_ring_r <= pregen_radius_chunks {
-            if requested.len() >= max_inflight {
-                return;
+            if requested.len() >= pregen_inflight_cap {
+                break;
             }
 
             let (dx, dz) = ring_coord(*pregen_ring_r, *pregen_ring_i);
@@ -999,7 +1400,7 @@ pub fn stream_tick(
             let y_end = surface_chunk_y + 1;
 
             for cy in y_start..=y_end {
-                if budget <= 0 || requested.len() >= max_inflight {
+                if budget <= 0 || requested.len() >= pregen_inflight_cap {
                     break;
                 }
                 let coord = (cx, cy, cz);
@@ -1016,7 +1417,7 @@ pub fn stream_tick(
                         coord,
                         step,
                         mode,
-                        lod,
+                        RequestClass::Far,
                     );
                     if !was_requested {
                         *pregen_chunks_requested += 1;
@@ -1062,7 +1463,7 @@ pub fn stream_tick(
                         key,
                         step,
                         mode,
-                        lod,
+                        RequestClass::Near,
                     );
                 }
             }
@@ -1103,7 +1504,7 @@ pub fn stream_tick(
                             key,
                             step,
                             mode,
-                            lod,
+                            RequestClass::Near,
                         );
                         count -= 1;
                     }
@@ -1150,7 +1551,7 @@ pub fn stream_tick(
                         key,
                         step,
                         mode,
-                        lod,
+                        RequestClass::Near,
                     );
                 }
             }
@@ -1208,6 +1609,11 @@ pub fn stream_tick(
             let lod = pack_lod(mode, step);
             let key = coord;
             if needs_chunk_request(requested, loaded, key, lod) {
+                let class = if dist <= lod_mid_radius {
+                    RequestClass::Near
+                } else {
+                    RequestClass::Far
+                };
                 submit_chunk_request(
                     req_queue,
                     requested,
@@ -1216,7 +1622,7 @@ pub fn stream_tick(
                     key,
                     step,
                     mode,
-                    lod,
+                    class,
                 );
                 budget -= 1;
                 if requested.len() >= max_inflight {

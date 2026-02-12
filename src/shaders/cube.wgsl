@@ -22,7 +22,7 @@ var grass_colormap_texture: texture_2d<f32>;
 @group(0) @binding(4)
 var grass_colormap_sampler: sampler;
 
-struct VertexInput {
+struct VertexInputRaw {
     @location(0) position: vec3<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) tile: u32,
@@ -31,6 +31,13 @@ struct VertexInput {
     @location(5) use_texture: u32,
     @location(6) transparent_mode: u32,
     @location(7) color: vec4<f32>,
+};
+
+struct VertexInputPacked {
+    @location(0) position_packed: vec4<i32>,
+    @location(1) uv_packed: vec2<i32>,
+    @location(2) packed_info: vec2<u32>,
+    @location(3) color: vec4<f32>,
 };
 
 struct VertexOutput {
@@ -43,21 +50,74 @@ struct VertexOutput {
     @location(5) transparent_mode: u32,
     @location(6) color: vec4<f32>,
     @location(7) world_pos: vec3<f32>,
+    @location(8) grass_cm_uv: vec2<f32>,
 };
 
-@vertex
-fn vs_main(input: VertexInput) -> VertexOutput {
+fn emit_vertex_output(
+    position: vec3<f32>,
+    uv: vec2<f32>,
+    tile: u32,
+    face: u32,
+    rotation: u32,
+    use_texture: u32,
+    transparent_mode: u32,
+    color: vec4<f32>,
+) -> VertexOutput {
     var out: VertexOutput;
-    out.position = uniforms.mvp * vec4<f32>(input.position, 1.0);
-    out.uv = input.uv;
-    out.tile = input.tile;
-    out.face = input.face;
-    out.rotation = input.rotation;
-    out.use_texture = input.use_texture;
-    out.transparent_mode = input.transparent_mode;
-    out.color = input.color;
-    out.world_pos = input.position;
+    out.position = uniforms.mvp * vec4<f32>(position, 1.0);
+    out.uv = uv;
+    out.tile = tile;
+    out.face = face;
+    out.rotation = rotation;
+    out.use_texture = use_texture;
+    out.transparent_mode = transparent_mode;
+    out.color = color;
+    out.world_pos = position;
+    out.grass_cm_uv = grass_colormap_uv(position);
     return out;
+}
+
+@vertex
+fn vs_main(input: VertexInputRaw) -> VertexOutput {
+    return emit_vertex_output(
+        input.position,
+        input.uv,
+        input.tile,
+        input.face,
+        input.rotation,
+        input.use_texture,
+        input.transparent_mode,
+        input.color,
+    );
+}
+
+@vertex
+fn vs_main_packed(input: VertexInputPacked) -> VertexOutput {
+    let pos = vec3<f32>(
+        f32(input.position_packed.x),
+        f32(input.position_packed.y),
+        f32(input.position_packed.z),
+    );
+    let uv = vec2<f32>(
+        f32(input.uv_packed.x) / 4096.0,
+        f32(input.uv_packed.y) / 4096.0,
+    );
+    let tile = input.packed_info.x;
+    let flags = input.packed_info.y;
+    let face = flags & 0xFu;
+    let rotation = (flags >> 4u) & 0xFu;
+    let use_texture = (flags >> 8u) & 0x1u;
+    let transparent_mode = (flags >> 9u) & 0xFu;
+    return emit_vertex_output(
+        pos,
+        uv,
+        tile,
+        face,
+        rotation,
+        use_texture,
+        transparent_mode,
+        input.color,
+    );
 }
 
 fn rotate_uv(uv: vec2<f32>, rot: u32) -> vec2<f32> {
@@ -190,7 +250,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         }
 
         if (is_grass_top || is_grass_side) {
-            let cm_uv = grass_colormap_uv(input.world_pos);
+            let cm_uv = input.grass_cm_uv;
             let cm = textureSample(grass_colormap_texture, grass_colormap_sampler, cm_uv).rgb;
             // Keep texture identity while applying biome tint.
             tex_rgb = mix(tex_rgb, tex_rgb * cm, uniforms.colormap_misc.x);
