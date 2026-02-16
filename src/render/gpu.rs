@@ -1,15 +1,26 @@
 use crate::player::Camera;
+use crate::player::inventory::{
+    CRAFT_GRID_SIDE, CRAFT_GRID_SLOTS, INVENTORY_STORAGE_SLOTS, InventorySlotRef, ItemStack,
+    MAX_STACK_SIZE, compute_inventory_layout, craft_input_slot_rect, craft_output_slot_rect,
+    hotbar_slot_rect, storage_slot_rect,
+};
 use crate::render::CubeStyle;
 use crate::render::atlas::TextureAtlas;
 use crate::render::mesh::{ChunkVertex, PackedFarVertex};
 use crate::render::texture::{
     AtlasTexture, create_dummy_texture, load_atlas_texture, load_grass_colormap_texture,
 };
+use crate::world::blocks::{
+    BLOCK_COUNT, BLOCK_CRAFTING_TABLE, BLOCK_DIRT, BLOCK_GRASS, BLOCK_GRAVEL, BLOCK_LEAVES,
+    BLOCK_LOG, BLOCK_PLANKS_OAK, BLOCK_SAND, BLOCK_STONE, DESTROY_STAGE_COUNT,
+    DESTROY_STAGE_TILE_START, HOTBAR_SLOTS, ITEM_APPLE, ITEM_STICK, item_icon_tile_index,
+};
 use bytemuck::{Pod, Zeroable};
-use glam::{IVec3, Mat4, Vec2, Vec3};
+use glam::{IVec3, Mat3, Mat4, Vec2, Vec3};
 use self_cell::self_cell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -21,6 +32,61 @@ struct SceneUniform {
     flags0: [u32; 4],        // [use_texture, tiles_x, debug_faces, debug_chunks]
     flags1: [u32; 4], // [occlusion_cull, grass_top_tile, grass_side_tile, grass_overlay_tile]
     colormap_misc: [f32; 4], // [colormap_strength, reserved, reserved, reserved]
+    item_misc: [f32; 4],     // [item_tile_uv_x, item_tile_uv_y, item_tiles_x, reserved]
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct UiVertex {
+    position: [f32; 2],
+    color: [f32; 4],
+    uv: [f32; 2],
+    use_texture: f32,
+    atlas_select: f32,
+}
+
+impl UiVertex {
+    fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<UiVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    shader_location: 0,
+                    offset: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    shader_location: 1,
+                    offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    shader_location: 2,
+                    offset: (std::mem::size_of::<[f32; 2]>() + std::mem::size_of::<[f32; 4]>())
+                        as wgpu::BufferAddress,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    shader_location: 3,
+                    offset: (std::mem::size_of::<[f32; 2]>()
+                        + std::mem::size_of::<[f32; 4]>()
+                        + std::mem::size_of::<[f32; 2]>())
+                        as wgpu::BufferAddress,
+                    format: wgpu::VertexFormat::Float32,
+                },
+                wgpu::VertexAttribute {
+                    shader_location: 4,
+                    offset: (std::mem::size_of::<[f32; 2]>()
+                        + std::mem::size_of::<[f32; 4]>()
+                        + std::mem::size_of::<[f32; 2]>()
+                        + std::mem::size_of::<f32>())
+                        as wgpu::BufferAddress,
+                    format: wgpu::VertexFormat::Float32,
+                },
+            ],
+        }
+    }
 }
 
 struct SuperChunkGpuMesh {
@@ -65,6 +131,10 @@ struct ChunkSlot {
 }
 
 const SUPER_CHUNK_SIZE: i32 = 4;
+const HOTBAR_SLOT_COUNT: usize = HOTBAR_SLOTS;
+const UI_ATLAS_ITEM: f32 = 0.0;
+const UI_ATLAS_BLOCK: f32 = 1.0;
+const SUN_TRANSPARENT_MODE: u32 = 15;
 
 struct GpuInner<'a> {
     surface: wgpu::Surface<'a>,
@@ -74,9 +144,12 @@ struct GpuInner<'a> {
     render_pipeline: wgpu::RenderPipeline,
     packed_render_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
+    ui_pipeline: wgpu::RenderPipeline,
+    ui_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    adapter_summary: String,
     tiles_x: u32,
     tile_uv_size: [f32; 2],
     chunks: HashMap<IVec3, CpuChunkMesh>,
@@ -89,6 +162,10 @@ struct GpuInner<'a> {
     selection_buffer: wgpu::Buffer,
     selection_count: u32,
     selection_coord: Option<IVec3>,
+    ui_vertex_buffer: wgpu::Buffer,
+    ui_vertex_capacity: usize,
+    ui_item_tiles_x: u32,
+    ui_item_tile_uv_size: [f32; 2],
     staged_indices: Vec<u32>,
 }
 
@@ -112,8 +189,21 @@ pub struct GpuStats {
     pub pending_updates: usize,
     pub pending_queue: usize,
     pub total_indices: u64,
+    pub visible_indices: u64,
+    pub visible_raw_indices: u64,
+    pub visible_packed_indices: u64,
+    pub total_draw_calls_est: u64,
+    pub visible_draw_calls_est: u64,
     pub total_raw_vertices_capacity: u64,
     pub total_packed_vertices_capacity: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct DroppedItemRender {
+    pub position: Vec3,
+    pub block_id: i8,
+    pub spin_y: f32,
+    pub tilt_z: f32,
 }
 
 impl Gpu {
@@ -135,6 +225,18 @@ impl Gpu {
                     force_fallback_adapter: false,
                 }))
                 .unwrap();
+            let adapter_info = adapter.get_info();
+            let adapter_name = adapter_info.name.trim();
+            let adapter_summary = format!(
+                "{} ({:?}, {:?})",
+                if adapter_name.is_empty() {
+                    "Unknown GPU"
+                } else {
+                    adapter_name
+                },
+                adapter_info.device_type,
+                adapter_info.backend
+            );
 
             let (device, queue) = pollster::block_on(
                 adapter.request_device(&wgpu::DeviceDescriptor::default(), None),
@@ -161,7 +263,7 @@ impl Gpu {
 
             let AtlasTexture {
                 view: texture_view,
-                sampler,
+                sampler: atlas_sampler,
                 tiles_x,
                 tile_uv_size,
             } = if style.use_texture {
@@ -172,6 +274,35 @@ impl Gpu {
             };
 
             let grass_colormap = load_grass_colormap_texture(&device, &queue);
+            let AtlasTexture {
+                view: ui_item_texture_view,
+                sampler: ui_item_sampler,
+                tiles_x: ui_item_tiles_x,
+                tile_uv_size: ui_item_tile_uv_size,
+            } = load_atlas_texture(
+                &device,
+                &queue,
+                &TextureAtlas {
+                    path: "src/texturing/atlas_output/atlas_items.png".to_string(),
+                    tile_size: 16,
+                },
+            );
+            let AtlasTexture {
+                view: sun_texture_view,
+                sampler: sun_sampler,
+                ..
+            } = if Path::new("src/texturing/sun_vv.png").exists() {
+                load_atlas_texture(
+                    &device,
+                    &queue,
+                    &TextureAtlas {
+                        path: "src/texturing/sun_vv.png".to_string(),
+                        tile_size: 32,
+                    },
+                )
+            } else {
+                create_dummy_texture(&device, &queue)
+            };
 
             let uniform = SceneUniform {
                 mvp: Mat4::IDENTITY.to_cols_array_2d(),
@@ -185,6 +316,12 @@ impl Gpu {
                 flags0: [style.use_texture as u32, tiles_x, 0, 0],
                 flags1: [0, 2, 3, 6],
                 colormap_misc: [0.72, 0.0, 0.0, 0.0],
+                item_misc: [
+                    ui_item_tile_uv_size[0],
+                    ui_item_tile_uv_size[1],
+                    ui_item_tiles_x as f32,
+                    0.0,
+                ],
             };
 
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -239,6 +376,38 @@ impl Gpu {
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 5,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 6,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 7,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 8,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
                     ],
                 });
 
@@ -256,7 +425,7 @@ impl Gpu {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
+                        resource: wgpu::BindingResource::Sampler(&atlas_sampler),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
@@ -265,6 +434,22 @@ impl Gpu {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: wgpu::BindingResource::Sampler(&grass_colormap.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&ui_item_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::Sampler(&ui_item_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(&sun_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::Sampler(&sun_sampler),
                     },
                 ],
             });
@@ -393,9 +578,119 @@ impl Gpu {
                 multiview: None,
             });
 
+            let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("ui_shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/ui.wgsl").into()),
+            });
+            let ui_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("ui_bind_group_layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+            let ui_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ui_bind_group"),
+                layout: &ui_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&ui_item_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&ui_item_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&atlas_sampler),
+                    },
+                ],
+            });
+            let ui_pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("ui_pipeline_layout"),
+                    bind_group_layouts: &[&ui_bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+            let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("ui_pipeline"),
+                layout: Some(&ui_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &ui_shader,
+                    entry_point: "vs_main",
+                    buffers: &[UiVertex::layout()],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth24Plus,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::Always,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &ui_shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+            });
+
             let selection_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("selection_line_buffer"),
                 size: (std::mem::size_of::<[f32; 3]>() * 24) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let ui_vertex_capacity = 1024usize;
+            let ui_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ui_vertex_buffer"),
+                size: (ui_vertex_capacity * std::mem::size_of::<UiVertex>()) as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -408,9 +703,12 @@ impl Gpu {
                 render_pipeline,
                 packed_render_pipeline,
                 line_pipeline,
+                ui_pipeline,
+                ui_bind_group,
                 depth_view,
                 uniform_buffer,
                 bind_group,
+                adapter_summary,
                 tiles_x,
                 tile_uv_size,
                 chunks: HashMap::new(),
@@ -423,6 +721,10 @@ impl Gpu {
                 selection_buffer,
                 selection_count: 0,
                 selection_coord: None,
+                ui_vertex_buffer,
+                ui_vertex_capacity,
+                ui_item_tiles_x,
+                ui_item_tile_uv_size,
                 staged_indices: Vec::new(),
             }
         });
@@ -448,6 +750,18 @@ impl Gpu {
         debug_faces: bool,
         debug_chunks: bool,
         _draw_radius: i32,
+        selected_hotbar_slot: u8,
+        hotbar_slots: &[Option<ItemStack>; HOTBAR_SLOT_COUNT],
+        inventory_open: bool,
+        storage_slots: &[Option<ItemStack>; INVENTORY_STORAGE_SLOTS],
+        craft_grid_side: usize,
+        craft_input_slots: &[Option<ItemStack>; CRAFT_GRID_SLOTS],
+        craft_output: Option<ItemStack>,
+        hovered_slot: Option<InventorySlotRef>,
+        cursor_pos: Option<(f32, f32)>,
+        dragged_item: Option<ItemStack>,
+        break_overlay: Option<(IVec3, u32)>,
+        dropped_items: &[DroppedItemRender],
     ) {
         self.cell.with_dependent_mut(|_, gpu| {
             apply_pending_uploads(gpu, 16);
@@ -470,6 +784,12 @@ impl Gpu {
                 ],
                 flags1: [0, 2, 3, 6],
                 colormap_misc: [0.72, 0.0, 0.0, 0.0],
+                item_misc: [
+                    gpu.ui_item_tile_uv_size[0],
+                    gpu.ui_item_tile_uv_size[1],
+                    gpu.ui_item_tiles_x as f32,
+                    0.0,
+                ],
             };
 
             gpu.queue
@@ -493,6 +813,96 @@ impl Gpu {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("cube_encoder"),
                 });
+            let ui_vertices = build_inventory_ui_vertices(
+                gpu.config.width,
+                gpu.config.height,
+                selected_hotbar_slot,
+                hotbar_slots,
+                inventory_open,
+                storage_slots,
+                craft_grid_side,
+                craft_input_slots,
+                craft_output,
+                hovered_slot,
+                cursor_pos,
+                dragged_item,
+                gpu.tiles_x,
+                gpu.tile_uv_size,
+                gpu.ui_item_tiles_x,
+                gpu.ui_item_tile_uv_size,
+            );
+            if !ui_vertices.is_empty() {
+                ensure_ui_vertex_capacity(gpu, ui_vertices.len());
+                gpu.queue.write_buffer(
+                    &gpu.ui_vertex_buffer,
+                    0,
+                    bytemuck::cast_slice(&ui_vertices),
+                );
+            }
+
+            let (drop_vertices, drop_indices) = build_dropped_item_mesh(dropped_items);
+            let dropped_draw = if drop_vertices.is_empty() || drop_indices.is_empty() {
+                None
+            } else {
+                let vertex_buffer =
+                    gpu.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("dropped_item_vertex_buffer"),
+                            contents: bytemuck::cast_slice(&drop_vertices),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+                let index_buffer =
+                    gpu.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("dropped_item_index_buffer"),
+                            contents: bytemuck::cast_slice(&drop_indices),
+                            usage: wgpu::BufferUsages::INDEX,
+                        });
+                Some((vertex_buffer, index_buffer, drop_indices.len() as u32))
+            };
+            let break_overlay_draw = break_overlay.and_then(|(coord, stage)| {
+                let (vertices, indices) = build_break_overlay_mesh(coord, stage);
+                if vertices.is_empty() || indices.is_empty() {
+                    return None;
+                }
+                let vertex_buffer =
+                    gpu.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("break_overlay_vertex_buffer"),
+                            contents: bytemuck::cast_slice(&vertices),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+                let index_buffer =
+                    gpu.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("break_overlay_index_buffer"),
+                            contents: bytemuck::cast_slice(&indices),
+                            usage: wgpu::BufferUsages::INDEX,
+                        });
+                Some((vertex_buffer, index_buffer, indices.len() as u32))
+            });
+            let sun_draw = {
+                let (vertices, indices) = build_sun_mesh(camera);
+                if vertices.is_empty() || indices.is_empty() {
+                    None
+                } else {
+                    let vertex_buffer =
+                        gpu.device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("sun_vertex_buffer"),
+                                contents: bytemuck::cast_slice(&vertices),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            });
+                    let index_buffer =
+                        gpu.device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("sun_index_buffer"),
+                                contents: bytemuck::cast_slice(&indices),
+                                usage: wgpu::BufferUsages::INDEX,
+                            });
+                    Some((vertex_buffer, index_buffer, indices.len() as u32))
+                }
+            };
 
             {
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -561,6 +971,27 @@ impl Gpu {
                     rpass.draw_indexed(0..chunk.packed_index_count, 0, 0..1);
                 }
 
+                if let Some((vertex_buffer, index_buffer, index_count)) = dropped_draw.as_ref() {
+                    rpass.set_pipeline(&gpu.render_pipeline);
+                    rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    rpass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    rpass.draw_indexed(0..*index_count, 0, 0..1);
+                }
+                if let Some((vertex_buffer, index_buffer, index_count)) =
+                    break_overlay_draw.as_ref()
+                {
+                    rpass.set_pipeline(&gpu.render_pipeline);
+                    rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    rpass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    rpass.draw_indexed(0..*index_count, 0, 0..1);
+                }
+                if let Some((vertex_buffer, index_buffer, index_count)) = sun_draw.as_ref() {
+                    rpass.set_pipeline(&gpu.render_pipeline);
+                    rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    rpass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    rpass.draw_indexed(0..*index_count, 0, 0..1);
+                }
+
                 if debug_chunks {
                     rpass.set_pipeline(&gpu.line_pipeline);
                     for chunk in gpu.super_chunks.values() {
@@ -573,6 +1004,13 @@ impl Gpu {
                     rpass.set_pipeline(&gpu.line_pipeline);
                     rpass.set_vertex_buffer(0, gpu.selection_buffer.slice(..));
                     rpass.draw(0..gpu.selection_count, 0..1);
+                }
+
+                if !ui_vertices.is_empty() {
+                    rpass.set_pipeline(&gpu.ui_pipeline);
+                    rpass.set_bind_group(0, &gpu.ui_bind_group, &[]);
+                    rpass.set_vertex_buffer(0, gpu.ui_vertex_buffer.slice(..));
+                    rpass.draw(0..ui_vertices.len() as u32, 0..1);
                 }
             }
 
@@ -602,15 +1040,43 @@ impl Gpu {
         self.cell.borrow_owner()
     }
 
+    pub fn adapter_summary(&self) -> String {
+        self.cell
+            .with_dependent(|_, gpu| gpu.adapter_summary.clone())
+    }
+
     pub fn stats(&self) -> GpuStats {
         self.cell.with_dependent(|_, gpu| {
             let mut total_indices = 0u64;
+            let mut total_draw_calls_est = 0u64;
             let mut total_raw_vertices_capacity = 0u64;
             let mut total_packed_vertices_capacity = 0u64;
             for chunk in gpu.super_chunks.values() {
                 total_indices += chunk.raw_index_count as u64 + chunk.packed_index_count as u64;
+                if chunk.raw_index_count > 0 {
+                    total_draw_calls_est += 1;
+                }
+                if chunk.packed_index_count > 0 {
+                    total_draw_calls_est += 1;
+                }
                 total_raw_vertices_capacity += chunk.raw_vertex_capacity as u64;
                 total_packed_vertices_capacity += chunk.packed_vertex_capacity as u64;
+            }
+            let mut visible_raw_indices = 0u64;
+            let mut visible_packed_indices = 0u64;
+            let mut visible_draw_calls_est = 0u64;
+            for coord in &gpu.visible_supers {
+                let Some(chunk) = gpu.super_chunks.get(coord) else {
+                    continue;
+                };
+                if chunk.raw_index_count > 0 {
+                    visible_raw_indices += chunk.raw_index_count as u64;
+                    visible_draw_calls_est += 1;
+                }
+                if chunk.packed_index_count > 0 {
+                    visible_packed_indices += chunk.packed_index_count as u64;
+                    visible_draw_calls_est += 1;
+                }
             }
             GpuStats {
                 super_chunks: gpu.super_chunks.len(),
@@ -619,6 +1085,11 @@ impl Gpu {
                 pending_updates: gpu.pending_updates.len(),
                 pending_queue: gpu.pending_queue.len(),
                 total_indices,
+                visible_indices: visible_raw_indices + visible_packed_indices,
+                visible_raw_indices,
+                visible_packed_indices,
+                total_draw_calls_est,
+                visible_draw_calls_est,
                 total_raw_vertices_capacity,
                 total_packed_vertices_capacity,
             }
@@ -1117,6 +1588,1738 @@ fn create_depth_view(
     });
 
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn ensure_ui_vertex_capacity(gpu: &mut GpuInner, required_vertices: usize) {
+    if required_vertices <= gpu.ui_vertex_capacity {
+        return;
+    }
+    let mut new_capacity = gpu.ui_vertex_capacity.max(1);
+    while new_capacity < required_vertices {
+        new_capacity = new_capacity.saturating_mul(2);
+    }
+    gpu.ui_vertex_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ui_vertex_buffer"),
+        size: (new_capacity * std::mem::size_of::<UiVertex>()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    gpu.ui_vertex_capacity = new_capacity;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_inventory_ui_vertices(
+    width: u32,
+    height: u32,
+    selected_hotbar_slot: u8,
+    hotbar_slots: &[Option<ItemStack>; HOTBAR_SLOT_COUNT],
+    inventory_open: bool,
+    storage_slots: &[Option<ItemStack>; INVENTORY_STORAGE_SLOTS],
+    craft_grid_side: usize,
+    craft_input_slots: &[Option<ItemStack>; CRAFT_GRID_SLOTS],
+    craft_output: Option<ItemStack>,
+    hovered_slot: Option<InventorySlotRef>,
+    cursor_pos: Option<(f32, f32)>,
+    dragged_item: Option<ItemStack>,
+    block_tiles_x: u32,
+    block_tile_uv_size: [f32; 2],
+    item_tiles_x: u32,
+    item_tile_uv_size: [f32; 2],
+) -> Vec<UiVertex> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let width_f = width as f32;
+    let height_f = height as f32;
+    let craft_grid_side = craft_grid_side.clamp(1, CRAFT_GRID_SIDE);
+    let layout = compute_inventory_layout(width, height, craft_grid_side);
+    let mut vertices = Vec::with_capacity(4096);
+    let selected = (selected_hotbar_slot as usize).min(HOTBAR_SLOT_COUNT - 1);
+
+    if inventory_open {
+        push_ui_rect(
+            &mut vertices,
+            width_f,
+            height_f,
+            0.0,
+            0.0,
+            width_f,
+            height_f,
+            [0.0, 0.0, 0.0, 0.35],
+        );
+        let panel = layout.panel;
+        push_ui_rect(
+            &mut vertices,
+            width_f,
+            height_f,
+            panel.x,
+            panel.y,
+            panel.w,
+            panel.h,
+            [0.08, 0.09, 0.11, 0.88],
+        );
+        let panel_border = (layout.slot * 0.08).clamp(2.0, 4.0);
+        push_ui_rect(
+            &mut vertices,
+            width_f,
+            height_f,
+            panel.x - panel_border,
+            panel.y - panel_border,
+            panel.w + panel_border * 2.0,
+            panel_border,
+            [0.78, 0.80, 0.86, 0.24],
+        );
+        push_ui_rect(
+            &mut vertices,
+            width_f,
+            height_f,
+            panel.x - panel_border,
+            panel.y + panel.h,
+            panel.w + panel_border * 2.0,
+            panel_border,
+            [0.78, 0.80, 0.86, 0.24],
+        );
+        push_ui_rect(
+            &mut vertices,
+            width_f,
+            height_f,
+            panel.x - panel_border,
+            panel.y,
+            panel_border,
+            panel.h,
+            [0.78, 0.80, 0.86, 0.24],
+        );
+        push_ui_rect(
+            &mut vertices,
+            width_f,
+            height_f,
+            panel.x + panel.w,
+            panel.y,
+            panel_border,
+            panel.h,
+            [0.78, 0.80, 0.86, 0.24],
+        );
+    }
+
+    for i in 0..HOTBAR_SLOT_COUNT {
+        let rect = hotbar_slot_rect(&layout, i);
+        let hovered = hovered_slot == Some(InventorySlotRef::Hotbar(i as u8));
+        push_slot_box(
+            &mut vertices,
+            width_f,
+            height_f,
+            rect,
+            i == selected,
+            hovered,
+        );
+        if let Some(stack) = hotbar_slots.get(i).copied().flatten() {
+            let icon_center_x = rect.x + rect.w * 0.5;
+            let icon_center_y = rect.y + rect.h * 0.5;
+            let icon_size = rect.w * 0.54;
+            push_inventory_icon(
+                &mut vertices,
+                width_f,
+                height_f,
+                icon_center_x,
+                icon_center_y,
+                icon_size,
+                stack.block_id,
+                i == selected,
+                rect.w,
+                block_tiles_x,
+                block_tile_uv_size,
+                item_tiles_x,
+                item_tile_uv_size,
+            );
+            push_stack_meter(&mut vertices, width_f, height_f, rect, stack.count);
+        }
+    }
+
+    if inventory_open {
+        for i in 0..CRAFT_GRID_SLOTS {
+            let row = i / CRAFT_GRID_SIDE;
+            let col = i % CRAFT_GRID_SIDE;
+            if row >= craft_grid_side || col >= craft_grid_side {
+                continue;
+            }
+            let rect = craft_input_slot_rect(&layout, i);
+            let hovered = hovered_slot == Some(InventorySlotRef::CraftInput(i as u8));
+            push_slot_box(&mut vertices, width_f, height_f, rect, false, hovered);
+            if let Some(stack) = craft_input_slots.get(i).copied().flatten() {
+                let icon_center_x = rect.x + rect.w * 0.5;
+                let icon_center_y = rect.y + rect.h * 0.5;
+                let icon_size = rect.w * 0.54;
+                push_inventory_icon(
+                    &mut vertices,
+                    width_f,
+                    height_f,
+                    icon_center_x,
+                    icon_center_y,
+                    icon_size,
+                    stack.block_id,
+                    false,
+                    rect.w,
+                    block_tiles_x,
+                    block_tile_uv_size,
+                    item_tiles_x,
+                    item_tile_uv_size,
+                );
+                push_stack_meter(&mut vertices, width_f, height_f, rect, stack.count);
+            }
+        }
+
+        let output_rect = craft_output_slot_rect(&layout);
+        let output_hovered = hovered_slot == Some(InventorySlotRef::CraftOutput);
+        push_slot_box(
+            &mut vertices,
+            width_f,
+            height_f,
+            output_rect,
+            craft_output.is_some(),
+            output_hovered,
+        );
+        if let Some(stack) = craft_output {
+            let icon_center_x = output_rect.x + output_rect.w * 0.5;
+            let icon_center_y = output_rect.y + output_rect.h * 0.5;
+            let icon_size = output_rect.w * 0.54;
+            push_inventory_icon(
+                &mut vertices,
+                width_f,
+                height_f,
+                icon_center_x,
+                icon_center_y,
+                icon_size,
+                stack.block_id,
+                output_hovered,
+                output_rect.w,
+                block_tiles_x,
+                block_tile_uv_size,
+                item_tiles_x,
+                item_tile_uv_size,
+            );
+            push_stack_meter(&mut vertices, width_f, height_f, output_rect, stack.count);
+        }
+
+        let grid_right = layout.craft_input_start_x
+            + craft_grid_side as f32 * (layout.slot + layout.gap)
+            - layout.gap;
+        let connector_start_x = grid_right + (output_rect.x - grid_right) * 0.24;
+        let connector_end_x = output_rect.x - (output_rect.x - grid_right) * 0.20;
+        let connector_y = output_rect.y + output_rect.h * 0.5;
+        let connector_h = (layout.slot * 0.11).clamp(2.0, 4.0);
+        let connector_color = if craft_output.is_some() {
+            [0.86, 0.90, 0.64, 0.72]
+        } else {
+            [0.55, 0.58, 0.62, 0.38]
+        };
+        if connector_end_x > connector_start_x {
+            push_ui_rect(
+                &mut vertices,
+                width_f,
+                height_f,
+                connector_start_x,
+                connector_y - connector_h * 0.5,
+                connector_end_x - connector_start_x,
+                connector_h,
+                connector_color,
+            );
+            let head_w = (layout.slot * 0.18).clamp(4.0, 10.0);
+            push_ui_rect(
+                &mut vertices,
+                width_f,
+                height_f,
+                connector_end_x - head_w,
+                connector_y - connector_h,
+                head_w,
+                connector_h,
+                connector_color,
+            );
+            push_ui_rect(
+                &mut vertices,
+                width_f,
+                height_f,
+                connector_end_x - head_w,
+                connector_y,
+                head_w,
+                connector_h,
+                connector_color,
+            );
+        }
+
+        for i in 0..INVENTORY_STORAGE_SLOTS {
+            let rect = storage_slot_rect(&layout, i);
+            let hovered = hovered_slot == Some(InventorySlotRef::Storage(i as u8));
+            push_slot_box(&mut vertices, width_f, height_f, rect, false, hovered);
+            if let Some(stack) = storage_slots.get(i).copied().flatten() {
+                let icon_center_x = rect.x + rect.w * 0.5;
+                let icon_center_y = rect.y + rect.h * 0.5;
+                let icon_size = rect.w * 0.54;
+                push_inventory_icon(
+                    &mut vertices,
+                    width_f,
+                    height_f,
+                    icon_center_x,
+                    icon_center_y,
+                    icon_size,
+                    stack.block_id,
+                    false,
+                    rect.w,
+                    block_tiles_x,
+                    block_tile_uv_size,
+                    item_tiles_x,
+                    item_tile_uv_size,
+                );
+                push_stack_meter(&mut vertices, width_f, height_f, rect, stack.count);
+            }
+        }
+
+        if let (Some(stack), Some((mx, my))) = (dragged_item, cursor_pos) {
+            push_inventory_icon(
+                &mut vertices,
+                width_f,
+                height_f,
+                mx,
+                my,
+                layout.slot * 0.62,
+                stack.block_id,
+                true,
+                layout.slot,
+                block_tiles_x,
+                block_tile_uv_size,
+                item_tiles_x,
+                item_tile_uv_size,
+            );
+        }
+    }
+
+    vertices
+}
+
+fn push_slot_box(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    rect: crate::player::inventory::UiRect,
+    selected: bool,
+    hovered: bool,
+) {
+    push_ui_rect(
+        out,
+        width,
+        height,
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        [0.06, 0.06, 0.06, 0.78],
+    );
+    let inset = (rect.w * 0.07).clamp(2.0, 4.0);
+    let inner_color = if hovered {
+        [0.24, 0.25, 0.29, 0.88]
+    } else if selected {
+        [0.33, 0.33, 0.33, 0.85]
+    } else {
+        [0.18, 0.18, 0.18, 0.78]
+    };
+    push_ui_rect(
+        out,
+        width,
+        height,
+        rect.x + inset,
+        rect.y + inset,
+        (rect.w - inset * 2.0).max(1.0),
+        (rect.h - inset * 2.0).max(1.0),
+        inner_color,
+    );
+
+    if selected || hovered {
+        let border = (rect.w * 0.08).clamp(1.5, 4.0);
+        let border_color = if selected {
+            [0.95, 0.95, 0.87, 0.98]
+        } else {
+            [0.76, 0.86, 0.98, 0.60]
+        };
+        push_ui_rect(
+            out,
+            width,
+            height,
+            rect.x - border,
+            rect.y - border,
+            rect.w + border * 2.0,
+            border,
+            border_color,
+        );
+        push_ui_rect(
+            out,
+            width,
+            height,
+            rect.x - border,
+            rect.y + rect.h,
+            rect.w + border * 2.0,
+            border,
+            border_color,
+        );
+        push_ui_rect(
+            out,
+            width,
+            height,
+            rect.x - border,
+            rect.y,
+            border,
+            rect.h,
+            border_color,
+        );
+        push_ui_rect(
+            out,
+            width,
+            height,
+            rect.x + rect.w,
+            rect.y,
+            border,
+            rect.h,
+            border_color,
+        );
+    }
+}
+
+fn push_stack_meter(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    rect: crate::player::inventory::UiRect,
+    count: u8,
+) {
+    if count == 0 {
+        return;
+    }
+    let bar_margin = (rect.w * 0.12).clamp(2.0, 6.0);
+    let bar_h = (rect.h * 0.09).clamp(2.0, 5.0);
+    let bar_w = (rect.w - bar_margin * 2.0).max(2.0);
+    let bar_x = rect.x + bar_margin;
+    let bar_y = rect.y + rect.h - bar_h - (rect.h * 0.08).clamp(1.0, 4.0);
+    let fill_ratio = (count as f32 / MAX_STACK_SIZE as f32).clamp(0.0, 1.0);
+    let fill_w = (bar_w * fill_ratio).max(1.0);
+
+    push_ui_rect(
+        out,
+        width,
+        height,
+        bar_x,
+        bar_y,
+        bar_w,
+        bar_h,
+        [0.04, 0.04, 0.04, 0.92],
+    );
+    push_ui_rect(
+        out,
+        width,
+        height,
+        bar_x,
+        bar_y,
+        fill_w,
+        bar_h,
+        [0.80, 0.88, 0.36, 0.95],
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_inventory_icon(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    center_x: f32,
+    center_y: f32,
+    size: f32,
+    item_id: i8,
+    selected: bool,
+    item_slot_size: f32,
+    block_tiles_x: u32,
+    block_tile_uv_size: [f32; 2],
+    item_tiles_x: u32,
+    item_tile_uv_size: [f32; 2],
+) {
+    if let Some(tile_index) = item_icon_tile_index(item_id) {
+        push_item_icon_2d(
+            out,
+            width,
+            height,
+            center_x,
+            center_y,
+            item_slot_size * 0.94,
+            tile_index,
+            item_tiles_x,
+            item_tile_uv_size,
+            UI_ATLAS_ITEM,
+            selected,
+        );
+    } else if item_id >= 0 && (item_id as usize) < BLOCK_COUNT {
+        push_block_icon_textured(
+            out,
+            width,
+            height,
+            center_x,
+            center_y,
+            size,
+            item_id,
+            block_tiles_x,
+            block_tile_uv_size,
+            selected,
+        );
+    } else {
+        push_block_icon(
+            out, width, height, center_x, center_y, size, item_id, selected,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_item_icon_2d(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    center_x: f32,
+    center_y: f32,
+    size: f32,
+    tile_index: u32,
+    tiles_x: u32,
+    tile_uv_size: [f32; 2],
+    atlas_select: f32,
+    selected: bool,
+) {
+    if tiles_x == 0 || tile_uv_size[0] <= 0.0 || tile_uv_size[1] <= 0.0 {
+        return;
+    }
+    let icon_size = size;
+    let half = icon_size * 0.5;
+    let x = center_x - half;
+    let y = center_y - half;
+    let tint = if selected {
+        [1.08, 1.08, 1.08, 1.0]
+    } else {
+        [1.0, 1.0, 1.0, 1.0]
+    };
+
+    let tile_x = tile_index % tiles_x;
+    let tile_y = tile_index / tiles_x;
+    let uv_w = tile_uv_size[0];
+    let uv_h = tile_uv_size[1];
+    // Pull UVs slightly inward to avoid bleeding from neighboring tiles.
+    let pad_u = uv_w * 0.04;
+    let pad_v = uv_h * 0.04;
+    let u0 = tile_x as f32 * uv_w + pad_u;
+    let v0 = tile_y as f32 * uv_h + pad_v;
+    let u1 = (tile_x + 1) as f32 * uv_w - pad_u;
+    let v1 = (tile_y + 1) as f32 * uv_h - pad_v;
+
+    push_ui_textured_rect(
+        out,
+        width,
+        height,
+        x,
+        y,
+        icon_size,
+        icon_size,
+        [u0, v0],
+        [u1, v1],
+        tint,
+        atlas_select,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_ui_textured_rect(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    uv_min: [f32; 2],
+    uv_max: [f32; 2],
+    color: [f32; 4],
+    atlas_select: f32,
+) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let x0 = (x / width) * 2.0 - 1.0;
+    let x1 = ((x + w) / width) * 2.0 - 1.0;
+    let y0 = 1.0 - (y / height) * 2.0;
+    let y1 = 1.0 - ((y + h) / height) * 2.0;
+
+    let v0 = UiVertex {
+        position: [x0, y0],
+        color,
+        uv: [uv_min[0], uv_min[1]],
+        use_texture: 1.0,
+        atlas_select,
+    };
+    let v1 = UiVertex {
+        position: [x1, y0],
+        color,
+        uv: [uv_max[0], uv_min[1]],
+        use_texture: 1.0,
+        atlas_select,
+    };
+    let v2 = UiVertex {
+        position: [x1, y1],
+        color,
+        uv: [uv_max[0], uv_max[1]],
+        use_texture: 1.0,
+        atlas_select,
+    };
+    let v3 = UiVertex {
+        position: [x0, y1],
+        color,
+        uv: [uv_min[0], uv_max[1]],
+        use_texture: 1.0,
+        atlas_select,
+    };
+    out.extend_from_slice(&[v0, v1, v2, v0, v2, v3]);
+}
+
+fn tile_uv_bounds(
+    tile_index: u32,
+    tiles_x: u32,
+    tile_uv_size: [f32; 2],
+) -> Option<([f32; 2], [f32; 2])> {
+    if tiles_x == 0 || tile_uv_size[0] <= 0.0 || tile_uv_size[1] <= 0.0 {
+        return None;
+    }
+    let tile_x = tile_index % tiles_x;
+    let tile_y = tile_index / tiles_x;
+    let uv_w = tile_uv_size[0];
+    let uv_h = tile_uv_size[1];
+    // Pull UVs slightly inward to avoid bleeding from neighboring tiles.
+    let pad_u = uv_w * 0.04;
+    let pad_v = uv_h * 0.04;
+    let u0 = tile_x as f32 * uv_w + pad_u;
+    let v0 = tile_y as f32 * uv_h + pad_v;
+    let u1 = (tile_x + 1) as f32 * uv_w - pad_u;
+    let v1 = (tile_y + 1) as f32 * uv_h - pad_v;
+    Some(([u0, v0], [u1, v1]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_block_icon_textured(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    center_x: f32,
+    center_y: f32,
+    size: f32,
+    block_id: i8,
+    tiles_x: u32,
+    tile_uv_size: [f32; 2],
+    selected: bool,
+) {
+    if tiles_x == 0 || tile_uv_size[0] <= 0.0 || tile_uv_size[1] <= 0.0 {
+        push_block_icon(
+            out, width, height, center_x, center_y, size, block_id, selected,
+        );
+        return;
+    }
+
+    let (tiles, _, _) = dropped_block_face_data(block_id);
+    let (top_uv_min, top_uv_max) = match tile_uv_bounds(tiles[2], tiles_x, tile_uv_size) {
+        Some(v) => v,
+        None => {
+            push_block_icon(
+                out, width, height, center_x, center_y, size, block_id, selected,
+            );
+            return;
+        }
+    };
+    let (left_uv_min, left_uv_max) = match tile_uv_bounds(tiles[1], tiles_x, tile_uv_size) {
+        Some(v) => v,
+        None => {
+            push_block_icon(
+                out, width, height, center_x, center_y, size, block_id, selected,
+            );
+            return;
+        }
+    };
+    let (right_uv_min, right_uv_max) = match tile_uv_bounds(tiles[0], tiles_x, tile_uv_size) {
+        Some(v) => v,
+        None => {
+            push_block_icon(
+                out, width, height, center_x, center_y, size, block_id, selected,
+            );
+            return;
+        }
+    };
+
+    // Isometric-ish mini cube for the hotbar icon.
+    let half_w = size * 0.56;
+    let half_h = size * 0.34;
+    let depth = size * 0.56;
+
+    let top = (center_x, center_y - half_h);
+    let right = (center_x + half_w, center_y);
+    let bottom = (center_x, center_y + half_h);
+    let left = (center_x - half_w, center_y);
+    let down = (center_x, center_y + half_h + depth);
+    let down_left = (center_x - half_w, center_y + depth);
+    let down_right = (center_x + half_w, center_y + depth);
+
+    let select_boost = if selected { 1.08 } else { 1.0 };
+    let top_tint = [select_boost, select_boost, select_boost, 1.0];
+    let left_tint = [
+        0.88 * select_boost,
+        0.88 * select_boost,
+        0.88 * select_boost,
+        1.0,
+    ];
+    let right_tint = [
+        0.74 * select_boost,
+        0.74 * select_boost,
+        0.74 * select_boost,
+        1.0,
+    ];
+
+    let top_u_mid = (top_uv_min[0] + top_uv_max[0]) * 0.5;
+    let top_v_mid = (top_uv_min[1] + top_uv_max[1]) * 0.5;
+    push_ui_textured_quad(
+        out,
+        width,
+        height,
+        top,
+        right,
+        bottom,
+        left,
+        [top_u_mid, top_uv_min[1]],
+        [top_uv_max[0], top_v_mid],
+        [top_u_mid, top_uv_max[1]],
+        [top_uv_min[0], top_v_mid],
+        top_tint,
+        UI_ATLAS_BLOCK,
+    );
+    push_ui_textured_quad(
+        out,
+        width,
+        height,
+        left,
+        bottom,
+        down,
+        down_left,
+        [left_uv_min[0], left_uv_min[1]],
+        [left_uv_max[0], left_uv_min[1]],
+        [left_uv_max[0], left_uv_max[1]],
+        [left_uv_min[0], left_uv_max[1]],
+        left_tint,
+        UI_ATLAS_BLOCK,
+    );
+    push_ui_textured_quad(
+        out,
+        width,
+        height,
+        right,
+        down_right,
+        down,
+        bottom,
+        [right_uv_min[0], right_uv_min[1]],
+        [right_uv_max[0], right_uv_min[1]],
+        [right_uv_max[0], right_uv_max[1]],
+        [right_uv_min[0], right_uv_max[1]],
+        right_tint,
+        UI_ATLAS_BLOCK,
+    );
+}
+
+fn push_ui_rect(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: [f32; 4],
+) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let x0 = (x / width) * 2.0 - 1.0;
+    let x1 = ((x + w) / width) * 2.0 - 1.0;
+    let y0 = 1.0 - (y / height) * 2.0;
+    let y1 = 1.0 - ((y + h) / height) * 2.0;
+
+    let v0 = UiVertex {
+        position: [x0, y0],
+        color,
+        uv: [0.0, 0.0],
+        use_texture: 0.0,
+        atlas_select: 0.0,
+    };
+    let v1 = UiVertex {
+        position: [x1, y0],
+        color,
+        uv: [0.0, 0.0],
+        use_texture: 0.0,
+        atlas_select: 0.0,
+    };
+    let v2 = UiVertex {
+        position: [x1, y1],
+        color,
+        uv: [0.0, 0.0],
+        use_texture: 0.0,
+        atlas_select: 0.0,
+    };
+    let v3 = UiVertex {
+        position: [x0, y1],
+        color,
+        uv: [0.0, 0.0],
+        use_texture: 0.0,
+        atlas_select: 0.0,
+    };
+    out.extend_from_slice(&[v0, v1, v2, v0, v2, v3]);
+}
+
+fn push_block_icon(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    center_x: f32,
+    center_y: f32,
+    size: f32,
+    block_id: i8,
+    selected: bool,
+) {
+    let (mut top_color, mut left_color, mut right_color) = block_icon_colors(block_id);
+    if selected {
+        top_color = scale_color(top_color, 1.12);
+        left_color = scale_color(left_color, 1.12);
+        right_color = scale_color(right_color, 1.12);
+    }
+
+    // Isometric-ish mini cube for the hotbar icon.
+    let half_w = size * 0.56;
+    let half_h = size * 0.34;
+    let depth = size * 0.56;
+
+    let top = (center_x, center_y - half_h);
+    let right = (center_x + half_w, center_y);
+    let bottom = (center_x, center_y + half_h);
+    let left = (center_x - half_w, center_y);
+    let down = (center_x, center_y + half_h + depth);
+    let down_left = (center_x - half_w, center_y + depth);
+    let down_right = (center_x + half_w, center_y + depth);
+
+    push_ui_quad(out, width, height, top, right, bottom, left, top_color);
+    push_ui_quad(
+        out, width, height, left, bottom, down, down_left, left_color,
+    );
+    push_ui_quad(
+        out,
+        width,
+        height,
+        right,
+        down_right,
+        down,
+        bottom,
+        right_color,
+    );
+}
+
+fn block_icon_colors(block_id: i8) -> ([f32; 4], [f32; 4], [f32; 4]) {
+    match block_id {
+        x if x == BLOCK_STONE as i8 => (
+            [0.76, 0.76, 0.76, 1.0],
+            [0.56, 0.56, 0.56, 1.0],
+            [0.46, 0.46, 0.46, 1.0],
+        ),
+        x if x == BLOCK_DIRT as i8 => (
+            [0.61, 0.45, 0.27, 1.0],
+            [0.46, 0.33, 0.20, 1.0],
+            [0.37, 0.26, 0.16, 1.0],
+        ),
+        x if x == BLOCK_GRASS as i8 => (
+            [0.45, 0.73, 0.35, 1.0],
+            [0.49, 0.38, 0.23, 1.0],
+            [0.40, 0.30, 0.19, 1.0],
+        ),
+        x if x == BLOCK_LOG as i8 => (
+            [0.72, 0.58, 0.38, 1.0],
+            [0.55, 0.40, 0.24, 1.0],
+            [0.44, 0.31, 0.18, 1.0],
+        ),
+        x if x == BLOCK_LEAVES as i8 => (
+            [0.39, 0.63, 0.32, 0.95],
+            [0.29, 0.48, 0.24, 0.95],
+            [0.23, 0.39, 0.19, 0.95],
+        ),
+        x if x == BLOCK_PLANKS_OAK as i8 => (
+            [0.72, 0.57, 0.36, 1.0],
+            [0.54, 0.41, 0.25, 1.0],
+            [0.44, 0.33, 0.20, 1.0],
+        ),
+        x if x == BLOCK_CRAFTING_TABLE as i8 => (
+            [0.73, 0.59, 0.40, 1.0],
+            [0.55, 0.42, 0.28, 1.0],
+            [0.46, 0.34, 0.22, 1.0],
+        ),
+        x if x == BLOCK_GRAVEL as i8 => (
+            [0.65, 0.65, 0.66, 1.0],
+            [0.50, 0.50, 0.51, 1.0],
+            [0.40, 0.40, 0.41, 1.0],
+        ),
+        x if x == BLOCK_SAND as i8 => (
+            [0.88, 0.80, 0.57, 1.0],
+            [0.69, 0.61, 0.43, 1.0],
+            [0.56, 0.49, 0.34, 1.0],
+        ),
+        x if x == ITEM_APPLE => (
+            [0.92, 0.20, 0.18, 1.0],
+            [0.74, 0.13, 0.12, 1.0],
+            [0.58, 0.10, 0.10, 1.0],
+        ),
+        x if x == ITEM_STICK => (
+            [0.76, 0.62, 0.36, 1.0],
+            [0.57, 0.44, 0.24, 1.0],
+            [0.45, 0.33, 0.19, 1.0],
+        ),
+        _ => (
+            [0.7, 0.7, 0.7, 1.0],
+            [0.5, 0.5, 0.5, 1.0],
+            [0.4, 0.4, 0.4, 1.0],
+        ),
+    }
+}
+
+fn scale_color(mut color: [f32; 4], scale: f32) -> [f32; 4] {
+    color[0] = (color[0] * scale).clamp(0.0, 1.0);
+    color[1] = (color[1] * scale).clamp(0.0, 1.0);
+    color[2] = (color[2] * scale).clamp(0.0, 1.0);
+    color
+}
+
+fn push_ui_quad(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    a: (f32, f32),
+    b: (f32, f32),
+    c: (f32, f32),
+    d: (f32, f32),
+    color: [f32; 4],
+) {
+    fn to_ndc(width: f32, height: f32, p: (f32, f32)) -> [f32; 2] {
+        let x = (p.0 / width) * 2.0 - 1.0;
+        let y = 1.0 - (p.1 / height) * 2.0;
+        [x, y]
+    }
+
+    let va = UiVertex {
+        position: to_ndc(width, height, a),
+        color,
+        uv: [0.0, 0.0],
+        use_texture: 0.0,
+        atlas_select: 0.0,
+    };
+    let vb = UiVertex {
+        position: to_ndc(width, height, b),
+        color,
+        uv: [0.0, 0.0],
+        use_texture: 0.0,
+        atlas_select: 0.0,
+    };
+    let vc = UiVertex {
+        position: to_ndc(width, height, c),
+        color,
+        uv: [0.0, 0.0],
+        use_texture: 0.0,
+        atlas_select: 0.0,
+    };
+    let vd = UiVertex {
+        position: to_ndc(width, height, d),
+        color,
+        uv: [0.0, 0.0],
+        use_texture: 0.0,
+        atlas_select: 0.0,
+    };
+    out.extend_from_slice(&[va, vb, vc, va, vc, vd]);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_ui_textured_quad(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    a: (f32, f32),
+    b: (f32, f32),
+    c: (f32, f32),
+    d: (f32, f32),
+    uv_a: [f32; 2],
+    uv_b: [f32; 2],
+    uv_c: [f32; 2],
+    uv_d: [f32; 2],
+    color: [f32; 4],
+    atlas_select: f32,
+) {
+    fn to_ndc(width: f32, height: f32, p: (f32, f32)) -> [f32; 2] {
+        let x = (p.0 / width) * 2.0 - 1.0;
+        let y = 1.0 - (p.1 / height) * 2.0;
+        [x, y]
+    }
+
+    let va = UiVertex {
+        position: to_ndc(width, height, a),
+        color,
+        uv: uv_a,
+        use_texture: 1.0,
+        atlas_select,
+    };
+    let vb = UiVertex {
+        position: to_ndc(width, height, b),
+        color,
+        uv: uv_b,
+        use_texture: 1.0,
+        atlas_select,
+    };
+    let vc = UiVertex {
+        position: to_ndc(width, height, c),
+        color,
+        uv: uv_c,
+        use_texture: 1.0,
+        atlas_select,
+    };
+    let vd = UiVertex {
+        position: to_ndc(width, height, d),
+        color,
+        uv: uv_d,
+        use_texture: 1.0,
+        atlas_select,
+    };
+    out.extend_from_slice(&[va, vb, vc, va, vc, vd]);
+}
+
+fn build_break_overlay_mesh(coord: IVec3, stage: u32) -> (Vec<ChunkVertex>, Vec<u32>) {
+    let mut vertices = Vec::with_capacity(24);
+    let mut indices = Vec::with_capacity(36);
+    let max_stage = DESTROY_STAGE_COUNT.saturating_sub(1);
+    let stage = stage.min(max_stage);
+    let tile = DESTROY_STAGE_TILE_START + stage;
+    let color = [1.0, 1.0, 1.0, 0.9];
+    let inflate = 0.0025f32;
+
+    let x0 = coord.x as f32 - inflate;
+    let y0 = coord.y as f32 - inflate;
+    let z0 = coord.z as f32 - inflate;
+    let x1 = coord.x as f32 + 1.0 + inflate;
+    let y1 = coord.y as f32 + 1.0 + inflate;
+    let z1 = coord.z as f32 + 1.0 + inflate;
+
+    emit_dropped_item_face(
+        &mut vertices,
+        &mut indices,
+        0,
+        [x1, y0, z0],
+        [x1, y1, z0],
+        [x1, y1, z1],
+        [x1, y0, z1],
+        tile,
+        0,
+        1,
+        1,
+        color,
+    );
+    emit_dropped_item_face(
+        &mut vertices,
+        &mut indices,
+        1,
+        [x0, y0, z1],
+        [x0, y1, z1],
+        [x0, y1, z0],
+        [x0, y0, z0],
+        tile,
+        0,
+        1,
+        1,
+        color,
+    );
+    emit_dropped_item_face(
+        &mut vertices,
+        &mut indices,
+        2,
+        [x0, y1, z0],
+        [x0, y1, z1],
+        [x1, y1, z1],
+        [x1, y1, z0],
+        tile,
+        0,
+        1,
+        1,
+        color,
+    );
+    emit_dropped_item_face(
+        &mut vertices,
+        &mut indices,
+        3,
+        [x0, y0, z1],
+        [x0, y0, z0],
+        [x1, y0, z0],
+        [x1, y0, z1],
+        tile,
+        0,
+        1,
+        1,
+        color,
+    );
+    emit_dropped_item_face(
+        &mut vertices,
+        &mut indices,
+        4,
+        [x0, y0, z1],
+        [x1, y0, z1],
+        [x1, y1, z1],
+        [x0, y1, z1],
+        tile,
+        0,
+        1,
+        1,
+        color,
+    );
+    emit_dropped_item_face(
+        &mut vertices,
+        &mut indices,
+        5,
+        [x1, y0, z0],
+        [x0, y0, z0],
+        [x0, y1, z0],
+        [x1, y1, z0],
+        tile,
+        0,
+        1,
+        1,
+        color,
+    );
+
+    (vertices, indices)
+}
+
+fn build_sun_mesh(camera: &Camera) -> (Vec<ChunkVertex>, Vec<u32>) {
+    let mut vertices = Vec::with_capacity(8);
+    let mut indices = Vec::with_capacity(12);
+
+    let center = camera.position + Vec3::new(0.0, 900.0, 0.0);
+    let half = 76.0f32;
+    let y = center.y;
+    let x0 = center.x - half;
+    let x1 = center.x + half;
+    let z0 = center.z - half;
+    let z1 = center.z + half;
+    let color = [1.0, 1.0, 1.0, 1.0];
+
+    // Draw both sides so the sun is visible regardless of camera height.
+    emit_dropped_item_face(
+        &mut vertices,
+        &mut indices,
+        3,
+        [x0, y, z1],
+        [x0, y, z0],
+        [x1, y, z0],
+        [x1, y, z1],
+        0,
+        0,
+        SUN_TRANSPARENT_MODE,
+        1,
+        color,
+    );
+    emit_dropped_item_face(
+        &mut vertices,
+        &mut indices,
+        2,
+        [x0, y + 0.01, z0],
+        [x0, y + 0.01, z1],
+        [x1, y + 0.01, z1],
+        [x1, y + 0.01, z0],
+        0,
+        0,
+        SUN_TRANSPARENT_MODE,
+        1,
+        color,
+    );
+
+    (vertices, indices)
+}
+
+fn build_dropped_item_mesh(items: &[DroppedItemRender]) -> (Vec<ChunkVertex>, Vec<u32>) {
+    if items.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut vertices = Vec::with_capacity(items.len() * 24);
+    let mut indices = Vec::with_capacity(items.len() * 36);
+    for &item in items {
+        if let Some(tile_index) = item_icon_tile_index(item.block_id) {
+            emit_dropped_item_prism(&mut vertices, &mut indices, item, tile_index);
+        } else {
+            emit_dropped_item_cube(&mut vertices, &mut indices, item);
+        }
+    }
+    (vertices, indices)
+}
+
+fn emit_dropped_item_cube(
+    vertices: &mut Vec<ChunkVertex>,
+    indices: &mut Vec<u32>,
+    item: DroppedItemRender,
+) {
+    let half = 0.22f32;
+    let rot = Mat3::from_rotation_y(item.spin_y) * Mat3::from_rotation_z(item.tilt_z);
+    let to_world = |p: Vec3| -> [f32; 3] { (rot * p + item.position).to_array() };
+
+    let p000 = to_world(Vec3::new(-half, -half, -half));
+    let p001 = to_world(Vec3::new(-half, -half, half));
+    let p010 = to_world(Vec3::new(-half, half, -half));
+    let p011 = to_world(Vec3::new(-half, half, half));
+    let p100 = to_world(Vec3::new(half, -half, -half));
+    let p101 = to_world(Vec3::new(half, -half, half));
+    let p110 = to_world(Vec3::new(half, half, -half));
+    let p111 = to_world(Vec3::new(half, half, half));
+
+    let (tiles, rotations, transparent_modes) = dropped_block_face_data(item.block_id);
+    emit_dropped_item_face(
+        vertices,
+        indices,
+        0,
+        p100,
+        p110,
+        p111,
+        p101,
+        tiles[0],
+        rotations[0],
+        transparent_modes[0],
+        1,
+        [1.0, 1.0, 1.0, 1.0],
+    );
+    emit_dropped_item_face(
+        vertices,
+        indices,
+        1,
+        p001,
+        p011,
+        p010,
+        p000,
+        tiles[1],
+        rotations[1],
+        transparent_modes[1],
+        1,
+        [1.0, 1.0, 1.0, 1.0],
+    );
+    emit_dropped_item_face(
+        vertices,
+        indices,
+        2,
+        p010,
+        p011,
+        p111,
+        p110,
+        tiles[2],
+        rotations[2],
+        transparent_modes[2],
+        1,
+        [1.0, 1.0, 1.0, 1.0],
+    );
+    emit_dropped_item_face(
+        vertices,
+        indices,
+        3,
+        p001,
+        p000,
+        p100,
+        p101,
+        tiles[3],
+        rotations[3],
+        transparent_modes[3],
+        1,
+        [1.0, 1.0, 1.0, 1.0],
+    );
+    emit_dropped_item_face(
+        vertices,
+        indices,
+        4,
+        p001,
+        p101,
+        p111,
+        p011,
+        tiles[4],
+        rotations[4],
+        transparent_modes[4],
+        1,
+        [1.0, 1.0, 1.0, 1.0],
+    );
+    emit_dropped_item_face(
+        vertices,
+        indices,
+        5,
+        p100,
+        p000,
+        p010,
+        p110,
+        tiles[5],
+        rotations[5],
+        transparent_modes[5],
+        1,
+        [1.0, 1.0, 1.0, 1.0],
+    );
+}
+
+const DROPPED_ITEM_TILE_PIXELS: u32 = 16;
+
+struct CpuItemAtlas {
+    width: u32,
+    tiles_x: u32,
+    tiles_y: u32,
+    rgba: Vec<u8>,
+}
+
+fn cpu_item_atlas() -> Option<&'static CpuItemAtlas> {
+    static ATLAS: OnceLock<Option<CpuItemAtlas>> = OnceLock::new();
+    ATLAS.get_or_init(load_cpu_item_atlas).as_ref()
+}
+
+fn load_cpu_item_atlas() -> Option<CpuItemAtlas> {
+    let atlas_rgba = image::open("src/texturing/atlas_output/atlas_items.png")
+        .ok()?
+        .to_rgba8();
+    let width = atlas_rgba.width();
+    let height = atlas_rgba.height();
+    if width == 0
+        || height == 0
+        || width % DROPPED_ITEM_TILE_PIXELS != 0
+        || height % DROPPED_ITEM_TILE_PIXELS != 0
+    {
+        return None;
+    }
+    Some(CpuItemAtlas {
+        width,
+        tiles_x: width / DROPPED_ITEM_TILE_PIXELS,
+        tiles_y: height / DROPPED_ITEM_TILE_PIXELS,
+        rgba: atlas_rgba.into_raw(),
+    })
+}
+
+fn item_tile_pixel_rgba(tile_index: u32, px: u32, py: u32) -> Option<[u8; 4]> {
+    if px >= DROPPED_ITEM_TILE_PIXELS || py >= DROPPED_ITEM_TILE_PIXELS {
+        return None;
+    }
+    let atlas = cpu_item_atlas()?;
+    if atlas.tiles_x == 0 {
+        return None;
+    }
+    let tile_x = tile_index % atlas.tiles_x;
+    let tile_y = tile_index / atlas.tiles_x;
+    if tile_y >= atlas.tiles_y {
+        return None;
+    }
+    let x = tile_x * DROPPED_ITEM_TILE_PIXELS + px;
+    let y = tile_y * DROPPED_ITEM_TILE_PIXELS + py;
+    let idx = ((y * atlas.width + x) * 4) as usize;
+    if idx + 3 >= atlas.rgba.len() {
+        return None;
+    }
+    Some([
+        atlas.rgba[idx],
+        atlas.rgba[idx + 1],
+        atlas.rgba[idx + 2],
+        atlas.rgba[idx + 3],
+    ])
+}
+
+fn dropped_item_side_color(item_id: i8) -> [f32; 4] {
+    match item_id {
+        ITEM_APPLE => [0.82, 0.20, 0.18, 1.0],
+        ITEM_STICK => [0.66, 0.50, 0.30, 1.0],
+        _ => [0.70, 0.70, 0.70, 1.0],
+    }
+}
+
+fn scale_rgba(mut c: [f32; 4], k: f32) -> [f32; 4] {
+    c[0] = (c[0] * k).clamp(0.0, 1.0);
+    c[1] = (c[1] * k).clamp(0.0, 1.0);
+    c[2] = (c[2] * k).clamp(0.0, 1.0);
+    c
+}
+
+fn emit_dropped_item_prism(
+    vertices: &mut Vec<ChunkVertex>,
+    indices: &mut Vec<u32>,
+    item: DroppedItemRender,
+    item_tile_index: u32,
+) {
+    // Thin cuboid so item drops still look like items, but with visible depth.
+    let half_x = 0.18f32;
+    let half_y = 0.20f32;
+    let half_z = 0.055f32;
+    let rot = Mat3::from_rotation_y(item.spin_y) * Mat3::from_rotation_z(item.tilt_z);
+    let to_world = |p: Vec3| -> [f32; 3] { (rot * p + item.position).to_array() };
+
+    let p000 = to_world(Vec3::new(-half_x, -half_y, -half_z));
+    let p001 = to_world(Vec3::new(-half_x, -half_y, half_z));
+    let p010 = to_world(Vec3::new(-half_x, half_y, -half_z));
+    let p011 = to_world(Vec3::new(-half_x, half_y, half_z));
+    let p100 = to_world(Vec3::new(half_x, -half_y, -half_z));
+    let p101 = to_world(Vec3::new(half_x, -half_y, half_z));
+    let p110 = to_world(Vec3::new(half_x, half_y, -half_z));
+    let p111 = to_world(Vec3::new(half_x, half_y, half_z));
+
+    let item_mode_alpha = 9u32; // 8+1 => sample item atlas, alpha-cutout mode.
+    emit_dropped_item_face(
+        vertices,
+        indices,
+        4,
+        p001,
+        p101,
+        p111,
+        p011,
+        item_tile_index,
+        0,
+        item_mode_alpha,
+        1,
+        [1.0, 1.0, 1.0, 1.0],
+    );
+    let mirrored_side_rotation = if item.block_id == ITEM_APPLE { 2 } else { 0 };
+    emit_dropped_item_face_mirror_y(
+        vertices,
+        indices,
+        5,
+        p100,
+        p000,
+        p010,
+        p110,
+        item_tile_index,
+        mirrored_side_rotation,
+        item_mode_alpha,
+        1,
+        [1.0, 1.0, 1.0, 1.0],
+    );
+
+    let mut opaque = [false; (DROPPED_ITEM_TILE_PIXELS * DROPPED_ITEM_TILE_PIXELS) as usize];
+    let mut rgb = [[0.0f32; 3]; (DROPPED_ITEM_TILE_PIXELS * DROPPED_ITEM_TILE_PIXELS) as usize];
+    let mut any_opaque = false;
+    for py in 0..DROPPED_ITEM_TILE_PIXELS {
+        for px in 0..DROPPED_ITEM_TILE_PIXELS {
+            let idx = (py * DROPPED_ITEM_TILE_PIXELS + px) as usize;
+            if let Some([r, g, b, a]) = item_tile_pixel_rgba(item_tile_index, px, py)
+                && a >= 20
+            {
+                opaque[idx] = true;
+                rgb[idx] = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
+                any_opaque = true;
+            }
+        }
+    }
+
+    if !any_opaque {
+        // Fallback if atlas data isn't available.
+        let base_side = dropped_item_side_color(item.block_id);
+        let side_a = scale_rgba(base_side, 0.72);
+        let side_b = scale_rgba(base_side, 0.82);
+        let side_top = scale_rgba(base_side, 0.92);
+        let side_bottom = scale_rgba(base_side, 0.58);
+        emit_dropped_item_face(
+            vertices, indices, 0, p100, p110, p111, p101, 0, 0, 0, 0, side_a,
+        );
+        emit_dropped_item_face(
+            vertices, indices, 1, p001, p011, p010, p000, 0, 0, 0, 0, side_b,
+        );
+        emit_dropped_item_face(
+            vertices, indices, 2, p010, p011, p111, p110, 0, 0, 0, 0, side_top,
+        );
+        emit_dropped_item_face(
+            vertices,
+            indices,
+            3,
+            p001,
+            p000,
+            p100,
+            p101,
+            0,
+            0,
+            0,
+            0,
+            side_bottom,
+        );
+        return;
+    }
+
+    let pixel_w = (half_x * 2.0) / DROPPED_ITEM_TILE_PIXELS as f32;
+    let pixel_h = (half_y * 2.0) / DROPPED_ITEM_TILE_PIXELS as f32;
+    let is_opaque = |x: i32, y: i32| -> bool {
+        if x < 0
+            || y < 0
+            || x >= DROPPED_ITEM_TILE_PIXELS as i32
+            || y >= DROPPED_ITEM_TILE_PIXELS as i32
+        {
+            return false;
+        }
+        opaque[(y as u32 * DROPPED_ITEM_TILE_PIXELS + x as u32) as usize]
+    };
+
+    for y in 0..DROPPED_ITEM_TILE_PIXELS as i32 {
+        for x in 0..DROPPED_ITEM_TILE_PIXELS as i32 {
+            if !is_opaque(x, y) {
+                continue;
+            }
+            let idx = (y as u32 * DROPPED_ITEM_TILE_PIXELS + x as u32) as usize;
+            let base = [rgb[idx][0], rgb[idx][1], rgb[idx][2], 1.0];
+
+            let x0 = -half_x + x as f32 * pixel_w;
+            let x1 = x0 + pixel_w;
+            let y_top = half_y - y as f32 * pixel_h;
+            let y_bot = y_top - pixel_h;
+
+            if !is_opaque(x - 1, y) {
+                emit_dropped_item_face(
+                    vertices,
+                    indices,
+                    1,
+                    to_world(Vec3::new(x0, y_bot, half_z)),
+                    to_world(Vec3::new(x0, y_top, half_z)),
+                    to_world(Vec3::new(x0, y_top, -half_z)),
+                    to_world(Vec3::new(x0, y_bot, -half_z)),
+                    0,
+                    0,
+                    0,
+                    0,
+                    scale_rgba(base, 0.84),
+                );
+            }
+            if !is_opaque(x + 1, y) {
+                emit_dropped_item_face(
+                    vertices,
+                    indices,
+                    0,
+                    to_world(Vec3::new(x1, y_bot, -half_z)),
+                    to_world(Vec3::new(x1, y_top, -half_z)),
+                    to_world(Vec3::new(x1, y_top, half_z)),
+                    to_world(Vec3::new(x1, y_bot, half_z)),
+                    0,
+                    0,
+                    0,
+                    0,
+                    scale_rgba(base, 0.74),
+                );
+            }
+            if !is_opaque(x, y - 1) {
+                emit_dropped_item_face(
+                    vertices,
+                    indices,
+                    2,
+                    to_world(Vec3::new(x0, y_top, -half_z)),
+                    to_world(Vec3::new(x0, y_top, half_z)),
+                    to_world(Vec3::new(x1, y_top, half_z)),
+                    to_world(Vec3::new(x1, y_top, -half_z)),
+                    0,
+                    0,
+                    0,
+                    0,
+                    scale_rgba(base, 0.95),
+                );
+            }
+            if !is_opaque(x, y + 1) {
+                emit_dropped_item_face(
+                    vertices,
+                    indices,
+                    3,
+                    to_world(Vec3::new(x0, y_bot, half_z)),
+                    to_world(Vec3::new(x0, y_bot, -half_z)),
+                    to_world(Vec3::new(x1, y_bot, -half_z)),
+                    to_world(Vec3::new(x1, y_bot, half_z)),
+                    0,
+                    0,
+                    0,
+                    0,
+                    scale_rgba(base, 0.60),
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_dropped_item_face(
+    vertices: &mut Vec<ChunkVertex>,
+    indices: &mut Vec<u32>,
+    face: u32,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    p3: [f32; 3],
+    tile: u32,
+    rotation: u32,
+    transparent_mode: u32,
+    use_texture: u32,
+    color: [f32; 4],
+) {
+    let base = vertices.len() as u32;
+    vertices.push(ChunkVertex {
+        position: p0,
+        uv: [0.0, 1.0],
+        tile,
+        face,
+        rotation,
+        use_texture,
+        transparent_mode,
+        color,
+    });
+    vertices.push(ChunkVertex {
+        position: p1,
+        uv: [1.0, 1.0],
+        tile,
+        face,
+        rotation,
+        use_texture,
+        transparent_mode,
+        color,
+    });
+    vertices.push(ChunkVertex {
+        position: p2,
+        uv: [1.0, 0.0],
+        tile,
+        face,
+        rotation,
+        use_texture,
+        transparent_mode,
+        color,
+    });
+    vertices.push(ChunkVertex {
+        position: p3,
+        uv: [0.0, 0.0],
+        tile,
+        face,
+        rotation,
+        use_texture,
+        transparent_mode,
+        color,
+    });
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_dropped_item_face_mirror_y(
+    vertices: &mut Vec<ChunkVertex>,
+    indices: &mut Vec<u32>,
+    face: u32,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    p3: [f32; 3],
+    tile: u32,
+    rotation: u32,
+    transparent_mode: u32,
+    use_texture: u32,
+    color: [f32; 4],
+) {
+    let base = vertices.len() as u32;
+    vertices.push(ChunkVertex {
+        position: p0,
+        uv: [0.0, 0.0],
+        tile,
+        face,
+        rotation,
+        use_texture,
+        transparent_mode,
+        color,
+    });
+    vertices.push(ChunkVertex {
+        position: p1,
+        uv: [1.0, 0.0],
+        tile,
+        face,
+        rotation,
+        use_texture,
+        transparent_mode,
+        color,
+    });
+    vertices.push(ChunkVertex {
+        position: p2,
+        uv: [1.0, 1.0],
+        tile,
+        face,
+        rotation,
+        use_texture,
+        transparent_mode,
+        color,
+    });
+    vertices.push(ChunkVertex {
+        position: p3,
+        uv: [0.0, 1.0],
+        tile,
+        face,
+        rotation,
+        use_texture,
+        transparent_mode,
+        color,
+    });
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+fn dropped_block_face_data(block_id: i8) -> ([u32; 6], [u32; 6], [u32; 6]) {
+    // Atlas slots are 1-based in assets, shader expects zero-based tile indices.
+    let tile_dirt = 1;
+    let tile_grass_top = 2;
+    let tile_grass_side = 3;
+    let tile_log_top = 4;
+    let tile_log_side = 5;
+    let tile_leaves = 7;
+    let tile_stone = 8;
+    let tile_planks_oak = 9;
+    let tile_crafting_table_top = 10;
+    let tile_crafting_table_side = 11;
+    let tile_crafting_table_front = 12;
+    let tile_gravel = 13;
+    let tile_sand = 14;
+
+    match block_id {
+        x if x == BLOCK_STONE as i8 => ([tile_stone; 6], [0, 0, 0, 0, 0, 0], [3, 3, 0, 0, 0, 0]),
+        x if x == BLOCK_DIRT as i8 => ([tile_dirt; 6], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]),
+        x if x == BLOCK_GRASS as i8 => (
+            [
+                tile_grass_side,
+                tile_grass_side,
+                tile_grass_top,
+                tile_dirt,
+                tile_grass_side,
+                tile_grass_side,
+            ],
+            [3, 3, 0, 0, 0, 0],
+            [1, 1, 0, 0, 1, 1],
+        ),
+        x if x == BLOCK_LOG as i8 => (
+            [
+                tile_log_side,
+                tile_log_side,
+                tile_log_top,
+                tile_log_top,
+                tile_log_side,
+                tile_log_side,
+            ],
+            [3, 3, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0],
+        ),
+        x if x == BLOCK_LEAVES as i8 => ([tile_leaves; 6], [0, 0, 0, 0, 0, 0], [2, 2, 2, 2, 2, 2]),
+        x if x == BLOCK_PLANKS_OAK as i8 => {
+            ([tile_planks_oak; 6], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0])
+        }
+        x if x == BLOCK_CRAFTING_TABLE as i8 => (
+            [
+                tile_crafting_table_side,
+                tile_crafting_table_side,
+                tile_crafting_table_top,
+                tile_crafting_table_side,
+                tile_crafting_table_front,
+                tile_crafting_table_side,
+            ],
+            [0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0],
+        ),
+        x if x == BLOCK_GRAVEL as i8 => ([tile_gravel; 6], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]),
+        x if x == BLOCK_SAND as i8 => ([tile_sand; 6], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]),
+        _ => ([tile_dirt; 6], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]),
+    }
 }
 
 fn chunk_visible(

@@ -5,6 +5,7 @@ struct Uniforms {
     flags0: vec4<u32>,
     flags1: vec4<u32>,
     colormap_misc: vec4<f32>,
+    item_misc: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -21,6 +22,18 @@ var grass_colormap_texture: texture_2d<f32>;
 
 @group(0) @binding(4)
 var grass_colormap_sampler: sampler;
+
+@group(0) @binding(5)
+var item_atlas_texture: texture_2d<f32>;
+
+@group(0) @binding(6)
+var item_atlas_sampler: sampler;
+
+@group(0) @binding(7)
+var sun_texture: texture_2d<f32>;
+
+@group(0) @binding(8)
+var sun_sampler: sampler;
 
 struct VertexInputRaw {
     @location(0) position: vec3<f32>,
@@ -225,12 +238,32 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     if (uniforms.flags0.x == 1u && input.use_texture == 1u) {
         let uv_rot = rotate_uv(input.uv, input.rotation);
-        let tiles_x = uniforms.flags0.y;
-        let tile_x = input.tile % tiles_x;
-        let tile_y = input.tile / tiles_x;
-        let uv_base = vec2<f32>(f32(tile_x), f32(tile_y)) * uniforms.tile_misc.xy;
-        let uv = uv_base + fract(uv_rot) * uniforms.tile_misc.xy;
-        let tex = textureSample(atlas_texture, atlas_sampler, uv);
+        let block_tiles_x = uniforms.flags0.y;
+        let block_tile_x = input.tile % block_tiles_x;
+        let block_tile_y = input.tile / block_tiles_x;
+        let block_uv_base = vec2<f32>(f32(block_tile_x), f32(block_tile_y)) * uniforms.tile_misc.xy;
+        let block_uv = block_uv_base + fract(uv_rot) * uniforms.tile_misc.xy;
+        let item_atlas_flag = 8u;
+        let sun_mode = 15u;
+        let sample_sun = input.transparent_mode == sun_mode;
+        let sample_item_atlas = !sample_sun && input.transparent_mode >= item_atlas_flag;
+        var transparent_mode = input.transparent_mode;
+        var tex: vec4<f32>;
+        if (sample_sun) {
+            // Sun texture is not tiled in the main atlas.
+            transparent_mode = 1u;
+            tex = textureSample(sun_texture, sun_sampler, clamp(uv_rot, vec2<f32>(0.0), vec2<f32>(1.0)));
+        } else if (sample_item_atlas) {
+            transparent_mode = input.transparent_mode - item_atlas_flag;
+            let item_tiles_x = max(u32(uniforms.item_misc.z), 1u);
+            let item_tile_x = input.tile % item_tiles_x;
+            let item_tile_y = input.tile / item_tiles_x;
+            let item_uv_base = vec2<f32>(f32(item_tile_x), f32(item_tile_y)) * uniforms.item_misc.xy;
+            let item_uv = item_uv_base + fract(uv_rot) * uniforms.item_misc.xy;
+            tex = textureSample(item_atlas_texture, item_atlas_sampler, item_uv);
+        } else {
+            tex = textureSample(atlas_texture, atlas_sampler, block_uv);
+        }
         var tex_rgb = tex.rgb;
         var tex_a = tex.a;
 
@@ -238,10 +271,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let is_grass_top = input.face == 2u && input.tile == uniforms.flags1.y;
         let is_side_face = input.face == 0u || input.face == 1u || input.face == 4u || input.face == 5u;
         let is_grass_side = is_side_face && input.tile == uniforms.flags1.z;
-        if (is_grass_side) {
+        if (!sample_item_atlas && is_grass_side) {
             let overlay_tile = uniforms.flags1.w;
-            let overlay_x = overlay_tile % tiles_x;
-            let overlay_y = overlay_tile / tiles_x;
+            let overlay_x = overlay_tile % block_tiles_x;
+            let overlay_y = overlay_tile / block_tiles_x;
             let overlay_uv_base = vec2<f32>(f32(overlay_x), f32(overlay_y)) * uniforms.tile_misc.xy;
             let overlay_uv = overlay_uv_base + fract(uv_rot) * uniforms.tile_misc.xy;
             let overlay = textureSample(atlas_texture, atlas_sampler, overlay_uv);
@@ -249,14 +282,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             tex_a = max(tex_a, overlay.a);
         }
 
-        if (is_grass_top || is_grass_side) {
+        if (!sample_item_atlas && !sample_sun && (is_grass_top || is_grass_side)) {
             let cm_uv = input.grass_cm_uv;
             let cm = textureSample(grass_colormap_texture, grass_colormap_sampler, cm_uv).rgb;
             // Keep texture identity while applying biome tint.
             tex_rgb = mix(tex_rgb, tex_rgb * cm, uniforms.colormap_misc.x);
         }
 
-        if (input.transparent_mode == 1u) {
+        if (transparent_mode == 1u) {
             if (tex_a < 0.05) {
                 discard;
             }
@@ -266,7 +299,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 mix(tex_rgb, tinted_rgb, tint_mix),
                 tex_a * color.a,
             );
-        } else if (input.transparent_mode == 2u) {
+        } else if (transparent_mode == 2u) {
             // RGB atlas fallback: treat near-white as transparent background.
             if (tex_rgb.r > 0.92 && tex_rgb.g > 0.92 && tex_rgb.b > 0.92) {
                 discard;

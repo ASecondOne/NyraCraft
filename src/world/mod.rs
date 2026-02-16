@@ -1,4 +1,5 @@
 pub mod blocks;
+pub mod lightengine;
 pub mod mesher;
 pub mod worldgen;
 

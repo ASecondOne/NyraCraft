@@ -1,17 +1,49 @@
 use glam::{IVec3, Vec3};
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
 use winit::event::MouseButton;
 
 use crate::app::streaming::{
-    DirtyChunks, EditedChunkRanges, SharedRequestQueue, request_chunk_remesh_now,
+    DirtyChunks, EditedChunkRanges, SharedRequestQueue, request_chunk_remesh_decay,
+    request_chunk_remesh_now,
 };
 use crate::world::CHUNK_SIZE;
-use crate::world::blocks::{BLOCK_LEAVES, BLOCK_LOG, BLOCK_STONE};
+use crate::world::blocks::{BLOCK_LEAVES, BLOCK_LOG};
 use crate::world::worldgen::WorldGen;
 
 type CoordKey = (i32, i32, i32);
 type ChunkKey = (i32, i32, i32);
+const LEAF_DECAY_SEARCH_CAP: usize = 2048;
+const LEAF_DECAY_BREAK_DELAY_TICKS: u64 = 4;
+const FACE_NEIGHBORS: [(i32, i32, i32); 6] = [
+    (1, 0, 0),
+    (-1, 0, 0),
+    (0, 1, 0),
+    (0, -1, 0),
+    (0, 0, 1),
+    (0, 0, -1),
+];
+
+#[derive(Clone, Copy)]
+struct ScheduledLeafBreak {
+    pos: IVec3,
+    ready_tick: u64,
+}
+
+#[derive(Default)]
+pub struct LeafDecayState {
+    tick: u64,
+    check_queue: VecDeque<IVec3>,
+    check_pending: HashSet<CoordKey>,
+    break_queue: VecDeque<ScheduledLeafBreak>,
+    break_pending: HashSet<CoordKey>,
+}
+
+enum LeafDecayAction {
+    None,
+    Check(IVec3),
+    Break(IVec3),
+}
 
 #[derive(Default)]
 pub struct EditedBlockStore {
@@ -20,9 +52,20 @@ pub struct EditedBlockStore {
 }
 
 pub type EditedBlocks = Arc<RwLock<EditedBlockStore>>;
+pub type LeafDecayQueue = Arc<Mutex<LeafDecayState>>;
+
+#[derive(Default, Clone, Copy)]
+pub struct BlockEditResult {
+    pub broke: Option<(IVec3, i8)>,
+    pub placed: Option<(IVec3, i8)>,
+}
 
 pub fn new_edited_blocks() -> EditedBlocks {
     Arc::new(RwLock::new(EditedBlockStore::default()))
+}
+
+pub fn new_leaf_decay_queue() -> LeafDecayQueue {
+    Arc::new(Mutex::new(LeafDecayState::default()))
 }
 
 impl EditedBlockStore {
@@ -86,10 +129,8 @@ pub fn block_id_with_edits(
     y: i32,
     z: i32,
 ) -> i8 {
-    if let Some(id) = edited_blocks.read().unwrap().get(x, y, z) {
-        return id;
-    }
-    world_gen.block_id_full_at(x, y, z)
+    let store = edited_blocks.read().unwrap();
+    block_id_with_store(world_gen, &store, x, y, z)
 }
 
 pub fn handle_block_mouse_input(
@@ -97,27 +138,31 @@ pub fn handle_block_mouse_input(
     looked_hit: Option<(IVec3, i8, IVec3)>,
     world_gen: &WorldGen,
     edited_blocks: &EditedBlocks,
+    leaf_decay_queue: &LeafDecayQueue,
     edited_chunk_ranges: &EditedChunkRanges,
     dirty_chunks: &DirtyChunks,
     request_queue: &SharedRequestQueue,
     player_pos: Vec3,
     player_height: f32,
     player_radius: f32,
-) {
-    let Some((target_block, target_id, place_block)) = looked_hit else {
-        return;
+    selected_place_block: Option<i8>,
+) -> BlockEditResult {
+    let mut result = BlockEditResult::default();
+    let Some((target_block, _target_id, place_block)) = looked_hit else {
+        return result;
     };
 
     match button {
         MouseButton::Left => {
-            if block_id_with_edits(
+            let target_now = block_id_with_edits(
                 world_gen,
                 edited_blocks,
                 target_block.x,
                 target_block.y,
                 target_block.z,
-            ) >= 0
-            {
+            );
+            if target_now >= 0 {
+                let tree_like = target_now == BLOCK_LOG as i8 || target_now == BLOCK_LEAVES as i8;
                 edited_blocks.write().unwrap().set(
                     target_block.x,
                     target_block.y,
@@ -125,11 +170,22 @@ pub fn handle_block_mouse_input(
                     -1,
                 );
                 mark_edited_chunk_range(edited_chunk_ranges, target_block);
-                let tree_like = target_id == BLOCK_LOG as i8 || target_id == BLOCK_LEAVES as i8;
-                invalidate_block_edit(dirty_chunks, request_queue, target_block, tree_like);
+                invalidate_block_edit(dirty_chunks, request_queue, target_block, tree_like, false);
+                result.broke = Some((target_block, target_now));
+                if tree_like {
+                    queue_leaf_decay_neighbors(
+                        world_gen,
+                        edited_blocks,
+                        leaf_decay_queue,
+                        target_block,
+                    );
+                }
             }
         }
         MouseButton::Right => {
+            let Some(place_block_id) = selected_place_block else {
+                return result;
+            };
             let place_id = block_id_with_edits(
                 world_gen,
                 edited_blocks,
@@ -145,13 +201,81 @@ pub fn handle_block_mouse_input(
                     place_block.x,
                     place_block.y,
                     place_block.z,
-                    BLOCK_STONE as i8,
+                    place_block_id,
                 );
                 mark_edited_chunk_range(edited_chunk_ranges, place_block);
-                invalidate_block_edit(dirty_chunks, request_queue, place_block, false);
+                invalidate_block_edit(dirty_chunks, request_queue, place_block, false, false);
+                result.placed = Some((place_block, place_block_id));
+                if place_block_id == BLOCK_LEAVES as i8
+                    && !leaf_has_log_connection(world_gen, edited_blocks, place_block)
+                {
+                    edited_blocks.write().unwrap().set(
+                        place_block.x,
+                        place_block.y,
+                        place_block.z,
+                        -1,
+                    );
+                    mark_edited_chunk_range(edited_chunk_ranges, place_block);
+                    invalidate_block_edit(dirty_chunks, request_queue, place_block, false, false);
+                }
             }
         }
         _ => {}
+    }
+    result
+}
+
+pub fn tick_leaf_decay(
+    world_gen: &WorldGen,
+    edited_blocks: &EditedBlocks,
+    leaf_decay_queue: &LeafDecayQueue,
+    edited_chunk_ranges: &EditedChunkRanges,
+    dirty_chunks: &DirtyChunks,
+    request_queue: &SharedRequestQueue,
+) -> Option<IVec3> {
+    match pop_leaf_decay_action(leaf_decay_queue) {
+        LeafDecayAction::None => return None,
+        LeafDecayAction::Check(candidate) => {
+            if block_id_with_edits(
+                world_gen,
+                edited_blocks,
+                candidate.x,
+                candidate.y,
+                candidate.z,
+            ) != BLOCK_LEAVES as i8
+            {
+                return None;
+            }
+            if leaf_has_log_connection(world_gen, edited_blocks, candidate) {
+                return None;
+            }
+            schedule_leaf_break(leaf_decay_queue, candidate);
+            None
+        }
+        LeafDecayAction::Break(candidate) => {
+            if block_id_with_edits(
+                world_gen,
+                edited_blocks,
+                candidate.x,
+                candidate.y,
+                candidate.z,
+            ) != BLOCK_LEAVES as i8
+            {
+                return None;
+            }
+            if leaf_has_log_connection(world_gen, edited_blocks, candidate) {
+                return None;
+            }
+
+            edited_blocks
+                .write()
+                .unwrap()
+                .set(candidate.x, candidate.y, candidate.z, -1);
+            mark_edited_chunk_range(edited_chunk_ranges, candidate);
+            invalidate_block_edit(dirty_chunks, request_queue, candidate, false, true);
+            queue_leaf_decay_neighbors(world_gen, edited_blocks, leaf_decay_queue, candidate);
+            Some(candidate)
+        }
     }
 }
 
@@ -192,12 +316,21 @@ fn world_to_chunk_coord(block: IVec3) -> IVec3 {
 }
 
 fn mark_edited_chunk_range(edited_chunk_ranges: &EditedChunkRanges, block: IVec3) {
-    let coord = world_to_chunk_coord(block);
-    let key = (coord.x, coord.y, coord.z);
+    mark_edited_chunk_ranges(edited_chunk_ranges, &[block]);
+}
+
+fn mark_edited_chunk_ranges(edited_chunk_ranges: &EditedChunkRanges, blocks: &[IVec3]) {
+    if blocks.is_empty() {
+        return;
+    }
     let mut ranges = edited_chunk_ranges.lock().unwrap();
-    let entry = ranges.entry(key).or_insert((block.y, block.y));
-    entry.0 = entry.0.min(block.y);
-    entry.1 = entry.1.max(block.y);
+    for &block in blocks {
+        let coord = world_to_chunk_coord(block);
+        let key = (coord.x, coord.y, coord.z);
+        let entry = ranges.entry(key).or_insert((block.y, block.y));
+        entry.0 = entry.0.min(block.y);
+        entry.1 = entry.1.max(block.y);
+    }
 }
 
 fn invalidate_block_edit(
@@ -205,7 +338,43 @@ fn invalidate_block_edit(
     request_queue: &SharedRequestQueue,
     block: IVec3,
     tree_like: bool,
+    decay: bool,
 ) {
+    invalidate_block_edits(dirty_chunks, request_queue, &[block], tree_like, decay);
+}
+
+fn invalidate_block_edits(
+    dirty_chunks: &DirtyChunks,
+    request_queue: &SharedRequestQueue,
+    blocks: &[IVec3],
+    tree_like: bool,
+    decay: bool,
+) {
+    if blocks.is_empty() {
+        return;
+    }
+
+    let mut unique = HashSet::new();
+    for &block in blocks {
+        collect_affected_chunks(block, tree_like, &mut unique);
+    }
+
+    let mut dirty = dirty_chunks.lock().unwrap();
+    for (x, y, z) in unique {
+        let key = (x, y, z);
+        let state = dirty.entry(key).or_insert(0);
+        let next_rev = state.abs().saturating_add(1);
+        *state = next_rev;
+        let coord = IVec3::new(x, y, z);
+        if decay {
+            request_chunk_remesh_decay(request_queue, coord);
+        } else {
+            request_chunk_remesh_now(request_queue, coord);
+        }
+    }
+}
+
+fn collect_affected_chunks(block: IVec3, tree_like: bool, affected: &mut HashSet<ChunkKey>) {
     const TREE_XZ_MARGIN: i32 = 3;
 
     let coord = world_to_chunk_coord(block);
@@ -216,21 +385,27 @@ fn invalidate_block_edit(
     );
     let local = block - chunk_min;
 
-    let mut affected = vec![coord];
+    affected.insert((coord.x, coord.y, coord.z));
     if local.x == 0 {
-        affected.push(coord - IVec3::X);
+        let c = coord - IVec3::X;
+        affected.insert((c.x, c.y, c.z));
     } else if local.x == CHUNK_SIZE - 1 {
-        affected.push(coord + IVec3::X);
+        let c = coord + IVec3::X;
+        affected.insert((c.x, c.y, c.z));
     }
     if local.y == 0 {
-        affected.push(coord - IVec3::Y);
+        let c = coord - IVec3::Y;
+        affected.insert((c.x, c.y, c.z));
     } else if local.y == CHUNK_SIZE - 1 {
-        affected.push(coord + IVec3::Y);
+        let c = coord + IVec3::Y;
+        affected.insert((c.x, c.y, c.z));
     }
     if local.z == 0 {
-        affected.push(coord - IVec3::Z);
+        let c = coord - IVec3::Z;
+        affected.insert((c.x, c.y, c.z));
     } else if local.z == CHUNK_SIZE - 1 {
-        affected.push(coord + IVec3::Z);
+        let c = coord + IVec3::Z;
+        affected.insert((c.x, c.y, c.z));
     }
 
     if tree_like {
@@ -250,20 +425,115 @@ fn invalidate_block_edit(
         }
         for ox in &x_offsets {
             for oz in &z_offsets {
-                affected.push(coord + IVec3::new(*ox, 0, *oz));
+                let c = coord + IVec3::new(*ox, 0, *oz);
+                affected.insert((c.x, c.y, c.z));
+            }
+        }
+    }
+}
+
+fn block_id_with_store(
+    world_gen: &WorldGen,
+    store: &EditedBlockStore,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> i8 {
+    if let Some(id) = store.get(x, y, z) {
+        return id;
+    }
+    world_gen.block_id_full_at(x, y, z)
+}
+
+fn queue_leaf_decay_neighbors(
+    world_gen: &WorldGen,
+    edited_blocks: &EditedBlocks,
+    leaf_decay_queue: &LeafDecayQueue,
+    center: IVec3,
+) {
+    for &(dx, dy, dz) in &FACE_NEIGHBORS {
+        let candidate = IVec3::new(center.x + dx, center.y + dy, center.z + dz);
+        if block_id_with_edits(
+            world_gen,
+            edited_blocks,
+            candidate.x,
+            candidate.y,
+            candidate.z,
+        ) == BLOCK_LEAVES as i8
+        {
+            enqueue_leaf_decay_candidate(leaf_decay_queue, candidate);
+        }
+    }
+}
+
+fn enqueue_leaf_decay_candidate(leaf_decay_queue: &LeafDecayQueue, candidate: IVec3) {
+    let mut state = leaf_decay_queue.lock().unwrap();
+    let key = (candidate.x, candidate.y, candidate.z);
+    if state.check_pending.insert(key) {
+        state.check_queue.push_back(candidate);
+    }
+}
+
+fn schedule_leaf_break(leaf_decay_queue: &LeafDecayQueue, candidate: IVec3) {
+    let mut state = leaf_decay_queue.lock().unwrap();
+    let key = (candidate.x, candidate.y, candidate.z);
+    if !state.break_pending.insert(key) {
+        return;
+    }
+    let ready_tick = state.tick.saturating_add(LEAF_DECAY_BREAK_DELAY_TICKS);
+    state.break_queue.push_back(ScheduledLeafBreak {
+        pos: candidate,
+        ready_tick,
+    });
+}
+
+fn pop_leaf_decay_action(leaf_decay_queue: &LeafDecayQueue) -> LeafDecayAction {
+    let mut state = leaf_decay_queue.lock().unwrap();
+    state.tick = state.tick.saturating_add(1);
+
+    if let Some(front) = state.break_queue.front().copied()
+        && front.ready_tick <= state.tick
+    {
+        state.break_queue.pop_front();
+        state
+            .break_pending
+            .remove(&(front.pos.x, front.pos.y, front.pos.z));
+        return LeafDecayAction::Break(front.pos);
+    }
+
+    let Some(next) = state.check_queue.pop_front() else {
+        return LeafDecayAction::None;
+    };
+    state.check_pending.remove(&(next.x, next.y, next.z));
+    LeafDecayAction::Check(next)
+}
+
+fn leaf_has_log_connection(
+    world_gen: &WorldGen,
+    edited_blocks: &EditedBlocks,
+    start_leaf: IVec3,
+) -> bool {
+    let mut visited = HashSet::<CoordKey>::new();
+    let mut queue = VecDeque::from([start_leaf]);
+    visited.insert((start_leaf.x, start_leaf.y, start_leaf.z));
+
+    while let Some(pos) = queue.pop_front() {
+        if visited.len() >= LEAF_DECAY_SEARCH_CAP {
+            // Avoid long scans in dense canopies; keep leaves in this ambiguous case.
+            return true;
+        }
+
+        for &(dx, dy, dz) in &FACE_NEIGHBORS {
+            let next = IVec3::new(pos.x + dx, pos.y + dy, pos.z + dz);
+            let next_id = block_id_with_edits(world_gen, edited_blocks, next.x, next.y, next.z);
+            if next_id == BLOCK_LOG as i8 {
+                return true;
+            }
+            if next_id == BLOCK_LEAVES as i8 && visited.insert((next.x, next.y, next.z)) {
+                queue.push_back(next);
             }
         }
     }
 
-    let mut unique = HashSet::new();
-    let mut dirty = dirty_chunks.lock().unwrap();
-    for c in affected {
-        if !unique.insert((c.x, c.y, c.z)) {
-            continue;
-        }
-        let key = (c.x, c.y, c.z);
-        let rev = dirty.entry(key).or_insert(0);
-        *rev = rev.saturating_add(1);
-        request_chunk_remesh_now(request_queue, c);
-    }
+    false
 }
