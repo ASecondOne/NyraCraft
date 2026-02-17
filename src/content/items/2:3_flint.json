@@ -1,0 +1,9 @@
+{
+  "id": "2:3",
+  "register_name": "item_flint",
+  "aliases": ["flint"],
+  "item_atlas_slot_1based": 3,
+  "edible": false,
+  "saturation": 0.0,
+  "effects": []
+}

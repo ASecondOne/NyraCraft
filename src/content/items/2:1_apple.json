@@ -1,0 +1,9 @@
+{
+  "id": "2:1",
+  "register_name": "item_apple",
+  "aliases": ["apple"],
+  "item_atlas_slot_1based": 1,
+  "edible": true,
+  "saturation": 4.0,
+  "effects": []
+}

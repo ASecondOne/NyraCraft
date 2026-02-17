@@ -1,8 +1,8 @@
 use crate::player::Camera;
 use crate::player::inventory::{
     CRAFT_GRID_SIDE, CRAFT_GRID_SLOTS, INVENTORY_STORAGE_SLOTS, InventorySlotRef, ItemStack,
-    MAX_STACK_SIZE, compute_inventory_layout, craft_input_slot_rect, craft_output_slot_rect,
-    hotbar_slot_rect, storage_slot_rect,
+    compute_inventory_layout, craft_input_slot_rect, craft_output_slot_rect, hotbar_slot_rect,
+    storage_slot_rect,
 };
 use crate::render::CubeStyle;
 use crate::render::atlas::TextureAtlas;
@@ -11,9 +11,10 @@ use crate::render::texture::{
     AtlasTexture, create_dummy_texture, load_atlas_texture, load_grass_colormap_texture,
 };
 use crate::world::blocks::{
-    BLOCK_COUNT, BLOCK_CRAFTING_TABLE, BLOCK_DIRT, BLOCK_GRASS, BLOCK_GRAVEL, BLOCK_LEAVES,
-    BLOCK_LOG, BLOCK_PLANKS_OAK, BLOCK_SAND, BLOCK_STONE, DESTROY_STAGE_COUNT,
-    DESTROY_STAGE_TILE_START, HOTBAR_SLOTS, ITEM_APPLE, ITEM_STICK, item_icon_tile_index,
+    BLOCK_CRAFTING_TABLE, BLOCK_DIRT, BLOCK_GRASS, BLOCK_GRAVEL, BLOCK_LEAVES, BLOCK_LOG,
+    BLOCK_PLANKS_OAK, BLOCK_SAND, BLOCK_STONE, DESTROY_STAGE_COUNT, DESTROY_STAGE_TILE_START,
+    HOTBAR_SLOTS, ITEM_APPLE, ITEM_STICK, block_count, block_texture_by_id, item_icon_tile_index,
+    item_max_durability, item_max_stack_size, placeable_block_id_for_item,
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat3, Mat4, Vec2, Vec3};
@@ -32,7 +33,7 @@ struct SceneUniform {
     flags0: [u32; 4],        // [use_texture, tiles_x, debug_faces, debug_chunks]
     flags1: [u32; 4], // [occlusion_cull, grass_top_tile, grass_side_tile, grass_overlay_tile]
     colormap_misc: [f32; 4], // [colormap_strength, reserved, reserved, reserved]
-    item_misc: [f32; 4],     // [item_tile_uv_x, item_tile_uv_y, item_tiles_x, reserved]
+    item_misc: [f32; 4], // [item_tile_uv_x, item_tile_uv_y, item_tiles_x, reserved]
 }
 
 #[repr(C)]
@@ -135,6 +136,32 @@ const HOTBAR_SLOT_COUNT: usize = HOTBAR_SLOTS;
 const UI_ATLAS_ITEM: f32 = 0.0;
 const UI_ATLAS_BLOCK: f32 = 1.0;
 const SUN_TRANSPARENT_MODE: u32 = 15;
+const DAY_CYCLE_SECONDS: f32 = 48.0 * 60.0; // 2 min per in-game hour, 48 min full day.
+
+#[derive(Clone, Copy)]
+struct DayCycleState {
+    day_progress: f32,
+    daylight: f32,
+    sky_mix: f32,
+    sun_height: f32,
+}
+
+fn sample_day_cycle(elapsed_seconds: f32) -> DayCycleState {
+    let day_progress = (elapsed_seconds / DAY_CYCLE_SECONDS).rem_euclid(1.0);
+    // Noon at t=0, midnight at 0.5 cycle.
+    let cycle_angle = day_progress * std::f32::consts::TAU;
+    let sun_height = cycle_angle.cos();
+    let day01 = ((sun_height + 1.0) * 0.5).clamp(0.0, 1.0);
+    // Keep a small ambient floor so nights stay readable.
+    let daylight = (0.08 + 0.92 * day01.powf(1.35)).clamp(0.08, 1.0);
+    let sky_mix = day01.powf(0.8);
+    DayCycleState {
+        day_progress,
+        daylight,
+        sky_mix,
+        sun_height,
+    }
+}
 
 struct GpuInner<'a> {
     surface: wgpu::Surface<'a>,
@@ -747,6 +774,7 @@ impl Gpu {
     pub fn render(
         &mut self,
         camera: &Camera,
+        elapsed_seconds: f32,
         debug_faces: bool,
         debug_chunks: bool,
         _draw_radius: i32,
@@ -761,11 +789,20 @@ impl Gpu {
         cursor_pos: Option<(f32, f32)>,
         dragged_item: Option<ItemStack>,
         break_overlay: Option<(IVec3, u32)>,
+        chat_open: bool,
+        chat_visible: bool,
+        keybind_overlay_visible: bool,
+        keybind_overlay_lines: &[&str],
+        stats_overlay_visible: bool,
+        stats_overlay_lines: &[String],
+        chat_input: &str,
+        chat_lines: &[String],
         dropped_items: &[DroppedItemRender],
     ) {
         self.cell.with_dependent_mut(|_, gpu| {
             apply_pending_uploads(gpu, 16);
             let mvp = build_mvp(gpu.config.width, gpu.config.height, camera);
+            let day_cycle = sample_day_cycle(elapsed_seconds);
 
             let uniform = SceneUniform {
                 mvp: mvp.to_cols_array_2d(),
@@ -783,7 +820,7 @@ impl Gpu {
                     0,
                 ],
                 flags1: [0, 2, 3, 6],
-                colormap_misc: [0.72, 0.0, 0.0, 0.0],
+                colormap_misc: [0.72, day_cycle.daylight, 0.0, 0.0],
                 item_misc: [
                     gpu.ui_item_tile_uv_size[0],
                     gpu.ui_item_tile_uv_size[1],
@@ -813,9 +850,10 @@ impl Gpu {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("cube_encoder"),
                 });
-            let ui_vertices = build_inventory_ui_vertices(
+            let mut ui_vertices = build_inventory_ui_vertices(
                 gpu.config.width,
                 gpu.config.height,
+                elapsed_seconds,
                 selected_hotbar_slot,
                 hotbar_slots,
                 inventory_open,
@@ -830,6 +868,29 @@ impl Gpu {
                 gpu.tile_uv_size,
                 gpu.ui_item_tiles_x,
                 gpu.ui_item_tile_uv_size,
+            );
+            push_chat_overlay(
+                &mut ui_vertices,
+                gpu.config.width,
+                gpu.config.height,
+                chat_open,
+                chat_visible,
+                chat_input,
+                chat_lines,
+            );
+            push_stats_overlay(
+                &mut ui_vertices,
+                gpu.config.width,
+                gpu.config.height,
+                stats_overlay_visible,
+                stats_overlay_lines,
+            );
+            push_keybind_overlay(
+                &mut ui_vertices,
+                gpu.config.width,
+                gpu.config.height,
+                keybind_overlay_visible,
+                keybind_overlay_lines,
             );
             if !ui_vertices.is_empty() {
                 ensure_ui_vertex_capacity(gpu, ui_vertices.len());
@@ -882,7 +943,8 @@ impl Gpu {
                 Some((vertex_buffer, index_buffer, indices.len() as u32))
             });
             let sun_draw = {
-                let (vertices, indices) = build_sun_mesh(camera);
+                let (vertices, indices) =
+                    build_sun_mesh(camera, day_cycle.day_progress, day_cycle.sun_height);
                 if vertices.is_empty() || indices.is_empty() {
                     None
                 } else {
@@ -912,9 +974,9 @@ impl Gpu {
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.52,
-                                g: 0.73,
-                                b: 0.95,
+                                r: 0.02 + (0.52 - 0.02) * day_cycle.sky_mix as f64,
+                                g: 0.04 + (0.73 - 0.04) * day_cycle.sky_mix as f64,
+                                b: 0.09 + (0.95 - 0.09) * day_cycle.sky_mix as f64,
                                 a: 1.0,
                             }),
                             store: wgpu::StoreOp::Store,
@@ -1207,17 +1269,21 @@ impl Gpu {
             if gpu.dirty_supers.is_empty() || budget == 0 {
                 return;
             }
-            // Sort once by distance (descending), then pop nearest from the tail.
-            gpu.dirty_supers.sort_unstable_by(|a, b| {
-                let da = (super_chunk_center(*a) - camera_pos).length_squared();
-                let db = (super_chunk_center(*b) - camera_pos).length_squared();
-                db.total_cmp(&da)
-            });
-            let take = budget.min(gpu.dirty_supers.len());
-            for _ in 0..take {
-                let Some(coord) = gpu.dirty_supers.pop() else {
-                    break;
-                };
+            let len = gpu.dirty_supers.len();
+            let take = budget.min(len);
+            let mut rebuild_now: Vec<IVec3> = if take >= len {
+                std::mem::take(&mut gpu.dirty_supers)
+            } else {
+                let split = len - take;
+                // Keep far supers in-place and extract only the nearest slice this tick.
+                gpu.dirty_supers.select_nth_unstable_by(split, |a, b| {
+                    let da = (super_chunk_center(*a) - camera_pos).length_squared();
+                    let db = (super_chunk_center(*b) - camera_pos).length_squared();
+                    db.total_cmp(&da)
+                });
+                gpu.dirty_supers.split_off(split)
+            };
+            for coord in rebuild_now.drain(..) {
                 gpu.dirty_set.remove(&coord);
                 rebuild_superchunk(gpu, coord);
             }
@@ -1611,6 +1677,7 @@ fn ensure_ui_vertex_capacity(gpu: &mut GpuInner, required_vertices: usize) {
 fn build_inventory_ui_vertices(
     width: u32,
     height: u32,
+    elapsed_seconds: f32,
     selected_hotbar_slot: u8,
     hotbar_slots: &[Option<ItemStack>; HOTBAR_SLOT_COUNT],
     inventory_open: bool,
@@ -1732,8 +1799,74 @@ fn build_inventory_ui_vertices(
                 item_tiles_x,
                 item_tile_uv_size,
             );
-            push_stack_meter(&mut vertices, width_f, height_f, rect, stack.count);
+            push_stack_meter(
+                &mut vertices,
+                width_f,
+                height_f,
+                rect,
+                stack.block_id,
+                stack.count,
+            );
+            if stack.count > 1 {
+                let count_text = stack.count.to_string();
+                let pixel = (rect.w * 0.06).clamp(1.0, 2.4);
+                let text_w = text_width_3x5(&count_text, pixel);
+                let text_x = rect.x + rect.w - text_w - pixel * 1.3;
+                let text_y = rect.y + rect.h - pixel * 6.0;
+                push_text_3x5_shadow(
+                    &mut vertices,
+                    width_f,
+                    height_f,
+                    text_x,
+                    text_y,
+                    pixel,
+                    &count_text,
+                    [0.96, 0.96, 0.96, 0.95],
+                );
+            }
         }
+    }
+
+    if let Some(selected_stack) = hotbar_slots.get(selected).copied().flatten() {
+        if let Some(max_durability) = item_max_durability(selected_stack.block_id) {
+            let cur_durability = selected_stack
+                .durability
+                .max(1)
+                .min(max_durability.max(1));
+            let text = format!("{}/{}", cur_durability, max_durability.max(1));
+            let pixel = (layout.slot * 0.072).clamp(1.2, 2.8);
+            let text_w = text_width_3x5(&text, pixel);
+            let text_x = (width_f - text_w) * 0.5;
+            let text_y = (layout.hotbar_y - pixel * 7.0).max(4.0);
+            push_text_3x5_shadow(
+                &mut vertices,
+                width_f,
+                height_f,
+                text_x,
+                text_y,
+                pixel,
+                &text,
+                [0.90, 0.94, 0.98, 0.96],
+            );
+        }
+    }
+
+    if !inventory_open {
+        push_held_item_viewmodel(
+            &mut vertices,
+            width_f,
+            height_f,
+            elapsed_seconds,
+            hotbar_slots
+                .get(selected)
+                .copied()
+                .flatten()
+                .filter(|stack| stack.count > 0),
+            block_tiles_x,
+            block_tile_uv_size,
+            item_tiles_x,
+            item_tile_uv_size,
+        );
     }
 
     if inventory_open {
@@ -1765,7 +1898,14 @@ fn build_inventory_ui_vertices(
                     item_tiles_x,
                     item_tile_uv_size,
                 );
-                push_stack_meter(&mut vertices, width_f, height_f, rect, stack.count);
+                push_stack_meter(
+                    &mut vertices,
+                    width_f,
+                    height_f,
+                    rect,
+                    stack.block_id,
+                    stack.count,
+                );
             }
         }
 
@@ -1798,7 +1938,14 @@ fn build_inventory_ui_vertices(
                 item_tiles_x,
                 item_tile_uv_size,
             );
-            push_stack_meter(&mut vertices, width_f, height_f, output_rect, stack.count);
+            push_stack_meter(
+                &mut vertices,
+                width_f,
+                height_f,
+                output_rect,
+                stack.block_id,
+                stack.count,
+            );
         }
 
         let grid_right = layout.craft_input_start_x
@@ -1870,7 +2017,14 @@ fn build_inventory_ui_vertices(
                     item_tiles_x,
                     item_tile_uv_size,
                 );
-                push_stack_meter(&mut vertices, width_f, height_f, rect, stack.count);
+                push_stack_meter(
+                    &mut vertices,
+                    width_f,
+                    height_f,
+                    rect,
+                    stack.block_id,
+                    stack.count,
+                );
             }
         }
 
@@ -1894,6 +2048,302 @@ fn build_inventory_ui_vertices(
     }
 
     vertices
+}
+
+fn clipped_text(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    text.chars().take(max_chars).collect()
+}
+
+fn push_chat_overlay(
+    out: &mut Vec<UiVertex>,
+    width: u32,
+    height: u32,
+    chat_open: bool,
+    chat_visible: bool,
+    chat_input: &str,
+    chat_lines: &[String],
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    if !chat_open && !chat_visible {
+        return;
+    }
+    if !chat_open && chat_lines.is_empty() {
+        return;
+    }
+
+    let width_f = width as f32;
+    let height_f = height as f32;
+    let pixel = (width_f.min(height_f) * 0.0032).clamp(1.5, 2.8);
+    let line_h = pixel * 6.0;
+    let panel_w = (width_f * 0.50).clamp(260.0, 620.0);
+    let panel_x = (width_f * 0.018).clamp(8.0, 20.0);
+    let panel_bottom_margin = (height_f * 0.16).clamp(78.0, 132.0);
+    let pad = (pixel * 2.3).clamp(4.0, 9.0);
+    let max_visible_lines = if chat_open { 8 } else { 5 };
+    let shown_count = chat_lines.len().min(max_visible_lines);
+    let line_count = shown_count + usize::from(chat_open);
+    if line_count == 0 {
+        return;
+    }
+    let panel_h = line_count as f32 * line_h + pad * 2.0 + if chat_open { pixel * 1.6 } else { 0.0 };
+    let panel_y = (height_f - panel_h - panel_bottom_margin).max(8.0);
+    let panel_alpha = if chat_open { 0.70 } else { 0.44 };
+    push_ui_rect(
+        out,
+        width_f,
+        height_f,
+        panel_x,
+        panel_y,
+        panel_w,
+        panel_h,
+        [0.03, 0.04, 0.05, panel_alpha],
+    );
+    push_ui_rect(
+        out,
+        width_f,
+        height_f,
+        panel_x,
+        panel_y,
+        panel_w,
+        (pixel * 0.9).clamp(1.0, 3.0),
+        [0.80, 0.86, 0.92, 0.28],
+    );
+
+    let max_chars = (((panel_w - pad * 2.0) / (pixel * 4.0)).floor() as usize).max(1);
+    let start_index = chat_lines.len().saturating_sub(shown_count);
+    for (row, line) in chat_lines[start_index..].iter().enumerate() {
+        let visible = clipped_text(line, max_chars);
+        let y = panel_y + pad + row as f32 * line_h;
+        push_text_3x5_shadow(
+            out,
+            width_f,
+            height_f,
+            panel_x + pad,
+            y,
+            pixel,
+            &visible,
+            [0.92, 0.94, 0.98, 0.96],
+        );
+    }
+
+    if chat_open {
+        let input_bg_y = panel_y + pad + shown_count as f32 * line_h + pixel * 0.4;
+        push_ui_rect(
+            out,
+            width_f,
+            height_f,
+            panel_x + pad * 0.55,
+            input_bg_y - pixel * 0.7,
+            panel_w - pad * 1.1,
+            line_h + pixel * 0.9,
+            [0.0, 0.0, 0.0, 0.38],
+        );
+        let available_chars = max_chars.saturating_sub(2).max(1);
+        let mut input_visible = clipped_text(chat_input, available_chars);
+        if input_visible.is_empty() {
+            input_visible.push(' ');
+        }
+        let input_text = format!("> {input_visible}_");
+        push_text_3x5_shadow(
+            out,
+            width_f,
+            height_f,
+            panel_x + pad,
+            input_bg_y,
+            pixel,
+            &input_text,
+            [0.97, 0.98, 0.99, 0.98],
+        );
+    }
+}
+
+fn push_stats_overlay(
+    out: &mut Vec<UiVertex>,
+    width: u32,
+    height: u32,
+    visible: bool,
+    lines: &[String],
+) {
+    if !visible || width == 0 || height == 0 || lines.is_empty() {
+        return;
+    }
+
+    let width_f = width as f32;
+    let height_f = height as f32;
+    let pixel = (width_f.min(height_f) * 0.0029).clamp(1.3, 2.2);
+    let line_h = pixel * 6.0;
+    let panel_x = 8.0;
+    let panel_y = 8.0;
+    let panel_w = (width_f * 0.62).clamp(300.0, 900.0);
+    let max_lines = (((height_f * 0.86) / line_h).floor() as usize).max(3);
+    let shown_count = lines.len().min(max_lines);
+    if shown_count == 0 {
+        return;
+    }
+    let pad = (pixel * 2.1).clamp(3.0, 8.0);
+    let panel_h = shown_count as f32 * line_h + pad * 2.0;
+
+    push_ui_rect(
+        out,
+        width_f,
+        height_f,
+        panel_x,
+        panel_y,
+        panel_w,
+        panel_h,
+        [0.01, 0.01, 0.01, 0.62],
+    );
+    push_ui_rect(
+        out,
+        width_f,
+        height_f,
+        panel_x,
+        panel_y,
+        panel_w,
+        (pixel * 0.9).clamp(1.0, 2.2),
+        [0.76, 0.87, 0.96, 0.30],
+    );
+
+    let max_chars = (((panel_w - pad * 2.0) / (pixel * 4.0)).floor() as usize).max(1);
+    for (idx, line) in lines.iter().take(shown_count).enumerate() {
+        let text = clipped_text(line, max_chars);
+        push_text_3x5_shadow(
+            out,
+            width_f,
+            height_f,
+            panel_x + pad,
+            panel_y + pad + idx as f32 * line_h,
+            pixel,
+            &text,
+            [0.92, 0.94, 0.98, 0.96],
+        );
+    }
+}
+
+fn push_keybind_overlay(
+    out: &mut Vec<UiVertex>,
+    width: u32,
+    height: u32,
+    visible: bool,
+    lines: &[&str],
+) {
+    if !visible || width == 0 || height == 0 || lines.is_empty() {
+        return;
+    }
+
+    let width_f = width as f32;
+    let height_f = height as f32;
+    let pixel = (width_f.min(height_f) * 0.0030).clamp(1.4, 2.4);
+    let line_h = pixel * 6.0;
+    let panel_w = (width_f * 0.76).clamp(360.0, 1040.0);
+    let panel_h = (lines.len() as f32 * line_h + pixel * 6.0).clamp(120.0, height_f * 0.88);
+    let panel_x = (width_f - panel_w) * 0.5;
+    let panel_y = (height_f - panel_h) * 0.16;
+    let pad = (pixel * 2.5).clamp(4.0, 9.0);
+
+    push_ui_rect(
+        out,
+        width_f,
+        height_f,
+        panel_x,
+        panel_y,
+        panel_w,
+        panel_h,
+        [0.02, 0.02, 0.03, 0.82],
+    );
+    push_ui_rect(
+        out,
+        width_f,
+        height_f,
+        panel_x,
+        panel_y,
+        panel_w,
+        (pixel * 1.2).clamp(1.0, 3.0),
+        [0.84, 0.91, 0.98, 0.35],
+    );
+
+    let max_chars = (((panel_w - pad * 2.0) / (pixel * 4.0)).floor() as usize).max(1);
+    let max_lines = (((panel_h - pad * 2.0) / line_h).floor() as usize).max(1);
+    for (idx, line) in lines.iter().take(max_lines).enumerate() {
+        let text = clipped_text(line, max_chars);
+        let color = if idx == 0 {
+            [0.98, 0.98, 0.84, 0.99]
+        } else {
+            [0.94, 0.95, 0.98, 0.97]
+        };
+        push_text_3x5_shadow(
+            out,
+            width_f,
+            height_f,
+            panel_x + pad,
+            panel_y + pad + idx as f32 * line_h,
+            pixel,
+            &text,
+            color,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_held_item_viewmodel(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    elapsed_seconds: f32,
+    held_stack: Option<ItemStack>,
+    block_tiles_x: u32,
+    block_tile_uv_size: [f32; 2],
+    item_tiles_x: u32,
+    item_tile_uv_size: [f32; 2],
+) {
+    let Some(held) = held_stack else {
+        return;
+    };
+    if held.count == 0 {
+        return;
+    }
+
+    let base_size = (width.min(height) * 0.34).clamp(92.0, 220.0);
+    let sway_x = (elapsed_seconds * 1.9).sin() * (base_size * 0.03);
+    let sway_y = (elapsed_seconds * 1.35).sin() * (base_size * 0.02);
+    let center_x = width * 0.84 + sway_x;
+    let center_y = height * 0.79 + sway_y;
+
+    let panel_w = base_size * 0.95;
+    let panel_h = base_size * 0.48;
+    let panel_x = center_x - panel_w * 0.5;
+    let panel_y = center_y - panel_h * 0.16;
+    push_ui_rect(
+        out,
+        width,
+        height,
+        panel_x,
+        panel_y,
+        panel_w,
+        panel_h,
+        [0.02, 0.02, 0.02, 0.22],
+    );
+
+    push_inventory_icon(
+        out,
+        width,
+        height,
+        center_x,
+        center_y,
+        base_size * 0.64,
+        held.block_id,
+        true,
+        base_size,
+        block_tiles_x,
+        block_tile_uv_size,
+        item_tiles_x,
+        item_tile_uv_size,
+    );
 }
 
 fn push_slot_box(
@@ -1988,6 +2438,7 @@ fn push_stack_meter(
     width: f32,
     height: f32,
     rect: crate::player::inventory::UiRect,
+    item_id: i8,
     count: u8,
 ) {
     if count == 0 {
@@ -1998,7 +2449,8 @@ fn push_stack_meter(
     let bar_w = (rect.w - bar_margin * 2.0).max(2.0);
     let bar_x = rect.x + bar_margin;
     let bar_y = rect.y + rect.h - bar_h - (rect.h * 0.08).clamp(1.0, 4.0);
-    let fill_ratio = (count as f32 / MAX_STACK_SIZE as f32).clamp(0.0, 1.0);
+    let max_count = item_max_stack_size(item_id).max(1);
+    let fill_ratio = (count as f32 / max_count as f32).clamp(0.0, 1.0);
     let fill_w = (bar_w * fill_ratio).max(1.0);
 
     push_ui_rect(
@@ -2053,7 +2505,20 @@ fn push_inventory_icon(
             UI_ATLAS_ITEM,
             selected,
         );
-    } else if item_id >= 0 && (item_id as usize) < BLOCK_COUNT {
+    } else if let Some(block_id) = placeable_block_id_for_item(item_id) {
+        push_block_icon_textured(
+            out,
+            width,
+            height,
+            center_x,
+            center_y,
+            size,
+            block_id,
+            block_tiles_x,
+            block_tile_uv_size,
+            selected,
+        );
+    } else if item_id >= 0 && (item_id as usize) < block_count() {
         push_block_icon_textured(
             out,
             width,
@@ -2375,6 +2840,154 @@ fn push_ui_rect(
         atlas_select: 0.0,
     };
     out.extend_from_slice(&[v0, v1, v2, v0, v2, v3]);
+}
+
+fn text_width_3x5(text: &str, pixel: f32) -> f32 {
+    let count = text.chars().count() as f32;
+    if count <= 0.0 {
+        return 0.0;
+    }
+    // 3 px glyph width + 1 px spacing.
+    count * (pixel * 3.0) + (count - 1.0) * pixel
+}
+
+fn push_text_3x5_shadow(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    x: f32,
+    y: f32,
+    pixel: f32,
+    text: &str,
+    color: [f32; 4],
+) {
+    if text.is_empty() || pixel <= 0.0 {
+        return;
+    }
+    let shadow_offset = pixel.max(1.0);
+    push_text_3x5(
+        out,
+        width,
+        height,
+        x + shadow_offset,
+        y + shadow_offset,
+        pixel,
+        text,
+        [0.0, 0.0, 0.0, color[3] * 0.75],
+    );
+    push_text_3x5(out, width, height, x, y, pixel, text, color);
+}
+
+fn push_text_3x5(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    mut x: f32,
+    mut y: f32,
+    pixel: f32,
+    text: &str,
+    color: [f32; 4],
+) {
+    if text.is_empty() || pixel <= 0.0 {
+        return;
+    }
+    let line_start_x = x;
+    for ch in text.chars() {
+        if ch == '\n' {
+            y += pixel * 6.0;
+            x = line_start_x;
+            continue;
+        }
+        let glyph = glyph_3x5(ch).unwrap_or([0b111, 0b101, 0b111, 0b101, 0b101]);
+        for (row, bits) in glyph.iter().copied().enumerate() {
+            for col in 0..3 {
+                if (bits & (1 << (2 - col))) == 0 {
+                    continue;
+                }
+                push_ui_rect(
+                    out,
+                    width,
+                    height,
+                    x + col as f32 * pixel,
+                    y + row as f32 * pixel,
+                    pixel,
+                    pixel,
+                    color,
+                );
+            }
+        }
+        x += pixel * 4.0;
+    }
+}
+
+fn glyph_3x5(ch: char) -> Option<[u8; 5]> {
+    match ch.to_ascii_lowercase() {
+        '0' => Some([0b111, 0b101, 0b101, 0b101, 0b111]),
+        '1' => Some([0b010, 0b110, 0b010, 0b010, 0b111]),
+        '2' => Some([0b111, 0b001, 0b111, 0b100, 0b111]),
+        '3' => Some([0b111, 0b001, 0b111, 0b001, 0b111]),
+        '4' => Some([0b101, 0b101, 0b111, 0b001, 0b001]),
+        '5' => Some([0b111, 0b100, 0b111, 0b001, 0b111]),
+        '6' => Some([0b111, 0b100, 0b111, 0b101, 0b111]),
+        '7' => Some([0b111, 0b001, 0b010, 0b010, 0b010]),
+        '8' => Some([0b111, 0b101, 0b111, 0b101, 0b111]),
+        '9' => Some([0b111, 0b101, 0b111, 0b001, 0b111]),
+        'a' => Some([0b111, 0b001, 0b111, 0b101, 0b111]),
+        'b' => Some([0b110, 0b101, 0b110, 0b101, 0b110]),
+        'c' => Some([0b111, 0b100, 0b100, 0b100, 0b111]),
+        'd' => Some([0b110, 0b101, 0b101, 0b101, 0b110]),
+        'e' => Some([0b111, 0b100, 0b110, 0b100, 0b111]),
+        'f' => Some([0b111, 0b100, 0b110, 0b100, 0b100]),
+        'g' => Some([0b111, 0b100, 0b101, 0b101, 0b111]),
+        'h' => Some([0b101, 0b101, 0b111, 0b101, 0b101]),
+        'i' => Some([0b111, 0b010, 0b010, 0b010, 0b111]),
+        'j' => Some([0b001, 0b001, 0b001, 0b101, 0b111]),
+        'k' => Some([0b101, 0b101, 0b110, 0b101, 0b101]),
+        'l' => Some([0b100, 0b100, 0b100, 0b100, 0b111]),
+        'm' => Some([0b101, 0b111, 0b111, 0b101, 0b101]),
+        'n' => Some([0b110, 0b101, 0b101, 0b101, 0b101]),
+        'o' => Some([0b111, 0b101, 0b101, 0b101, 0b111]),
+        'p' => Some([0b111, 0b101, 0b111, 0b100, 0b100]),
+        'q' => Some([0b111, 0b101, 0b101, 0b111, 0b001]),
+        'r' => Some([0b110, 0b101, 0b110, 0b101, 0b101]),
+        's' => Some([0b111, 0b100, 0b111, 0b001, 0b111]),
+        't' => Some([0b111, 0b010, 0b010, 0b010, 0b010]),
+        'u' => Some([0b101, 0b101, 0b101, 0b101, 0b111]),
+        'v' => Some([0b101, 0b101, 0b101, 0b101, 0b010]),
+        'w' => Some([0b101, 0b101, 0b111, 0b111, 0b101]),
+        'x' => Some([0b101, 0b101, 0b010, 0b101, 0b101]),
+        'y' => Some([0b101, 0b101, 0b111, 0b001, 0b111]),
+        'z' => Some([0b111, 0b001, 0b010, 0b100, 0b111]),
+        '.' => Some([0b000, 0b000, 0b000, 0b000, 0b010]),
+        ',' => Some([0b000, 0b000, 0b000, 0b010, 0b100]),
+        ':' => Some([0b000, 0b010, 0b000, 0b010, 0b000]),
+        ';' => Some([0b000, 0b010, 0b000, 0b010, 0b100]),
+        '!' => Some([0b010, 0b010, 0b010, 0b000, 0b010]),
+        '?' => Some([0b111, 0b001, 0b011, 0b000, 0b010]),
+        '\'' => Some([0b010, 0b010, 0b000, 0b000, 0b000]),
+        '"' => Some([0b101, 0b101, 0b000, 0b000, 0b000]),
+        '/' => Some([0b001, 0b001, 0b010, 0b100, 0b100]),
+        '\\' => Some([0b100, 0b100, 0b010, 0b001, 0b001]),
+        '-' => Some([0b000, 0b000, 0b111, 0b000, 0b000]),
+        '+' => Some([0b000, 0b010, 0b111, 0b010, 0b000]),
+        '=' => Some([0b000, 0b111, 0b000, 0b111, 0b000]),
+        '_' => Some([0b000, 0b000, 0b000, 0b000, 0b111]),
+        '(' => Some([0b001, 0b010, 0b010, 0b010, 0b001]),
+        ')' => Some([0b100, 0b010, 0b010, 0b010, 0b100]),
+        '[' => Some([0b011, 0b010, 0b010, 0b010, 0b011]),
+        ']' => Some([0b110, 0b010, 0b010, 0b010, 0b110]),
+        '<' => Some([0b001, 0b010, 0b100, 0b010, 0b001]),
+        '>' => Some([0b100, 0b010, 0b001, 0b010, 0b100]),
+        '*' => Some([0b000, 0b101, 0b010, 0b101, 0b000]),
+        '#' => Some([0b101, 0b111, 0b101, 0b111, 0b101]),
+        '%' => Some([0b101, 0b001, 0b010, 0b100, 0b101]),
+        '|' => Some([0b010, 0b010, 0b010, 0b010, 0b010]),
+        '^' => Some([0b010, 0b101, 0b000, 0b000, 0b000]),
+        '~' => Some([0b000, 0b010, 0b101, 0b000, 0b000]),
+        '@' => Some([0b111, 0b101, 0b111, 0b100, 0b111]),
+        ' ' => Some([0b000, 0b000, 0b000, 0b000, 0b000]),
+        _ => None,
+    }
 }
 
 fn push_block_icon(
@@ -2699,18 +3312,29 @@ fn build_break_overlay_mesh(coord: IVec3, stage: u32) -> (Vec<ChunkVertex>, Vec<
     (vertices, indices)
 }
 
-fn build_sun_mesh(camera: &Camera) -> (Vec<ChunkVertex>, Vec<u32>) {
+fn build_sun_mesh(
+    camera: &Camera,
+    day_progress: f32,
+    sun_height: f32,
+) -> (Vec<ChunkVertex>, Vec<u32>) {
+    if sun_height < -0.22 {
+        return (Vec::new(), Vec::new());
+    }
+
     let mut vertices = Vec::with_capacity(8);
     let mut indices = Vec::with_capacity(12);
 
-    let center = camera.position + Vec3::new(0.0, 900.0, 0.0);
+    let orbit_angle = day_progress * std::f32::consts::TAU;
+    let sun_dir = Vec3::new(orbit_angle.sin(), sun_height, orbit_angle.cos() * 0.55).normalize();
+    let center = camera.position + sun_dir * 900.0;
     let half = 76.0f32;
     let y = center.y;
     let x0 = center.x - half;
     let x1 = center.x + half;
     let z0 = center.z - half;
     let z1 = center.z + half;
-    let color = [1.0, 1.0, 1.0, 1.0];
+    let glow = ((sun_height + 0.22) / 1.22).clamp(0.35, 1.0);
+    let color = [glow, glow, glow, 1.0];
 
     // Draw both sides so the sun is visible regardless of camera height.
     emit_dropped_item_face(
@@ -3257,68 +3881,12 @@ fn emit_dropped_item_face_mirror_y(
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
-fn dropped_block_face_data(block_id: i8) -> ([u32; 6], [u32; 6], [u32; 6]) {
-    // Atlas slots are 1-based in assets, shader expects zero-based tile indices.
-    let tile_dirt = 1;
-    let tile_grass_top = 2;
-    let tile_grass_side = 3;
-    let tile_log_top = 4;
-    let tile_log_side = 5;
-    let tile_leaves = 7;
-    let tile_stone = 8;
-    let tile_planks_oak = 9;
-    let tile_crafting_table_top = 10;
-    let tile_crafting_table_side = 11;
-    let tile_crafting_table_front = 12;
-    let tile_gravel = 13;
-    let tile_sand = 14;
-
-    match block_id {
-        x if x == BLOCK_STONE as i8 => ([tile_stone; 6], [0, 0, 0, 0, 0, 0], [3, 3, 0, 0, 0, 0]),
-        x if x == BLOCK_DIRT as i8 => ([tile_dirt; 6], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]),
-        x if x == BLOCK_GRASS as i8 => (
-            [
-                tile_grass_side,
-                tile_grass_side,
-                tile_grass_top,
-                tile_dirt,
-                tile_grass_side,
-                tile_grass_side,
-            ],
-            [3, 3, 0, 0, 0, 0],
-            [1, 1, 0, 0, 1, 1],
-        ),
-        x if x == BLOCK_LOG as i8 => (
-            [
-                tile_log_side,
-                tile_log_side,
-                tile_log_top,
-                tile_log_top,
-                tile_log_side,
-                tile_log_side,
-            ],
-            [3, 3, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0],
-        ),
-        x if x == BLOCK_LEAVES as i8 => ([tile_leaves; 6], [0, 0, 0, 0, 0, 0], [2, 2, 2, 2, 2, 2]),
-        x if x == BLOCK_PLANKS_OAK as i8 => {
-            ([tile_planks_oak; 6], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0])
-        }
-        x if x == BLOCK_CRAFTING_TABLE as i8 => (
-            [
-                tile_crafting_table_side,
-                tile_crafting_table_side,
-                tile_crafting_table_top,
-                tile_crafting_table_side,
-                tile_crafting_table_front,
-                tile_crafting_table_side,
-            ],
-            [0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0],
-        ),
-        x if x == BLOCK_GRAVEL as i8 => ([tile_gravel; 6], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]),
-        x if x == BLOCK_SAND as i8 => ([tile_sand; 6], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]),
-        _ => ([tile_dirt; 6], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]),
+fn dropped_block_face_data(item_id: i8) -> ([u32; 6], [u32; 6], [u32; 6]) {
+    let block_id = placeable_block_id_for_item(item_id).unwrap_or(item_id);
+    if let Some(tex) = block_texture_by_id(block_id) {
+        (tex.tiles, tex.rotations, tex.transparent_mode)
+    } else {
+        ([0; 6], [0; 6], [0; 6])
     }
 }
 

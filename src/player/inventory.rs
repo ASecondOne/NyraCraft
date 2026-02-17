@@ -1,26 +1,46 @@
+use crate::player::crafting::{
+    craft_once, craft_output_preview, craft_slot_in_side, normalize_craft_side,
+};
 use crate::world::blocks::{
-    BLOCK_CRAFTING_TABLE, BLOCK_LOG, BLOCK_PLANKS_OAK, HOTBAR_LOADOUT, HOTBAR_SLOTS, ITEM_STICK,
+    HOTBAR_LOADOUT, HOTBAR_SLOTS, item_break_strength, item_max_durability, item_max_stack_size,
     placeable_block_id_for_item,
 };
 
 pub const INVENTORY_ROWS: usize = 4;
 pub const INVENTORY_COLS: usize = HOTBAR_SLOTS;
 pub const INVENTORY_STORAGE_SLOTS: usize = INVENTORY_ROWS * INVENTORY_COLS;
-pub const PLAYER_CRAFT_GRID_SIDE: usize = 2;
-pub const TABLE_CRAFT_GRID_SIDE: usize = 3;
-pub const CRAFT_GRID_SIDE: usize = TABLE_CRAFT_GRID_SIDE;
-pub const CRAFT_GRID_SLOTS: usize = CRAFT_GRID_SIDE * CRAFT_GRID_SIDE;
 pub const MAX_STACK_SIZE: u8 = 64;
+pub use crate::player::crafting::{
+    CRAFT_GRID_SIDE, CRAFT_GRID_SLOTS, CraftGridMode,
+};
+
+fn item_stack_limit(item_id: i8) -> u8 {
+    item_max_stack_size(item_id).clamp(1, MAX_STACK_SIZE)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ItemStack {
     pub block_id: i8,
     pub count: u8,
+    pub durability: u16,
 }
 
 impl ItemStack {
-    pub const fn new(block_id: i8, count: u8) -> Self {
-        Self { block_id, count }
+    pub fn new(block_id: i8, count: u8) -> Self {
+        let limit = item_stack_limit(block_id);
+        Self {
+            block_id,
+            count: count.min(limit),
+            durability: item_max_durability(block_id).unwrap_or(0),
+        }
+    }
+
+    pub const fn with_durability(block_id: i8, count: u8, durability: u16) -> Self {
+        Self {
+            block_id,
+            count,
+            durability,
+        }
     }
 }
 
@@ -30,21 +50,6 @@ pub enum InventorySlotRef {
     Storage(u8),
     CraftInput(u8),
     CraftOutput,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CraftGridMode {
-    Player2x2,
-    Table3x3,
-}
-
-impl CraftGridMode {
-    pub const fn side(self) -> usize {
-        match self {
-            Self::Player2x2 => PLAYER_CRAFT_GRID_SIDE,
-            Self::Table3x3 => TABLE_CRAFT_GRID_SIDE,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -76,80 +81,6 @@ pub struct InventoryLayout {
     pub craft_output_y: f32,
 }
 
-#[derive(Clone, Copy)]
-struct CraftRecipe {
-    width: u8,
-    height: u8,
-    input: [Option<i8>; CRAFT_GRID_SLOTS],
-    output: ItemStack,
-}
-
-#[derive(Clone, Copy)]
-struct NormalizedCraftGrid {
-    origin_row: usize,
-    origin_col: usize,
-    width: usize,
-    height: usize,
-    cells: [Option<ItemStack>; CRAFT_GRID_SLOTS],
-}
-
-#[derive(Clone, Copy)]
-struct CraftMatch {
-    recipe: &'static CraftRecipe,
-    grid: NormalizedCraftGrid,
-}
-
-const CRAFT_RECIPES: [CraftRecipe; 3] = [
-    CraftRecipe {
-        width: 1,
-        height: 1,
-        input: [
-            Some(BLOCK_LOG as i8),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ],
-        output: ItemStack::new(BLOCK_PLANKS_OAK as i8, 4),
-    },
-    CraftRecipe {
-        width: 1,
-        height: 2,
-        input: [
-            Some(BLOCK_PLANKS_OAK as i8),
-            None,
-            None,
-            Some(BLOCK_PLANKS_OAK as i8),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ],
-        output: ItemStack::new(ITEM_STICK, 4),
-    },
-    CraftRecipe {
-        width: 2,
-        height: 2,
-        input: [
-            Some(BLOCK_PLANKS_OAK as i8),
-            Some(BLOCK_PLANKS_OAK as i8),
-            None,
-            Some(BLOCK_PLANKS_OAK as i8),
-            Some(BLOCK_PLANKS_OAK as i8),
-            None,
-            None,
-            None,
-            None,
-        ],
-        output: ItemStack::new(BLOCK_CRAFTING_TABLE as i8, 1),
-    },
-];
-
 pub struct InventoryState {
     pub open: bool,
     craft_mode: CraftGridMode,
@@ -165,7 +96,7 @@ impl InventoryState {
             open: false,
             craft_mode: CraftGridMode::Player2x2,
             hotbar: std::array::from_fn(|i| {
-                HOTBAR_LOADOUT[i].map(|block_id| ItemStack::new(block_id, MAX_STACK_SIZE))
+                HOTBAR_LOADOUT[i].map(|item_id| ItemStack::new(item_id, item_stack_limit(item_id)))
             }),
             storage: [None; INVENTORY_STORAGE_SLOTS],
             craft_input: [None; CRAFT_GRID_SLOTS],
@@ -185,6 +116,58 @@ impl InventoryState {
                     None
                 }
             })
+    }
+
+    pub fn selected_hotbar_item_id(&self, slot: u8) -> Option<i8> {
+        self.hotbar
+            .get(slot as usize)
+            .copied()
+            .flatten()
+            .and_then(|stack| (stack.count > 0).then_some(stack.block_id))
+    }
+
+    pub fn selected_hotbar_break_strength(&self, slot: u8) -> Option<f32> {
+        self.hotbar
+            .get(slot as usize)
+            .copied()
+            .flatten()
+            .and_then(|stack| {
+                if stack.count > 0 {
+                    item_break_strength(stack.block_id)
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn apply_selected_hotbar_durability_loss(&mut self, slot: u8, amount: u16) -> bool {
+        if amount == 0 {
+            return false;
+        }
+        let Some(slot_ref) = self.hotbar.get_mut(slot as usize) else {
+            return false;
+        };
+        let Some(mut stack) = *slot_ref else {
+            return false;
+        };
+        if stack.count == 0 {
+            *slot_ref = None;
+            return false;
+        }
+        let Some(max_durability) = item_max_durability(stack.block_id) else {
+            return false;
+        };
+        if stack.durability == 0 {
+            stack.durability = max_durability;
+        }
+        if amount >= stack.durability {
+            *slot_ref = None;
+            true
+        } else {
+            stack.durability -= amount;
+            *slot_ref = Some(stack);
+            false
+        }
     }
 
     pub fn consume_selected_hotbar(&mut self, slot: u8, amount: u8) -> bool {
@@ -216,7 +199,7 @@ impl InventoryState {
             return None;
         }
         stack.count -= 1;
-        let dropped = ItemStack::new(stack.block_id, 1);
+        let dropped = ItemStack::with_durability(stack.block_id, 1, stack.durability);
         if stack.count > 0 {
             *slot_ref = Some(stack);
         }
@@ -228,36 +211,62 @@ impl InventoryState {
         if remaining == 0 {
             return 0;
         }
-
-        for slot in self.hotbar.iter_mut().chain(self.storage.iter_mut()) {
-            if remaining == 0 {
+        let limit = item_stack_limit(item_id) as u16;
+        while remaining > 0 {
+            let chunk = remaining.min(limit);
+            let stack = ItemStack::new(item_id, chunk as u8);
+            let inserted = match self.add_item_stack(stack) {
+                Some(leftover) => chunk.saturating_sub(leftover.count as u16),
+                None => chunk,
+            };
+            if inserted == 0 {
                 break;
             }
-            let Some(stack) = slot.as_mut() else {
+            remaining = remaining.saturating_sub(inserted);
+        }
+        remaining
+    }
+
+    pub fn add_item_stack(&mut self, stack: ItemStack) -> Option<ItemStack> {
+        let mut stack = normalize_item_stack(Some(stack))?;
+        let limit = item_stack_limit(stack.block_id);
+
+        for slot in self.hotbar.iter_mut().chain(self.storage.iter_mut()) {
+            if stack.count == 0 {
+                break;
+            }
+            let Some(existing) = slot.as_mut() else {
                 continue;
             };
-            if stack.block_id != item_id || stack.count >= MAX_STACK_SIZE {
+            if existing.block_id != stack.block_id
+                || existing.durability != stack.durability
+                || existing.count >= limit
+            {
                 continue;
             }
-            let free = (MAX_STACK_SIZE - stack.count) as u16;
-            let moved = free.min(remaining);
-            stack.count += moved as u8;
-            remaining -= moved;
+            let free = limit - existing.count;
+            let moved = free.min(stack.count);
+            existing.count += moved;
+            stack.count -= moved;
         }
 
         for slot in self.hotbar.iter_mut().chain(self.storage.iter_mut()) {
-            if remaining == 0 {
+            if stack.count == 0 {
                 break;
             }
             if slot.is_some() {
                 continue;
             }
-            let moved = remaining.min(MAX_STACK_SIZE as u16);
-            *slot = Some(ItemStack::new(item_id, moved as u8));
-            remaining -= moved;
+            let moved = stack.count.min(limit);
+            *slot = Some(ItemStack::with_durability(
+                stack.block_id,
+                moved,
+                stack.durability,
+            ));
+            stack.count -= moved;
         }
 
-        remaining
+        (stack.count > 0).then_some(stack)
     }
 
     pub fn toggle_open(&mut self) {
@@ -289,7 +298,7 @@ impl InventoryState {
     }
 
     pub fn craft_output_preview(&self) -> Option<ItemStack> {
-        self.craft_match().map(|matched| matched.recipe.output)
+        craft_output_preview(&self.craft_input, self.craft_grid_side())
     }
 
     pub fn left_click_slot(&mut self, slot_ref: Option<InventorySlotRef>) {
@@ -311,8 +320,12 @@ impl InventoryState {
             }
             Some(mut held) => {
                 if let Some(mut slot_stack) = slot_item {
-                    if slot_stack.block_id == held.block_id && slot_stack.count < MAX_STACK_SIZE {
-                        let free = MAX_STACK_SIZE - slot_stack.count;
+                    let limit = item_stack_limit(slot_stack.block_id);
+                    if slot_stack.block_id == held.block_id
+                        && slot_stack.durability == held.durability
+                        && slot_stack.count < limit
+                    {
+                        let free = limit - slot_stack.count;
                         let moved = free.min(held.count);
                         slot_stack.count += moved;
                         held.count -= moved;
@@ -345,7 +358,8 @@ impl InventoryState {
                 if let Some(mut item) = slot_item {
                     let take = ((item.count as u16).saturating_add(1) / 2) as u8;
                     let remain = item.count.saturating_sub(take);
-                    self.dragged_item = Some(ItemStack::new(item.block_id, take));
+                    self.dragged_item =
+                        Some(ItemStack::with_durability(item.block_id, take, item.durability));
                     if remain == 0 {
                         self.set_slot_item(slot_ref, None);
                     } else {
@@ -360,13 +374,24 @@ impl InventoryState {
                     return;
                 }
                 if let Some(mut slot_stack) = slot_item {
-                    if slot_stack.block_id == held.block_id && slot_stack.count < MAX_STACK_SIZE {
+                    let limit = item_stack_limit(slot_stack.block_id);
+                    if slot_stack.block_id == held.block_id
+                        && slot_stack.durability == held.durability
+                        && slot_stack.count < limit
+                    {
                         slot_stack.count = slot_stack.count.saturating_add(1);
                         held.count = held.count.saturating_sub(1);
                         self.set_slot_item(slot_ref, Some(slot_stack));
                     }
                 } else {
-                    self.set_slot_item(slot_ref, Some(ItemStack::new(held.block_id, 1)));
+                    self.set_slot_item(
+                        slot_ref,
+                        Some(ItemStack::with_durability(
+                            held.block_id,
+                            1,
+                            held.durability,
+                        )),
+                    );
                     held.count = held.count.saturating_sub(1);
                 }
                 self.dragged_item = (held.count > 0).then_some(held);
@@ -408,64 +433,35 @@ impl InventoryState {
     }
 
     fn take_craft_output(&mut self) {
-        let Some(matched) = self.craft_match() else {
+        let grid_side = self.craft_grid_side();
+        let Some(output) = craft_output_preview(&self.craft_input, grid_side) else {
             return;
         };
-        let output = matched.recipe.output;
 
         match self.dragged_item {
             None => {
-                if self.consume_craft_ingredients(&matched) {
-                    self.dragged_item = Some(output);
+                if let Some(crafted) = craft_once(&mut self.craft_input, grid_side) {
+                    self.dragged_item = Some(crafted);
                 }
             }
             Some(mut held) => {
-                if held.block_id != output.block_id || held.count >= MAX_STACK_SIZE {
+                let limit = item_stack_limit(held.block_id);
+                if held.block_id != output.block_id
+                    || held.durability != output.durability
+                    || held.count >= limit
+                {
                     return;
                 }
-                let free = MAX_STACK_SIZE - held.count;
+                let free = limit - held.count;
                 if free < output.count {
                     return;
                 }
-                if self.consume_craft_ingredients(&matched) {
-                    held.count = held.count.saturating_add(output.count);
+                if let Some(crafted) = craft_once(&mut self.craft_input, grid_side) {
+                    held.count = held.count.saturating_add(crafted.count);
                     self.dragged_item = Some(held);
                 }
             }
         }
-    }
-
-    fn consume_craft_ingredients(&mut self, matched: &CraftMatch) -> bool {
-        for row in 0..matched.grid.height {
-            for col in 0..matched.grid.width {
-                let pattern_index = row * CRAFT_GRID_SIDE + col;
-                let Some(required_id) = matched.recipe.input[pattern_index] else {
-                    continue;
-                };
-                let slot_index = (matched.grid.origin_row + row) * CRAFT_GRID_SIDE
-                    + (matched.grid.origin_col + col);
-                let Some(mut stack) = self.craft_input.get(slot_index).copied().flatten() else {
-                    return false;
-                };
-                if stack.block_id != required_id || stack.count == 0 {
-                    return false;
-                }
-                stack.count -= 1;
-                self.craft_input[slot_index] = (stack.count > 0).then_some(stack);
-            }
-        }
-        true
-    }
-
-    fn craft_match(&self) -> Option<CraftMatch> {
-        let normalized = normalize_craft_input(&self.craft_input, self.craft_grid_side())?;
-        let recipe = CRAFT_RECIPES
-            .iter()
-            .find(|recipe| recipe_matches_grid(recipe, &normalized))?;
-        Some(CraftMatch {
-            recipe,
-            grid: normalized,
-        })
     }
 
     fn stow_dragged_item(&mut self) {
@@ -476,9 +472,8 @@ impl InventoryState {
     }
 
     fn stow_item_stack(&mut self, stack: ItemStack) {
-        let remaining = self.add_item(stack.block_id, stack.count as u16);
-        if remaining > 0 {
-            self.hotbar[0] = Some(ItemStack::new(stack.block_id, remaining as u8));
+        if let Some(remaining) = self.add_item_stack(stack) {
+            self.hotbar[0] = Some(remaining);
         }
     }
 
@@ -491,9 +486,8 @@ impl InventoryState {
             let Some(stack) = self.craft_input[index].take() else {
                 continue;
             };
-            let remaining = self.add_item(stack.block_id, stack.count as u16);
-            if remaining > 0 {
-                self.craft_input[index] = Some(ItemStack::new(stack.block_id, remaining as u8));
+            if let Some(remaining) = self.add_item_stack(stack) {
+                self.craft_input[index] = Some(remaining);
             }
         }
     }
@@ -545,9 +539,19 @@ fn normalize_item_stack(item: Option<ItemStack>) -> Option<ItemStack> {
     if item.count == 0 {
         return None;
     }
-    if item.count > MAX_STACK_SIZE {
-        item.count = MAX_STACK_SIZE;
+    let limit = item_stack_limit(item.block_id);
+    if item.count > limit {
+        item.count = limit;
     }
+    item.durability = item_max_durability(item.block_id)
+        .map(|max| {
+            if item.durability == 0 {
+                max
+            } else {
+                item.durability.min(max)
+            }
+        })
+        .unwrap_or(0);
     Some(item)
 }
 
@@ -555,6 +559,7 @@ fn move_stack_into_slots(stack: &mut ItemStack, slots: &mut [Option<ItemStack>])
     if stack.count == 0 {
         return;
     }
+    let limit = item_stack_limit(stack.block_id);
 
     for slot in slots.iter_mut() {
         if stack.count == 0 {
@@ -563,10 +568,13 @@ fn move_stack_into_slots(stack: &mut ItemStack, slots: &mut [Option<ItemStack>])
         let Some(existing) = slot.as_mut() else {
             continue;
         };
-        if existing.block_id != stack.block_id || existing.count >= MAX_STACK_SIZE {
+        if existing.block_id != stack.block_id
+            || existing.durability != stack.durability
+            || existing.count >= limit
+        {
             continue;
         }
-        let free = MAX_STACK_SIZE - existing.count;
+        let free = limit - existing.count;
         let moved = free.min(stack.count);
         existing.count += moved;
         stack.count -= moved;
@@ -579,86 +587,14 @@ fn move_stack_into_slots(stack: &mut ItemStack, slots: &mut [Option<ItemStack>])
         if slot.is_some() {
             continue;
         }
-        let moved = stack.count.min(MAX_STACK_SIZE);
-        *slot = Some(ItemStack::new(stack.block_id, moved));
+        let moved = stack.count.min(limit);
+        *slot = Some(ItemStack::with_durability(
+            stack.block_id,
+            moved,
+            stack.durability,
+        ));
         stack.count -= moved;
     }
-}
-
-fn normalize_craft_input(
-    input: &[Option<ItemStack>; CRAFT_GRID_SLOTS],
-    craft_grid_side: usize,
-) -> Option<NormalizedCraftGrid> {
-    let craft_grid_side = normalize_craft_side(craft_grid_side);
-    let mut min_row = craft_grid_side;
-    let mut min_col = craft_grid_side;
-    let mut max_row = 0usize;
-    let mut max_col = 0usize;
-    let mut has_any = false;
-
-    for (index, entry) in input.iter().enumerate() {
-        let Some(stack) = entry else {
-            continue;
-        };
-        if stack.count == 0 {
-            continue;
-        }
-        let row = index / CRAFT_GRID_SIDE;
-        let col = index % CRAFT_GRID_SIDE;
-        if row >= craft_grid_side || col >= craft_grid_side {
-            continue;
-        }
-        min_row = min_row.min(row);
-        min_col = min_col.min(col);
-        max_row = max_row.max(row);
-        max_col = max_col.max(col);
-        has_any = true;
-    }
-
-    if !has_any {
-        return None;
-    }
-
-    let width = max_col - min_col + 1;
-    let height = max_row - min_row + 1;
-    let mut cells = [None; CRAFT_GRID_SLOTS];
-    for row in 0..height {
-        for col in 0..width {
-            let src_index = (min_row + row) * CRAFT_GRID_SIDE + (min_col + col);
-            let dst_index = row * CRAFT_GRID_SIDE + col;
-            cells[dst_index] = input[src_index];
-        }
-    }
-
-    Some(NormalizedCraftGrid {
-        origin_row: min_row,
-        origin_col: min_col,
-        width,
-        height,
-        cells,
-    })
-}
-
-fn recipe_matches_grid(recipe: &CraftRecipe, grid: &NormalizedCraftGrid) -> bool {
-    if recipe.width as usize != grid.width || recipe.height as usize != grid.height {
-        return false;
-    }
-
-    for row in 0..grid.height {
-        for col in 0..grid.width {
-            let index = row * CRAFT_GRID_SIDE + col;
-            let expected = recipe.input[index];
-            let got = grid.cells[index].map(|stack| stack.block_id);
-            if expected != got {
-                return false;
-            }
-            if expected.is_some() && grid.cells[index].map(|stack| stack.count).unwrap_or(0) == 0 {
-                return false;
-            }
-        }
-    }
-
-    true
 }
 
 pub fn compute_inventory_layout(
@@ -799,14 +735,4 @@ pub fn hit_test_slot(
         }
     }
     None
-}
-
-fn normalize_craft_side(side: usize) -> usize {
-    side.clamp(1, CRAFT_GRID_SIDE)
-}
-
-fn craft_slot_in_side(index: usize, craft_grid_side: usize) -> bool {
-    let row = index / CRAFT_GRID_SIDE;
-    let col = index % CRAFT_GRID_SIDE;
-    row < craft_grid_side && col < craft_grid_side
 }

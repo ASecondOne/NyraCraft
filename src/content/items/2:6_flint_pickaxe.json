@@ -1,0 +1,13 @@
+{
+  "id": "2:6",
+  "register_name": "item_flint_pickaxe",
+  "aliases": ["flint_pickaxe", "pickaxe"],
+  "item_atlas_slot_1based": 6,
+  "edible": false,
+  "saturation": 0.0,
+  "effects": [],
+  "breaktime": 0.70,
+  "tool_type": "pickaxe",
+  "durability": 180,
+  "max_stack_size": 1
+}

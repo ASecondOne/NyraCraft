@@ -1,0 +1,12 @@
+{
+  "id": "1:9",
+  "register_name": "block_sand",
+  "aliases": ["sand"],
+  "hardness": 1.0,
+  "required_tool": "shovel",
+  "collidable": true,
+  "texture_slot_1based": 15,
+  "rotations": [0, 0, 0, 0, 0, 0],
+  "transparent_mode": [0, 0, 0, 0, 0, 0],
+  "icon_texture_slot_1based": 15
+}

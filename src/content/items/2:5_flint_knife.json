@@ -1,0 +1,13 @@
+{
+  "id": "2:5",
+  "register_name": "item_flint_knife",
+  "aliases": ["flint_knife", "knife"],
+  "item_atlas_slot_1based": 5,
+  "edible": false,
+  "saturation": 0.0,
+  "effects": [],
+  "breaktime": 1.10,
+  "tool_type": "knife",
+  "durability": 90,
+  "max_stack_size": 1
+}

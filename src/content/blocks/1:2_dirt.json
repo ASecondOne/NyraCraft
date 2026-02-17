@@ -1,0 +1,12 @@
+{
+  "id": "1:2",
+  "register_name": "block_dirt",
+  "aliases": ["dirt"],
+  "hardness": 1.2,
+  "required_tool": "shovel",
+  "collidable": true,
+  "texture_slot_1based": 2,
+  "rotations": [0, 0, 0, 0, 0, 0],
+  "transparent_mode": [0, 0, 0, 0, 0, 0],
+  "icon_texture_slot_1based": 2
+}

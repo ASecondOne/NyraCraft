@@ -1,0 +1,9 @@
+{
+  "id": "recipe_crafting_table_from_planks",
+  "type": "shaped",
+  "output": { "item": "crafting_table", "count": 1 },
+  "pattern": ["PP", "PP"],
+  "key": {
+    "P": "planks_oak"
+  }
+}

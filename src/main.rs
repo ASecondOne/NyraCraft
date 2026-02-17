@@ -2,7 +2,6 @@ use glam::{IVec3, Vec3};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
-use std::io;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -23,22 +22,21 @@ mod world;
 use app::bootstrap::{detect_cpu_label, generate_texture_atlases, resolve_launch_seed};
 use app::console::{
     CommandConsoleState, append_console_input, close_command_console,
-    execute_and_close_command_console, execute_console_command, is_console_open_shortcut,
+    execute_and_close_command_console, is_console_open_shortcut,
 };
 use app::controls::{
-    apply_look_delta, clear_movement_input, disable_mouse_look, print_keybinds,
-    try_enable_mouse_look,
+    apply_look_delta, clear_movement_input, disable_mouse_look, keybind_lines, try_enable_mouse_look,
 };
 use app::dropped_items::{
     DroppedItem, build_dropped_item_render_data, nudge_items_from_placed_block, spawn_block_drop,
-    spawn_leaf_loot_drops, throw_hotbar_item, update_dropped_items,
+    throw_hotbar_item, update_dropped_items,
 };
+use app::logger::{init_logger, install_panic_hook, log_info, log_warn};
 use app::streaming::{
-    CacheMeshView, CacheWriteMsg, EditedChunkRanges, PackedMeshData, SharedRequestQueue,
-    WorkerResult, apply_stream_results, block_id_full_cached, chunk_coord_from_pos,
-    is_solid_cached, mesh_cache_dir, new_request_queue, pick_block,
-    pop_request, print_stats, request_queue_stats, should_pack_far_lod, stream_tick,
-    try_load_cached_mesh, write_cached_mesh, DebugPerfSnapshot,
+    CacheMeshView, CacheWriteMsg, DebugPerfSnapshot, EditedChunkRanges, PackedMeshData, SharedRequestQueue,
+    WorkerResult, apply_stream_results, block_id_full_cached, build_stats_lines, chunk_coord_from_pos,
+    is_solid_cached, mesh_cache_dir, new_request_queue, pick_block, pop_request, request_queue_stats,
+    should_pack_far_lod, stream_tick, try_load_cached_mesh, write_cached_mesh,
 };
 use player::inventory::{InventorySlotRef, InventoryState, hit_test_slot};
 use player::{
@@ -52,7 +50,7 @@ use render::{CubeStyle, TextureAtlas};
 use world::CHUNK_SIZE;
 use world::blocks::{
     BLOCK_CRAFTING_TABLE, BLOCK_LEAVES, DEFAULT_TILES_X, HOTBAR_SLOTS, block_break_stage,
-    block_break_time_with_strength_seconds, build_block_index, default_blocks,
+    block_break_time_with_item_seconds, build_block_index, default_blocks,
 };
 use world::mesher::generate_chunk_mesh;
 use world::worldgen::{TreeSpec, WorldGen};
@@ -61,6 +59,7 @@ type CoordKey = (i32, i32, i32);
 type DirtyChunks = Arc<Mutex<HashMap<CoordKey, i64>>>;
 const DIRTY_EDIT_CHUNK_HALO: i32 = 1;
 const HAND_BREAK_STRENGTH: f32 = 1.0;
+const CHAT_HIDE_DELAY: Duration = Duration::from_secs(10);
 
 fn ema_ms(previous: f32, sample_ms: f32) -> f32 {
     if previous <= 0.001 {
@@ -71,6 +70,17 @@ fn ema_ms(previous: f32, sample_ms: f32) -> f32 {
 }
 
 fn main() {
+    match init_logger() {
+        Ok(path) => {
+            eprintln!("NyraCraft log: {}", path.display());
+        }
+        Err(err) => {
+            eprintln!("failed to initialize logger: {err}");
+        }
+    }
+    install_panic_hook();
+    log_info("startup: NyraCraft launching");
+
     let (seed, world_mode, seed_input) = resolve_launch_seed();
 
     let event_loop = EventLoop::new().unwrap();
@@ -93,6 +103,7 @@ fn main() {
     let block_index = build_block_index(tiles_x);
     if cfg!(debug_assertions) {
         eprintln!("Indexed {} block types:", block_index.len());
+        log_info(format!("startup: indexed {} block types", block_index.len()));
         for entry in &block_index {
             eprintln!(
                 "  item_id={} block_id={} name={} texture_index={}",
@@ -109,6 +120,13 @@ fn main() {
         world_gen.mode_name(),
         world_gen.world_id
     );
+    log_info(format!(
+        "startup: seed_input={} resolved_seed={} mode={} world_id={}",
+        seed_input,
+        world_gen.seed,
+        world_gen.mode_name(),
+        world_gen.world_id
+    ));
 
     let edited_blocks: EditedBlocks = new_edited_blocks();
     let leaf_decay_queue: LeafDecayQueue = new_leaf_decay_queue();
@@ -192,6 +210,11 @@ fn main() {
     let mut inventory = InventoryState::new();
     let mut dropped_items: Vec<DroppedItem> = Vec::new();
     let mut command_console = CommandConsoleState::default();
+    let keybind_overlay_lines = keybind_lines();
+    let mut keybind_overlay_visible = false;
+    let mut stats_overlay_lines: Vec<String> = Vec::new();
+    let mut chat_visible_until = Instant::now();
+    let mut last_runtime_log = Instant::now();
     let mut ui_cursor_pos: Option<(f32, f32)> = None;
     let mut f1_down = false;
     let mut f1_combo_used = false;
@@ -203,26 +226,6 @@ fn main() {
     let mut mining_target: Option<IVec3> = None;
     let mut mining_progress = 0.0f32;
     let mut mining_overlay: Option<(IVec3, u32)> = None;
-    let (tx_console_stdin, rx_console_stdin) = mpsc::channel::<String>();
-    let tx_thread_report_stdin = tx_thread_report.clone();
-    let _ = thread::Builder::new()
-        .name("nyra-stdin".to_string())
-        .spawn(move || {
-            let _ = tx_thread_report_stdin.send(format!("stdin: tid={:?}", thread::current().id()));
-            let stdin = io::stdin();
-            loop {
-                let mut line = String::new();
-                match stdin.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if tx_console_stdin.send(line).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
 
     let is_solid = {
         let worldgen = world_gen.clone();
@@ -286,6 +289,7 @@ fn main() {
         // Keep one core free for render/input, but allow enough workers so edits remesh quickly.
         .map(|n| n.get().saturating_sub(1).clamp(2, 12))
         .unwrap_or(2);
+    log_info(format!("startup: worker threads = {worker_count}"));
     for worker_idx in 0..worker_count {
         let request_queue = Arc::clone(&request_queue);
         let tx_res = tx_res.clone();
@@ -300,105 +304,106 @@ fn main() {
         let _ = thread::Builder::new()
             .name(format!("nyra-worker-{worker_idx}"))
             .spawn(move || {
-            let _ = tx_thread_report_worker.send(format!(
-                "worker-{worker_idx}(mesh/gen/cache-read): tid={:?}",
-                thread::current().id()
-            ));
-            while let Some(task) = pop_request(&request_queue) {
-                let coord = task.coord;
-                let step = task.step;
-                let mode = task.mode;
-                let lighting_pass = task.lighting_pass;
-                let coord_key = (coord.x, coord.y, coord.z);
-                let dirty_rev = dirty_chunks
-                    .lock()
-                    .unwrap()
-                    .get(&coord_key)
-                    .copied()
-                    .and_then(|state| {
-                        let rev = state.abs();
-                        if rev == 0 { None } else { Some(rev as u64) }
-                    });
-                let (overrides, override_range) = {
-                    let store = edited_blocks.read().unwrap();
-                    if store.has_any_edits() {
-                        (
-                            store.collect_chunk_halo(coord, DIRTY_EDIT_CHUNK_HALO),
-                            store.chunk_override_y_range(coord),
-                        )
-                    } else {
-                        (HashMap::new(), None)
-                    }
-                };
-                let has_overrides = !overrides.is_empty();
-                if should_pack_far_lod(mode, step)
-                    && dirty_rev.is_none()
-                    && !has_overrides
-                    && let Some(cached) = try_load_cached_mesh(&cache_dir, coord, step, mode)
-                {
-                    let _ = tx_res.send(cached.into_worker_result(coord, step, mode));
-                    continue;
-                }
-
-                let edit_range = if dirty_rev.is_some() {
-                    let recent_range = edited_chunk_ranges.lock().unwrap().get(&coord_key).copied();
-                    match (recent_range, override_range) {
-                        (Some((a_min, a_max)), Some((b_min, b_max))) => {
-                            Some((a_min.min(b_min), a_max.max(b_max)))
+                let _ = tx_thread_report_worker.send(format!(
+                    "worker-{worker_idx}(mesh/gen/cache-read): tid={:?}",
+                    thread::current().id()
+                ));
+                while let Some(task) = pop_request(&request_queue) {
+                    let coord = task.coord;
+                    let step = task.step;
+                    let mode = task.mode;
+                    let lighting_pass = task.lighting_pass;
+                    let coord_key = (coord.x, coord.y, coord.z);
+                    let dirty_rev = dirty_chunks
+                        .lock()
+                        .unwrap()
+                        .get(&coord_key)
+                        .copied()
+                        .and_then(|state| {
+                            let rev = state.abs();
+                            if rev == 0 { None } else { Some(rev as u64) }
+                        });
+                    let (overrides, override_range) = {
+                        let store = edited_blocks.read().unwrap();
+                        if store.has_any_edits() {
+                            (
+                                store.collect_chunk_halo(coord, DIRTY_EDIT_CHUNK_HALO),
+                                store.chunk_override_y_range(coord),
+                            )
+                        } else {
+                            (HashMap::new(), None)
                         }
-                        (Some(range), None) | (None, Some(range)) => Some(range),
-                        (None, None) => None,
-                    }
-                } else {
-                    None
-                };
-
-                let height_cache = RefCell::new(HashMap::<(i32, i32), i32>::new());
-                let tree_cache = RefCell::new(HashMap::<(i32, i32), Option<TreeSpec>>::new());
-                let block_at = |x: i32, y: i32, z: i32| -> i8 {
-                    overrides.get(&(x, y, z)).copied().unwrap_or_else(|| {
-                        block_id_full_cached(&gen_thread, &height_cache, &tree_cache, x, y, z)
-                    })
-                };
-                let mesh = generate_chunk_mesh(
-                    coord,
-                    &blocks_gen,
-                    &gen_thread,
-                    &block_at,
-                    edit_range,
-                    step,
-                    mode,
-                    lighting_pass,
-                );
-                if should_pack_far_lod(mode, step) {
-                    let packed_vertices = Arc::<[_]>::from(pack_far_vertices(&mesh.vertices));
-                    let packed_indices = Arc::<[_]>::from(mesh.indices);
-                    let packed = PackedMeshData {
-                        coord: mesh.coord,
-                        step: mesh.step,
-                        mode: mesh.mode,
-                        center: mesh.center,
-                        radius: mesh.radius,
-                        vertices: Arc::clone(&packed_vertices),
-                        indices: Arc::clone(&packed_indices),
                     };
-                    if dirty_rev.is_none() && !has_overrides {
-                        let _ = tx_cache.send(CacheWriteMsg::Write {
+                    let has_overrides = !overrides.is_empty();
+                    if should_pack_far_lod(mode, step)
+                        && dirty_rev.is_none()
+                        && !has_overrides
+                        && let Some(cached) = try_load_cached_mesh(&cache_dir, coord, step, mode)
+                    {
+                        let _ = tx_res.send(cached.into_worker_result(coord, step, mode));
+                        continue;
+                    }
+
+                    let edit_range = if dirty_rev.is_some() {
+                        let recent_range =
+                            edited_chunk_ranges.lock().unwrap().get(&coord_key).copied();
+                        match (recent_range, override_range) {
+                            (Some((a_min, a_max)), Some((b_min, b_max))) => {
+                                Some((a_min.min(b_min), a_max.max(b_max)))
+                            }
+                            (Some(range), None) | (None, Some(range)) => Some(range),
+                            (None, None) => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    let height_cache = RefCell::new(HashMap::<(i32, i32), i32>::new());
+                    let tree_cache = RefCell::new(HashMap::<(i32, i32), Option<TreeSpec>>::new());
+                    let block_at = |x: i32, y: i32, z: i32| -> i8 {
+                        overrides.get(&(x, y, z)).copied().unwrap_or_else(|| {
+                            block_id_full_cached(&gen_thread, &height_cache, &tree_cache, x, y, z)
+                        })
+                    };
+                    let mesh = generate_chunk_mesh(
+                        coord,
+                        &blocks_gen,
+                        &gen_thread,
+                        &block_at,
+                        edit_range,
+                        step,
+                        mode,
+                        lighting_pass,
+                    );
+                    if should_pack_far_lod(mode, step) {
+                        let packed_vertices = Arc::<[_]>::from(pack_far_vertices(&mesh.vertices));
+                        let packed_indices = Arc::<[_]>::from(mesh.indices);
+                        let packed = PackedMeshData {
                             coord: mesh.coord,
                             step: mesh.step,
                             mode: mesh.mode,
                             center: mesh.center,
                             radius: mesh.radius,
-                            vertices: packed_vertices,
-                            indices: packed_indices,
-                        });
+                            vertices: Arc::clone(&packed_vertices),
+                            indices: Arc::clone(&packed_indices),
+                        };
+                        if dirty_rev.is_none() && !has_overrides {
+                            let _ = tx_cache.send(CacheWriteMsg::Write {
+                                coord: mesh.coord,
+                                step: mesh.step,
+                                mode: mesh.mode,
+                                center: mesh.center,
+                                radius: mesh.radius,
+                                vertices: packed_vertices,
+                                indices: packed_indices,
+                            });
+                        }
+                        let _ = tx_res.send(WorkerResult::Packed { packed, dirty_rev });
+                    } else {
+                        let _ = tx_res.send(WorkerResult::Raw { mesh, dirty_rev });
                     }
-                    let _ = tx_res.send(WorkerResult::Packed { packed, dirty_rev });
-                } else {
-                    let _ = tx_res.send(WorkerResult::Raw { mesh, dirty_rev });
                 }
-            }
-        });
+            });
     }
 
     let base_render_radius = 512;
@@ -424,6 +429,13 @@ fn main() {
             pregen_radius_chunks * 2 + 1,
             pregen_radius_chunks * 2 + 1,
         );
+        log_warn(format!(
+            "startup: pregen span capped from {}x{} to {}x{}",
+            requested_pregen_span_chunks,
+            requested_pregen_span_chunks,
+            pregen_radius_chunks * 2 + 1,
+            pregen_radius_chunks * 2 + 1,
+        ));
     }
     let pregen_budget_per_tick = 64;
     let pregen_total_columns = ((pregen_radius_chunks * 2 + 1) as usize).pow(2);
@@ -439,6 +451,7 @@ fn main() {
     let mut column_height_cache: HashMap<(i32, i32), i32> = HashMap::new();
     let mut ring_r: i32 = 0;
     let mut ring_i: i32 = 0;
+    let mut stream_unload_counter: u8 = 0;
     let mut emergency_budget: i32 = 16;
     let mut looked_block: Option<(IVec3, i8)> = None;
     let mut looked_hit: Option<(IVec3, i8, IVec3)> = None;
@@ -456,29 +469,9 @@ fn main() {
 
             while let Ok(report) = rx_thread_report.try_recv() {
                 if !thread_reports.iter().any(|existing| existing == &report) {
+                    log_info(format!("thread-report: {report}"));
                     thread_reports.push(report);
                     thread_reports.sort();
-                }
-            }
-
-            while let Ok(line) = rx_console_stdin.try_recv() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if command_console.open || line.starts_with('/') {
-                    let feedback = execute_console_command(line, &mut inventory);
-                    let printed = line.trim_start_matches('/');
-                    println!("/{} -> {}", printed, feedback);
-                    if command_console.open {
-                        close_command_console(
-                            &mut command_console,
-                            inventory.open,
-                            gpu.window(),
-                            &mut mouse_enabled,
-                            &mut last_cursor_pos,
-                        );
-                    }
                 }
             }
 
@@ -530,7 +523,7 @@ fn main() {
                         &dirty_chunks,
                         &request_queue,
                     ) {
-                        spawn_leaf_loot_drops(&mut dropped_items, decayed_leaf);
+                        spawn_block_drop(&mut dropped_items, decayed_leaf, BLOCK_LEAVES as i8);
                     }
                     let height_chunks = (player.position.y / CHUNK_SIZE as f32).max(0.0) as i32;
                     let render_radius =
@@ -545,6 +538,7 @@ fn main() {
                         &mut current_chunk,
                         &mut ring_r,
                         &mut ring_i,
+                        &mut stream_unload_counter,
                         &mut loaded,
                         &mut requested,
                         &mut column_height_cache,
@@ -598,6 +592,10 @@ fn main() {
                     perf.stream_ms = ema_ms(perf.stream_ms, stream_ms_accum / stream_calls as f32);
                 }
 
+                let active_break_strength = inventory
+                    .selected_hotbar_break_strength(selected_hotbar_slot)
+                    .unwrap_or(HAND_BREAK_STRENGTH);
+                let active_break_item_id = inventory.selected_hotbar_item_id(selected_hotbar_slot);
                 let mining_phase_start = Instant::now();
                 mining_overlay = None;
                 if mine_left_down
@@ -619,9 +617,10 @@ fn main() {
                                 mining_target = Some(target_block);
                                 mining_progress = 0.0;
                             }
-                            if let Some(break_time) = block_break_time_with_strength_seconds(
+                            if let Some(break_time) = block_break_time_with_item_seconds(
                                 current_target_id,
-                                HAND_BREAK_STRENGTH,
+                                active_break_item_id,
+                                active_break_strength,
                             ) {
                                 mining_progress += dt;
                                 let stage = block_break_stage(mining_progress, break_time);
@@ -642,31 +641,32 @@ fn main() {
                                         inventory.selected_hotbar_block(selected_hotbar_slot),
                                     );
                                     if let Some((broken_pos, broken_id)) = edit_result.broke {
-                                        if broken_id == BLOCK_LEAVES as i8 {
-                                            spawn_leaf_loot_drops(&mut dropped_items, broken_pos);
-                                        } else {
-                                            spawn_block_drop(&mut dropped_items, broken_pos, broken_id);
-                                        }
+                                        spawn_block_drop(&mut dropped_items, broken_pos, broken_id);
+                                        let _ = inventory.apply_selected_hotbar_durability_loss(
+                                            selected_hotbar_slot,
+                                            1,
+                                        );
                                         mining_target = None;
                                         mining_progress = 0.0;
                                         mining_overlay = None;
                                         if !pause_stream {
                                             apply_stream_results(
                                                 &mut gpu,
-                                            &rx_res,
-                                            &dirty_chunks,
-                                            &edited_chunk_ranges,
-                                            &request_queue,
-                                            &mut loaded,
-                                            &mut requested,
+                                                &rx_res,
+                                                &dirty_chunks,
+                                                1,
+                                                &edited_chunk_ranges,
+                                                &request_queue,
+                                                &mut loaded,
+                                                &mut requested,
                                                 player.position,
                                                 pregen_center_chunk,
                                                 pregen_radius_chunks,
                                                 &mut pregen_chunks_created,
                                                 loaded_chunk_cap,
                                                 mesh_memory_cap_mb,
-                                                128,
-                                                adaptive_max_rebuilds_per_tick.max(16),
+                                                48,
+                                                adaptive_max_rebuilds_per_tick.max(6),
                                                 true,
                                             );
                                         }
@@ -706,14 +706,22 @@ fn main() {
                             .filter(|state| **state > 0)
                             .count();
                         let apply_budget = if dirty_pending > 0 {
-                            adaptive_max_apply_per_tick.max(64)
+                            let burst_floor = if dirty_pending > 48 {
+                                28
+                            } else if dirty_pending > 12 {
+                                22
+                            } else {
+                                16
+                            };
+                            adaptive_max_apply_per_tick.max(burst_floor)
                         } else if !requested.is_empty() {
                             (adaptive_max_apply_per_tick / 2).max(4)
                         } else {
                             2
                         };
                         let rebuild_budget = if dirty_pending > 0 {
-                            adaptive_max_rebuilds_per_tick + 4
+                            let extra = if dirty_pending > 48 { 2 } else { 1 };
+                            (adaptive_max_rebuilds_per_tick + extra).min(6)
                         } else {
                             adaptive_max_rebuilds_per_tick.max(1)
                         };
@@ -722,6 +730,7 @@ fn main() {
                             &mut gpu,
                             &rx_res,
                             &dirty_chunks,
+                            dirty_pending,
                             &edited_chunk_ranges,
                             &request_queue,
                             &mut loaded,
@@ -777,10 +786,11 @@ fn main() {
                     }
                 }
 
-                if (debug_ui || pregen_active) && last_stats_print.elapsed() >= Duration::from_millis(500) {
+                let stats_overlay_visible = debug_ui || pregen_active;
+                if stats_overlay_visible && last_stats_print.elapsed() >= Duration::from_millis(500) {
                     let stats = gpu.stats();
                     let req_stats = request_queue_stats(&request_queue);
-                    print_stats(
+                    stats_overlay_lines = build_stats_lines(
                         &stats,
                         &loaded,
                         &requested,
@@ -806,7 +816,8 @@ fn main() {
                         pregen_est_chunks_total,
                         loaded_chunk_cap,
                         mesh_memory_cap_mb,
-                        HAND_BREAK_STRENGTH,
+                        active_break_item_id,
+                        active_break_strength,
                         mining_target,
                         mining_progress,
                         dirty_pending_debug,
@@ -821,6 +832,26 @@ fn main() {
                         &thread_reports,
                     );
                     last_stats_print = Instant::now();
+                } else if !stats_overlay_visible {
+                    stats_overlay_lines.clear();
+                }
+
+                if last_runtime_log.elapsed() >= Duration::from_secs(5) {
+                    let req_stats = request_queue_stats(&request_queue);
+                    log_info(format!(
+                        "runtime: fps={} tps={} loaded={} requested={} req(edit/near/far)={}/{}/{} apply_ms={:.2} stream_ms={:.2} render_ms={:.2}",
+                        fps_value,
+                        tps_value,
+                        loaded.len(),
+                        requested.len(),
+                        req_stats.edit,
+                        req_stats.near,
+                        req_stats.far,
+                        perf.apply_ms,
+                        perf.stream_ms,
+                        perf.render_cpu_ms,
+                    ));
+                    last_runtime_log = Instant::now();
                 }
 
                 if !pause_render {
@@ -858,10 +889,13 @@ fn main() {
                 let render_time = start_time.elapsed().as_secs_f32();
                 let dropped_render_items =
                     build_dropped_item_render_data(&dropped_items, render_time);
+                let chat_recently_visible = Instant::now() < chat_visible_until;
+                let stats_overlay_visible = debug_ui || pregen_active;
                 gpu.set_selection(looked_block.map(|(coord, _)| coord));
                 let render_phase_start = Instant::now();
                 gpu.render(
                     &camera,
+                    render_time,
                     debug_faces,
                     debug_chunks,
                     draw_radius,
@@ -876,6 +910,14 @@ fn main() {
                     ui_cursor_pos,
                     inventory.dragged_item,
                     mining_overlay,
+                    command_console.open,
+                    chat_recently_visible,
+                    keybind_overlay_visible,
+                    keybind_overlay_lines,
+                    stats_overlay_visible,
+                    &stats_overlay_lines,
+                    &command_console.input,
+                    &command_console.chat_lines,
                     &dropped_render_items,
                 );
                 perf.render_cpu_ms = ema_ms(
@@ -893,14 +935,16 @@ fn main() {
                 append_console_input(&mut command_console, &text);
                 if has_newline {
                     let inventory_open = inventory.open;
-                    execute_and_close_command_console(
+                    if execute_and_close_command_console(
                         &mut command_console,
                         &mut inventory,
                         inventory_open,
                         gpu.window(),
                         &mut mouse_enabled,
                         &mut last_cursor_pos,
-                    );
+                    ) {
+                        chat_visible_until = Instant::now() + CHAT_HIDE_DELAY;
+                    }
                 }
             }
         }
@@ -922,14 +966,16 @@ fn main() {
                         && (text.contains('\n') || text.contains('\r'))
                     {
                         let inventory_open = inventory.open;
-                        execute_and_close_command_console(
+                        if execute_and_close_command_console(
                             &mut command_console,
                             &mut inventory,
                             inventory_open,
                             gpu.window(),
                             &mut mouse_enabled,
                             &mut last_cursor_pos,
-                        );
+                        ) {
+                            chat_visible_until = Instant::now() + CHAT_HIDE_DELAY;
+                        }
                         return;
                     }
                     match key {
@@ -944,14 +990,16 @@ fn main() {
                         }
                         Some(KeyCode::Enter) | Some(KeyCode::NumpadEnter) => {
                             let inventory_open = inventory.open;
-                            execute_and_close_command_console(
+                            if execute_and_close_command_console(
                                 &mut command_console,
                                 &mut inventory,
                                 inventory_open,
                                 gpu.window(),
                                 &mut mouse_enabled,
                                 &mut last_cursor_pos,
-                            );
+                            ) {
+                                chat_visible_until = Instant::now() + CHAT_HIDE_DELAY;
+                            }
                         }
                         Some(KeyCode::Backspace) => {
                             command_console.input.pop();
@@ -976,14 +1024,40 @@ fn main() {
                     f1_combo_used = false;
                 } else {
                     if !f1_combo_used {
-                        print_keybinds();
+                        keybind_overlay_visible = !keybind_overlay_visible;
+                        log_info(format!(
+                            "ui: keybind overlay {}",
+                            if keybind_overlay_visible {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        ));
                     }
                     f1_down = false;
                     f1_combo_used = false;
                 }
                 return;
             }
+            if pressed && key == KeyCode::F3 {
+                debug_ui = !debug_ui;
+                if debug_ui {
+                    last_stats_print = Instant::now() - Duration::from_secs(1);
+                } else {
+                    stats_overlay_lines.clear();
+                }
+                log_info(format!(
+                    "ui: stats overlay {} via F3",
+                    if debug_ui { "enabled" } else { "disabled" }
+                ));
+                return;
+            }
             if !inventory.open && is_console_open_shortcut(&event) {
+                let opens_with_slash = event
+                    .text
+                    .as_ref()
+                    .is_some_and(|text| text.as_str() == "/")
+                    || matches!(key, KeyCode::Slash);
                 let cached_cursor = last_cursor_pos.map(|(x, y)| (x as f32, y as f32));
                 disable_mouse_look(gpu.window(), &mut mouse_enabled, &mut last_cursor_pos);
                 ui_cursor_pos = cached_cursor;
@@ -995,11 +1069,12 @@ fn main() {
                 inventory_right_mouse_down = false;
                 inventory_drag_last_slot = None;
                 command_console.open = true;
-                command_console.input.clear();
+                command_console.input = if opens_with_slash {
+                    "/".to_string()
+                } else {
+                    String::new()
+                };
                 gpu.window().set_ime_allowed(true);
-                println!(
-                    "Console opened. Type command in window or terminal, then Enter. Example: give apple 1"
-                );
                 return;
             }
             if pressed && key == KeyCode::KeyE {
@@ -1026,23 +1101,67 @@ fn main() {
             if pressed && f1_down {
                 f1_combo_used = true;
                 match key {
-                    KeyCode::KeyF => debug_faces = !debug_faces,
-                    KeyCode::KeyW => debug_chunks = !debug_chunks,
-                    KeyCode::KeyP => pause_stream = !pause_stream,
-                    KeyCode::KeyV => pause_render = !pause_render,
-                    KeyCode::KeyD => debug_ui = !debug_ui,
-                    KeyCode::KeyR => force_reload = true,
+                    KeyCode::KeyF => {
+                        debug_faces = !debug_faces;
+                        log_info(format!(
+                            "ui: face debug {}",
+                            if debug_faces { "enabled" } else { "disabled" }
+                        ));
+                    }
+                    KeyCode::KeyW => {
+                        debug_chunks = !debug_chunks;
+                        log_info(format!(
+                            "ui: chunk wireframe {}",
+                            if debug_chunks { "enabled" } else { "disabled" }
+                        ));
+                    }
+                    KeyCode::KeyP => {
+                        pause_stream = !pause_stream;
+                        log_info(format!(
+                            "runtime: stream {}",
+                            if pause_stream { "paused" } else { "resumed" }
+                        ));
+                    }
+                    KeyCode::KeyV => {
+                        pause_render = !pause_render;
+                        log_info(format!(
+                            "runtime: render {}",
+                            if pause_render { "paused" } else { "resumed" }
+                        ));
+                    }
+                    KeyCode::KeyD => {
+                        debug_ui = !debug_ui;
+                        if debug_ui {
+                            last_stats_print = Instant::now() - Duration::from_secs(1);
+                        } else {
+                            stats_overlay_lines.clear();
+                        }
+                        log_info(format!(
+                            "ui: stats overlay {} via F1+D",
+                            if debug_ui { "enabled" } else { "disabled" }
+                        ));
+                    }
+                    KeyCode::KeyR => {
+                        force_reload = true;
+                        log_info("runtime: force chunk reload requested");
+                    }
                     KeyCode::KeyM => {
                         fly_mode = !fly_mode;
                         input.sneak = false;
                         input.move_down = false;
+                        log_info(format!(
+                            "player: fly mode {}",
+                            if fly_mode { "enabled" } else { "disabled" }
+                        ));
                     }
                     KeyCode::KeyX => {
                         let window = gpu.window();
                         if window.fullscreen().is_some() {
                             window.set_fullscreen(None);
+                            log_info("ui: fullscreen disabled");
                         } else {
                             window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                            log_info("ui: fullscreen enabled");
                         }
                     }
                     _ => {}
@@ -1237,11 +1356,7 @@ fn main() {
                 inventory.selected_hotbar_block(selected_hotbar_slot),
             );
             if let Some((broken_pos, broken_id)) = edit_result.broke {
-                if broken_id == BLOCK_LEAVES as i8 {
-                    spawn_leaf_loot_drops(&mut dropped_items, broken_pos);
-                } else {
-                    spawn_block_drop(&mut dropped_items, broken_pos, broken_id);
-                }
+                spawn_block_drop(&mut dropped_items, broken_pos, broken_id);
             }
             if let Some((placed_pos, _placed_id)) = edit_result.placed {
                 let _ = inventory.consume_selected_hotbar(selected_hotbar_slot, 1);
@@ -1258,6 +1373,7 @@ fn main() {
                     &mut gpu,
                     &rx_res,
                     &dirty_chunks,
+                    1,
                     &edited_chunk_ranges,
                     &request_queue,
                     &mut loaded,
@@ -1268,8 +1384,8 @@ fn main() {
                     &mut pregen_chunks_created,
                     loaded_chunk_cap,
                     mesh_memory_cap_mb,
-                    128,
-                    adaptive_max_rebuilds_per_tick.max(16),
+                    48,
+                    adaptive_max_rebuilds_per_tick.max(6),
                     true,
                 );
             }
@@ -1383,6 +1499,7 @@ fn main() {
             event: WindowEvent::CloseRequested,
             ..
         } => {
+            log_info("shutdown: close requested");
             elwt.exit();
         }
         _ => {}

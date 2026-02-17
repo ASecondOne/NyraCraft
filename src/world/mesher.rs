@@ -2,10 +2,10 @@ use glam::{IVec3, Vec3};
 
 use crate::render::block::BlockTexture;
 use crate::render::mesh::ChunkVertex;
+use crate::world::CHUNK_SIZE;
 use crate::world::blocks::{BLOCK_LEAVES, BLOCK_LOG};
 use crate::world::lightengine::compute_face_light;
 use crate::world::worldgen::WorldGen;
-use crate::world::CHUNK_SIZE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshMode {
@@ -1654,8 +1654,8 @@ fn emit_face_with_light(
     };
 
     let (u_scale, v_scale) = match face {
-        0 | 1 => (fz, fy),
-        2 | 3 => (fx, fz),
+        0 | 1 => (fy, fz),
+        2 | 3 => (fz, fx),
         _ => (fx, fy),
     };
     vertices.push(ChunkVertex {

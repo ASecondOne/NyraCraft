@@ -1,14 +1,12 @@
 use glam::{IVec3, Vec3};
 
-use crate::player::inventory::{InventoryState, ItemStack, MAX_STACK_SIZE};
+use crate::player::inventory::{InventoryState, ItemStack};
 use crate::player::{EditedBlocks, block_id_with_edits};
 use crate::render::gpu::DroppedItemRender;
-use crate::world::blocks::{ITEM_APPLE, ITEM_STICK};
+use crate::world::blocks::{block_drop_rolls, item_max_stack_size};
 use crate::world::worldgen::WorldGen;
 
 const DROPPED_ITEM_DESPAWN_SECS: f32 = 5.0 * 60.0;
-const LEAF_APPLE_DROP_CHANCE: f32 = 0.05;
-const LEAF_STICK_DROP_CHANCE: f32 = 0.10;
 
 #[derive(Clone, Copy)]
 pub struct DroppedItem {
@@ -108,23 +106,9 @@ fn relocate_drop_away_from_obstacle(
 }
 
 pub fn spawn_block_drop(dropped_items: &mut Vec<DroppedItem>, block: IVec3, block_id: i8) {
-    let jitter_x = (rand::random::<f32>() - 0.5) * 0.28;
-    let jitter_z = (rand::random::<f32>() - 0.5) * 0.28;
-    spawn_dropped_item(
-        dropped_items,
-        Vec3::new(
-            block.x as f32 + 0.5 + jitter_x,
-            block.y as f32 + 0.66,
-            block.z as f32 + 0.5 + jitter_z,
-        ),
-        Vec3::new(
-            jitter_x * 3.2,
-            2.1 + rand::random::<f32>() * 1.2,
-            jitter_z * 3.2,
-        ),
-        ItemStack::new(block_id, 1),
-        0.14,
-    );
+    for (item_id, count) in block_drop_rolls(block_id) {
+        spawn_item_drop(dropped_items, block, item_id, count, 1.0);
+    }
 }
 
 fn spawn_item_drop(
@@ -154,16 +138,6 @@ fn spawn_item_drop(
         ItemStack::new(item_id, count),
         0.14,
     );
-}
-
-pub fn spawn_leaf_loot_drops(dropped_items: &mut Vec<DroppedItem>, block: IVec3) {
-    if rand::random::<f32>() < LEAF_APPLE_DROP_CHANCE {
-        spawn_item_drop(dropped_items, block, ITEM_APPLE, 1, 1.0);
-    }
-    if rand::random::<f32>() < LEAF_STICK_DROP_CHANCE {
-        let stick_count = (rand::random::<u8>() % 3).saturating_add(1);
-        spawn_item_drop(dropped_items, block, ITEM_STICK, stick_count, 0.95);
-    }
 }
 
 pub fn throw_hotbar_item(
@@ -212,13 +186,14 @@ fn merge_stacks_in_same_block(dropped_items: &mut Vec<DroppedItem>) {
         let mut j = i + 1;
         while j < dropped_items.len() {
             let same_kind = dropped_items[j].stack.block_id == block_i;
+            let same_durability = dropped_items[j].stack.durability == dropped_items[i].stack.durability;
             let same_cell = drop_cell(dropped_items[j].position) == cell_i;
-            if !same_kind || !same_cell {
+            if !same_kind || !same_durability || !same_cell {
                 j += 1;
                 continue;
             }
 
-            let free = MAX_STACK_SIZE.saturating_sub(dropped_items[i].stack.count);
+            let free = item_max_stack_size(block_i).saturating_sub(dropped_items[i].stack.count);
             if free > 0 {
                 let moved = free.min(dropped_items[j].stack.count);
                 dropped_items[i].stack.count += moved;
@@ -297,12 +272,11 @@ pub fn update_dropped_items(
                 && drop.pickup_delay <= 0.0
                 && (drop.position - player_pickup_center).length_squared() <= 3.24
             {
-                let remaining = inventory.add_item(drop.stack.block_id, drop.stack.count as u16);
-                if remaining == 0 {
-                    remove = true;
-                } else {
-                    drop.stack.count = remaining as u8;
+                if let Some(remaining) = inventory.add_item_stack(drop.stack) {
+                    drop.stack = remaining;
                     drop.pickup_delay = 0.12;
+                } else {
+                    remove = true;
                 }
             }
         }

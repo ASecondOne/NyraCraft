@@ -1,2 +1,10 @@
-/target
+# CODE EDITOR
+.vscode/
+
+# RUST Stuff
+Cargo.lock
+target/
+
+# EXTRA
+logs/
 bedrock-samples-v1.26.0.2-full/

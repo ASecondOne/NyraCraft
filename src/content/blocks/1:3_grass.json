@@ -1,0 +1,13 @@
+{
+  "id": "1:3",
+  "register_name": "block_grass",
+  "aliases": ["grass", "grass_block"],
+  "hardness": 1.5,
+  "required_tool": "shovel",
+  "collidable": true,
+  "textures_slot_1based": [4, 4, 3, 2, 4, 4],
+  "rotations": [3, 3, 0, 0, 0, 0],
+  "transparent_mode": [1, 1, 0, 0, 1, 1],
+  "icon_texture_slot_1based": 3,
+  "drop_item": "1:2"
+}

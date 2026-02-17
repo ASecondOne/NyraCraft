@@ -1,0 +1,13 @@
+{
+  "id": "2:4",
+  "register_name": "item_flint_axe",
+  "aliases": ["flint_axe", "axe"],
+  "item_atlas_slot_1based": 4,
+  "edible": false,
+  "saturation": 0.0,
+  "effects": [],
+  "breaktime": 1.05,
+  "tool_type": "axe",
+  "durability": 64,
+  "max_stack_size": 1
+}

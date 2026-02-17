@@ -1,0 +1,23 @@
+{
+  "id": "recipe_stick_from_planks",
+  "type": "shaped",
+  "output": { "item": "stick", "count": 4 },
+  "pattern": ["P", "P"],
+  "key": {
+    "P": "planks_oak"
+  },
+  "aliases": [
+    {
+      "id": "recipe_stick_from_alias_planks",
+      "key": {
+        "P": "planks"
+      }
+    },
+    {
+      "id": "recipe_stick_from_alias_oak_planks",
+      "key": {
+        "P": "oak_planks"
+      }
+    }
+  ]
+}

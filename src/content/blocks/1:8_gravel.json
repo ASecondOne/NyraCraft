@@ -1,0 +1,16 @@
+{
+  "id": "1:8",
+  "register_name": "block_gravel",
+  "aliases": ["gravel"],
+  "hardness": 1.1,
+  "required_tool": "shovel",
+  "collidable": true,
+  "texture_slot_1based": 14,
+  "rotations": [0, 0, 0, 0, 0, 0],
+  "transparent_mode": [0, 0, 0, 0, 0, 0],
+  "icon_texture_slot_1based": 14,
+  "drop_items": [
+    { "item_id": "2:3", "chance": 0.02, "count": 1 },
+    { "item_id": "1:8", "chance": 1.00, "count": 1 }
+  ]
+}

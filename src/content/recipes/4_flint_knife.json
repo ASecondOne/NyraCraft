@@ -1,0 +1,10 @@
+{
+  "id": "recipe_flint_knife",
+  "type": "shaped",
+  "output": { "item": "flint_knife", "count": 1 },
+  "pattern": ["F", "S"],
+  "key": {
+    "F": "flint",
+    "S": "stick"
+  }
+}

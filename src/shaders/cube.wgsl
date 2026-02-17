@@ -112,8 +112,8 @@ fn vs_main_packed(input: VertexInputPacked) -> VertexOutput {
         f32(input.position_packed.z),
     );
     let uv = vec2<f32>(
-        f32(input.uv_packed.x) / 4096.0,
-        f32(input.uv_packed.y) / 4096.0,
+        f32(input.uv_packed.x) / 256.0,
+        f32(input.uv_packed.y) / 256.0,
     );
     let tile = input.packed_info.x;
     let flags = input.packed_info.y;
@@ -217,6 +217,9 @@ fn grass_colormap_uv(world_pos: vec3<f32>) -> vec2<f32> {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let sun_mode = 15u;
+    let day_factor = uniforms.colormap_misc.y;
+
     if (uniforms.flags1.x == 1u) {
         let view_dir = uniforms.camera_pos.xyz - input.world_pos;
         if (dot(face_normal(input.face), view_dir) <= 0.0) {
@@ -238,13 +241,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     if (uniforms.flags0.x == 1u && input.use_texture == 1u) {
         let uv_rot = rotate_uv(input.uv, input.rotation);
+        let uv_tile_rot = rotate_uv(fract(input.uv), input.rotation);
         let block_tiles_x = uniforms.flags0.y;
         let block_tile_x = input.tile % block_tiles_x;
         let block_tile_y = input.tile / block_tiles_x;
         let block_uv_base = vec2<f32>(f32(block_tile_x), f32(block_tile_y)) * uniforms.tile_misc.xy;
-        let block_uv = block_uv_base + fract(uv_rot) * uniforms.tile_misc.xy;
+        let block_uv = block_uv_base + uv_tile_rot * uniforms.tile_misc.xy;
         let item_atlas_flag = 8u;
-        let sun_mode = 15u;
         let sample_sun = input.transparent_mode == sun_mode;
         let sample_item_atlas = !sample_sun && input.transparent_mode >= item_atlas_flag;
         var transparent_mode = input.transparent_mode;
@@ -259,7 +262,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             let item_tile_x = input.tile % item_tiles_x;
             let item_tile_y = input.tile / item_tiles_x;
             let item_uv_base = vec2<f32>(f32(item_tile_x), f32(item_tile_y)) * uniforms.item_misc.xy;
-            let item_uv = item_uv_base + fract(uv_rot) * uniforms.item_misc.xy;
+            let item_uv = item_uv_base + uv_tile_rot * uniforms.item_misc.xy;
             tex = textureSample(item_atlas_texture, item_atlas_sampler, item_uv);
         } else {
             tex = textureSample(atlas_texture, atlas_sampler, block_uv);
@@ -276,7 +279,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             let overlay_x = overlay_tile % block_tiles_x;
             let overlay_y = overlay_tile / block_tiles_x;
             let overlay_uv_base = vec2<f32>(f32(overlay_x), f32(overlay_y)) * uniforms.tile_misc.xy;
-            let overlay_uv = overlay_uv_base + fract(uv_rot) * uniforms.tile_misc.xy;
+            let overlay_uv = overlay_uv_base + uv_tile_rot * uniforms.tile_misc.xy;
             let overlay = textureSample(atlas_texture, atlas_sampler, overlay_uv);
             tex_rgb = mix(tex_rgb, overlay.rgb, overlay.a);
             tex_a = max(tex_a, overlay.a);
@@ -308,6 +311,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         } else {
             color = vec4<f32>(tex_rgb, tex_a) * color;
         }
+    }
+    if (input.transparent_mode != sun_mode) {
+        color = vec4<f32>(color.rgb * day_factor, color.a);
     }
     return color;
 }

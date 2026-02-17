@@ -1,0 +1,13 @@
+{
+  "id": "1:1",
+  "register_name": "block_stone",
+  "aliases": ["stone"],
+  "hardness": 2.0,
+  "required_tool": "pickaxe",
+  "collidable": true,
+  "texture_slot_1based": 9,
+  "rotations": [3, 3, 0, 0, 0, 0],
+  "transparent_mode": [3, 3, 0, 0, 0, 0],
+  "icon_texture_slot_1based": 9,
+  "drop_item": "1:10"
+}

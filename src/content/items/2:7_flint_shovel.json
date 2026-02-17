@@ -1,0 +1,13 @@
+{
+  "id": "2:7",
+  "register_name": "item_flint_shovel",
+  "aliases": ["flint_shovel", "shovel"],
+  "item_atlas_slot_1based": 7,
+  "edible": false,
+  "saturation": 0.0,
+  "effects": [],
+  "breaktime": 1.00,
+  "tool_type": "shovel",
+  "durability": 110,
+  "max_stack_size": 1
+}

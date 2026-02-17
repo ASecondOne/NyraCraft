@@ -3,17 +3,30 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::Window;
 
 use crate::app::controls::try_enable_mouse_look;
+use crate::app::logger::log_info;
 use crate::player::inventory::InventoryState;
-use crate::world::blocks::{ITEM_DEFS, item_name_by_id, parse_item_id};
+use crate::world::blocks::{all_item_defs, item_name_by_id, parse_item_id};
+
+const MAX_INPUT_CHARS: usize = 180;
+const MAX_CHAT_LINES: usize = 10;
+const MAX_CHAT_LINE_CHARS: usize = 180;
 
 #[derive(Default)]
 pub struct CommandConsoleState {
     pub open: bool,
     pub input: String,
+    pub chat_lines: Vec<String>,
 }
 
 fn sanitize_console_input(text: &str) -> String {
     text.chars().filter(|ch| !ch.is_control()).collect()
+}
+
+fn truncate_to_char_limit(text: &mut String, max_chars: usize) {
+    if text.chars().count() <= max_chars {
+        return;
+    }
+    *text = text.chars().take(max_chars).collect();
 }
 
 pub fn append_console_input(console: &mut CommandConsoleState, text: &str) {
@@ -22,8 +35,37 @@ pub fn append_console_input(console: &mut CommandConsoleState, text: &str) {
         return;
     }
     console.input.push_str(&commit);
-    if console.input.len() > 180 {
-        console.input.truncate(180);
+    truncate_to_char_limit(&mut console.input, MAX_INPUT_CHARS);
+}
+
+pub fn push_chat_line(console: &mut CommandConsoleState, line: &str) {
+    let mut sanitized = sanitize_console_input(line);
+    sanitized = sanitized.trim().to_string();
+    if sanitized.is_empty() {
+        return;
+    }
+    truncate_to_char_limit(&mut sanitized, MAX_CHAT_LINE_CHARS);
+    console.chat_lines.push(sanitized);
+    if console.chat_lines.len() > MAX_CHAT_LINES {
+        let overflow = console.chat_lines.len() - MAX_CHAT_LINES;
+        console.chat_lines.drain(0..overflow);
+    }
+}
+
+fn execute_chat_line(raw_line: &str, inventory: &mut InventoryState) -> Option<String> {
+    let mut line = sanitize_console_input(raw_line);
+    line = line.trim().to_string();
+    if line.is_empty() {
+        return None;
+    }
+    truncate_to_char_limit(&mut line, MAX_CHAT_LINE_CHARS);
+    if line.starts_with('/') {
+        let feedback = execute_console_command(&line, inventory);
+        let command = line.trim_start_matches('/').trim();
+        log_info(format!("command /{} -> {}", command, feedback));
+        Some(format!("/{command} -> {feedback}"))
+    } else {
+        Some(line)
     }
 }
 
@@ -64,11 +106,11 @@ pub fn execute_and_close_command_console(
     window: &Window,
     mouse_enabled: &mut bool,
     last_cursor_pos: &mut Option<(f64, f64)>,
-) {
-    let command_text = console.input.trim().to_string();
-    if !command_text.is_empty() {
-        let feedback = execute_console_command(&command_text, inventory);
-        println!("/{} -> {}", command_text.trim_start_matches('/'), feedback);
+) -> bool {
+    let mut submitted = false;
+    if let Some(message) = execute_chat_line(&console.input, inventory) {
+        push_chat_line(console, &message);
+        submitted = true;
     }
     close_command_console(
         console,
@@ -77,6 +119,7 @@ pub fn execute_and_close_command_console(
         mouse_enabled,
         last_cursor_pos,
     );
+    submitted
 }
 
 pub fn execute_console_command(raw: &str, inventory: &mut InventoryState) -> String {
@@ -88,8 +131,11 @@ pub fn execute_console_command(raw: &str, inventory: &mut InventoryState) -> Str
     let mut parts = line.split_whitespace();
     let command = parts.next().unwrap_or_default().to_ascii_lowercase();
     match command.as_str() {
-        "help" => "commands: give <item> [count], items".to_string(),
-        "items" => ITEM_DEFS
+        "help" => {
+            "commands: give <item> [count], items | ids: 1:<block_id> (block), 2:<item_id> (item)"
+                .to_string()
+        }
+        "items" => all_item_defs()
             .iter()
             .map(|def| format!("{}:{}", def.item_id, def.name))
             .collect::<Vec<_>>()
@@ -100,7 +146,7 @@ pub fn execute_console_command(raw: &str, inventory: &mut InventoryState) -> Str
             };
             let Some(item_id) = parse_item_id(block_text) else {
                 return format!(
-                    "unknown item `{block_text}` (stone, dirt, grass, log, leaves, apple, stick)"
+                    "unknown item `{block_text}` (stone, dirt, grass, log, leaves, apple, stick, 1:<block_id>, 2:<item_id>)"
                 );
             };
             let count = if let Some(count_text) = parts.next() {

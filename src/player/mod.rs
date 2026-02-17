@@ -1,5 +1,6 @@
 pub mod block_edit;
 pub mod camera;
+pub mod crafting;
 pub mod inventory;
 pub mod movement;
 

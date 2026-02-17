@@ -118,8 +118,11 @@ fn quantize_unorm01_to_u8(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
+const PACKED_UV_SCALE: f32 = 256.0;
+const PACKED_UV_LIMIT: f32 = i16::MAX as f32 / PACKED_UV_SCALE;
+
 fn quantize_uv_to_i16(v: f32) -> i16 {
-    (v.clamp(-8.0, 8.0) * 4096.0).round() as i16
+    (v.clamp(-PACKED_UV_LIMIT, PACKED_UV_LIMIT) * PACKED_UV_SCALE).round() as i16
 }
 
 pub fn pack_far_vertices(vertices: &[ChunkVertex]) -> Vec<PackedFarVertex> {

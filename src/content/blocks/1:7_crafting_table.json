@@ -1,0 +1,12 @@
+{
+  "id": "1:7",
+  "register_name": "block_crafting_table",
+  "aliases": ["crafting", "crafting_table"],
+  "hardness": 1.6,
+  "required_tool": "axe",
+  "collidable": true,
+  "textures_slot_1based": [12, 12, 11, 12, 13, 12],
+  "rotations": [0, 0, 0, 0, 0, 0],
+  "transparent_mode": [0, 0, 0, 0, 0, 0],
+  "icon_texture_slot_1based": 13
+}

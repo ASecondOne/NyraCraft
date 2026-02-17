@@ -1,0 +1,12 @@
+{
+  "id": "1:4",
+  "register_name": "block_log",
+  "aliases": ["log", "oak_log"],
+  "hardness": 1.8,
+  "required_tool": "axe",
+  "collidable": true,
+  "textures_slot_1based": [6, 6, 5, 5, 6, 6],
+  "rotations": [3, 3, 0, 0, 0, 0],
+  "transparent_mode": [0, 0, 0, 0, 0, 0],
+  "icon_texture_slot_1based": 6
+}

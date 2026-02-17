@@ -3,6 +3,29 @@ use winit::window::{CursorGrabMode, Window};
 
 use crate::player::{Camera, PlayerInput};
 
+const KEYBIND_LINES: [&str; 16] = [
+    "--- NyraCraft Keybinds ---",
+    "Movement: W/A/S/D | Jump: Space",
+    "Sprint: Shift | Sneak: C | Descend (fly): C",
+    "Sneak edge-guard: C prevents walking off ledges",
+    "Mouse Left: Break block | Mouse Right: Place block / use crafting table",
+    "Mine blocks: Hold Left Mouse (block hardness enabled)",
+    "Hotbar: 1-9 select slot | Mouse Wheel cycles slots",
+    "Drop held item: Q",
+    "Inventory: E to toggle, shift-click quick move, right-drag split stacks",
+    "Chat: / or T to open | Enter to send command/text",
+    "F1: Toggle this keybind panel",
+    "F3: Toggle debug stats panel",
+    "F1 + F : Toggle face debug colors",
+    "F1 + W : Toggle chunk wireframe",
+    "F1 + P/V/R/M/X : Stream pause / render pause / reload / fly / fullscreen",
+    "F1 + D : Toggle debug stats panel",
+];
+
+pub fn keybind_lines() -> &'static [&'static str] {
+    &KEYBIND_LINES
+}
+
 pub fn try_enable_mouse_look(
     window: &Window,
     mouse_enabled: &mut bool,
@@ -59,27 +82,4 @@ pub fn apply_look_delta(
     let (sy, cy) = yaw.sin_cos();
     let (sp, cp) = pitch.sin_cos();
     camera.forward = Vec3::new(cy * cp, sp, sy * cp).normalize();
-}
-
-pub fn print_keybinds() {
-    println!("--- NyraCraft Keybinds ---");
-    println!("Movement: W/A/S/D | Jump: Space");
-    println!("Sprint: Shift | Sneak: C | Descend (fly): C");
-    println!("Sneak edge-guard: C prevents walking off ledges");
-    println!(
-        "Mouse Left: Break block | Mouse Right: Place selected hotbar block / use crafting table"
-    );
-    println!("Mine blocks: Hold Left Mouse (block hardness enabled)");
-    println!("Hotbar: 1-9 select slot | Mouse Wheel cycles slots");
-    println!("Drop held item: Q");
-    println!("Inventory: E to toggle, shift-click to quick move, right-drag to split stacks");
-    println!("Console: / or T to open | Enter to run (example: give apple 1)");
-    println!("F1 + F : Toggle face debug colors");
-    println!("F1 + W : Toggle chunk wireframe");
-    println!("F1 + P : Pause/resume chunk streaming");
-    println!("F1 + V : Pause/resume rendering");
-    println!("F1 + D : Toggle debug stats UI");
-    println!("F1 + R : Force chunk reload");
-    println!("F1 + M : Toggle fly mode");
-    println!("F1 + X : Toggle borderless fullscreen");
 }

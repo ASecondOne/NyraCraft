@@ -1,0 +1,6 @@
+{
+  "id": "recipe_log_to_planks",
+  "type": "shapeless",
+  "output": { "item": "planks_oak", "count": 4 },
+  "ingredients": ["log"]
+}

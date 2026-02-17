@@ -1,0 +1,13 @@
+{
+  "id": "2:8",
+  "register_name": "item_flint_sword",
+  "aliases": ["flint_sword", "sword"],
+  "item_atlas_slot_1based": 8,
+  "edible": false,
+  "saturation": 0.0,
+  "effects": [],
+  "breaktime": 1.20,
+  "tool_type": "sword",
+  "durability": 140,
+  "max_stack_size": 1
+}

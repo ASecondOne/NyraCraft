@@ -1,7 +1,7 @@
 use crate::world::CHUNK_SIZE;
 use crate::world::blocks::{
-    BLOCK_COUNT, BLOCK_DIRT, BLOCK_GRASS, BLOCK_GRAVEL, BLOCK_LEAVES, BLOCK_LOG, BLOCK_SAND,
-    BLOCK_STONE,
+    BLOCK_DIRT, BLOCK_GRASS, BLOCK_GRAVEL, BLOCK_LEAVES, BLOCK_LOG, BLOCK_SAND, BLOCK_STONE,
+    block_count,
 };
 use noise::{NoiseFn, Perlin};
 
@@ -15,6 +15,9 @@ const FLAT_SURFACE_Y: i32 = 3;
 const DESERT_HUMIDITY_MAX: f64 = 0.34;
 const GRAVEL_DESERT_TEMPERATURE_MAX: f64 = 0.42;
 const SAND_DESERT_TEMPERATURE_MIN: f64 = 0.62;
+const CAVE_MIN_Y: i32 = -96;
+const SURFACE_CAVE_DEPTH: i32 = 10;
+const WORLDGEN_LAYOUT_VERSION: u64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SurfaceBiome {
@@ -59,6 +62,16 @@ pub struct WorldGen {
     temperature_perlin: Perlin,
     humidity_freq: f64,
     humidity_perlin: Perlin,
+    cave_freq: f64,
+    cave_freq_y: f64,
+    cave_perlin: Perlin,
+    cave_detail_freq: f64,
+    cave_detail_freq_y: f64,
+    cave_detail_perlin: Perlin,
+    cave_entrance_freq: f64,
+    cave_entrance_perlin: Perlin,
+    cave_threshold: f64,
+    surface_cave_boost: f64,
     offset_x: f64,
     offset_z: f64,
 }
@@ -71,6 +84,9 @@ impl WorldGen {
         let biome_perlin = Perlin::new(seed.wrapping_add(3));
         let temperature_perlin = Perlin::new(seed.wrapping_add(4));
         let humidity_perlin = Perlin::new(seed.wrapping_add(5));
+        let cave_perlin = Perlin::new(seed.wrapping_add(6));
+        let cave_detail_perlin = Perlin::new(seed.wrapping_add(7));
+        let cave_entrance_perlin = Perlin::new(seed.wrapping_add(8));
         let world_id = derive_world_id(seed, mode);
         let (offset_x, offset_z) = derive_offsets(seed);
         Self {
@@ -94,6 +110,16 @@ impl WorldGen {
             temperature_perlin,
             humidity_freq: 0.0019,
             humidity_perlin,
+            cave_freq: 0.029,
+            cave_freq_y: 0.047,
+            cave_perlin,
+            cave_detail_freq: 0.071,
+            cave_detail_freq_y: 0.098,
+            cave_detail_perlin,
+            cave_entrance_freq: 0.0125,
+            cave_entrance_perlin,
+            cave_threshold: 0.162,
+            surface_cave_boost: 0.20,
             offset_x,
             offset_z,
         }
@@ -204,6 +230,62 @@ impl WorldGen {
         }
     }
 
+    fn cave_density_at(&self, x: i32, y: i32, z: i32) -> f64 {
+        let fx = x as f64 + self.offset_x;
+        let fz = z as f64 + self.offset_z;
+        let fy = y as f64;
+        let base = self
+            .cave_perlin
+            .get([fx * self.cave_freq, fy * self.cave_freq_y, fz * self.cave_freq])
+            .abs();
+        let detail = self
+            .cave_detail_perlin
+            .get([
+                fx * self.cave_detail_freq,
+                fy * self.cave_detail_freq_y,
+                fz * self.cave_detail_freq,
+            ])
+            .abs();
+        base + detail * 0.55
+    }
+
+    fn surface_cave_entrance_strength_at(&self, x: i32, z: i32) -> f64 {
+        let fx = x as f64 + self.offset_x;
+        let fz = z as f64 + self.offset_z;
+        let n = self
+            .cave_entrance_perlin
+            .get([fx * self.cave_entrance_freq, fz * self.cave_entrance_freq]);
+        smoothstep(0.34, 0.72, n)
+    }
+
+    fn should_carve_cave_at(&self, x: i32, y: i32, z: i32, height: i32) -> bool {
+        if self.mode != WorldMode::Normal || y > height || y < CAVE_MIN_Y {
+            return false;
+        }
+
+        let depth = height - y;
+        let density = self.cave_density_at(x, y, z);
+
+        if depth <= SURFACE_CAVE_DEPTH {
+            let entrance = self.surface_cave_entrance_strength_at(x, z);
+            if entrance <= 0.015 {
+                return false;
+            }
+            if depth <= 1 && entrance < 0.36 {
+                return false;
+            }
+            if depth <= 2 && entrance < 0.22 {
+                return false;
+            }
+            let depth_t = 1.0 - (depth as f64 / SURFACE_CAVE_DEPTH as f64);
+            let threshold = self.cave_threshold + entrance * self.surface_cave_boost * depth_t;
+            return density < threshold;
+        }
+
+        let deep_t = ((depth - SURFACE_CAVE_DEPTH) as f64 / 48.0).clamp(0.0, 1.0);
+        density < self.cave_threshold + deep_t * 0.03
+    }
+
     pub fn block_id_at(&self, x: i32, y: i32, z: i32, height: i32) -> i8 {
         if !self.in_world_bounds(x, z) {
             return -1;
@@ -213,20 +295,28 @@ impl WorldGen {
                 if y > height {
                     -1
                 } else {
-                    if y < height - 3 {
-                        return BLOCK_STONE as i8;
-                    }
-                    match self.surface_biome_at(x, z, height) {
-                        SurfaceBiome::Temperate => {
-                            if y == height {
-                                BLOCK_GRASS as i8
-                            } else {
-                                BLOCK_DIRT as i8
+                    let mut block_id = if y < height - 3 {
+                        BLOCK_STONE as i8
+                    } else {
+                        match self.surface_biome_at(x, z, height) {
+                            SurfaceBiome::Temperate => {
+                                if y == height {
+                                    BLOCK_GRASS as i8
+                                } else {
+                                    BLOCK_DIRT as i8
+                                }
                             }
+                            SurfaceBiome::GravelDesert => BLOCK_GRAVEL as i8,
+                            SurfaceBiome::SandDesert => BLOCK_SAND as i8,
                         }
-                        SurfaceBiome::GravelDesert => BLOCK_GRAVEL as i8,
-                        SurfaceBiome::SandDesert => BLOCK_SAND as i8,
+                    };
+                    if self.should_carve_cave_at(x, y, z, height) {
+                        block_id = -1;
                     }
+                    if y == height && block_id < 0 && self.tree_at(x, z, height).is_some() {
+                        return BLOCK_GRASS as i8;
+                    }
+                    block_id
                 }
             }
             WorldMode::Flat | WorldMode::Grid => {
@@ -356,8 +446,10 @@ fn derive_world_id(seed: u32, mode: WorldMode) -> u64 {
         WorldMode::Flat => 1_u64,
         WorldMode::Grid => 2_u64,
     };
-    let mut x = (seed as u64 ^ (mode_tag.wrapping_mul(0x9E3779B97F4A7C15)))
-        .wrapping_add(0x9E3779B97F4A7C15);
+    let mut x = (seed as u64
+        ^ (mode_tag.wrapping_mul(0x9E3779B97F4A7C15))
+        ^ WORLDGEN_LAYOUT_VERSION.wrapping_mul(0xD6E8FEB86659FD93))
+    .wrapping_add(0x9E3779B97F4A7C15);
     x ^= x >> 30;
     x = x.wrapping_mul(0xBF58476D1CE4E5B9);
     x ^= x >> 27;
@@ -382,7 +474,8 @@ fn grid_marker_block_id(x: i32, y: i32, z: i32, height: i32) -> Option<i8> {
 
     let grid_x = x.div_euclid(4);
     let grid_z = z.div_euclid(4);
-    let idx = (grid_x * 31 + grid_z * 17).rem_euclid(BLOCK_COUNT as i32) as i8;
+    let count = block_count().max(1) as i32;
+    let idx = (grid_x * 31 + grid_z * 17).rem_euclid(count) as i8;
     Some(idx)
 }
 
