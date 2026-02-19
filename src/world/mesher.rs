@@ -942,6 +942,132 @@ fn dequantize_light(light_bin: u8) -> f32 {
     light_bin as f32 / 255.0
 }
 
+#[inline]
+fn ao_axis_samples(min: i32, span: i32, high: bool) -> (i32, i32) {
+    if high {
+        (min + span - 1, min + span)
+    } else {
+        (min, min - 1)
+    }
+}
+
+#[inline]
+fn ao_occlusion_weight(block_id: i8) -> f32 {
+    if block_id < 0 {
+        0.0
+    } else if block_id == BLOCK_LEAVES as i8 {
+        0.35
+    } else {
+        1.0
+    }
+}
+
+#[inline]
+fn ao_corner_factor(side_a: f32, side_b: f32, corner: f32) -> f32 {
+    let occlusion = if side_a >= 0.99 && side_b >= 0.99 {
+        3.0
+    } else {
+        side_a + side_b + corner
+    };
+    (1.0 - 0.14 * occlusion).clamp(0.58, 1.0)
+}
+
+fn compute_face_corner_ao<F>(
+    face: u32,
+    wx: i32,
+    wy: i32,
+    wz: i32,
+    sx: i32,
+    sy: i32,
+    sz: i32,
+    block_at: &F,
+) -> [f32; 4]
+where
+    F: Fn(i32, i32, i32) -> i8,
+{
+    let sample_yz = |x: i32, high_y: bool, high_z: bool| {
+        let (y_base, y_side) = ao_axis_samples(wy, sy, high_y);
+        let (z_base, z_side) = ao_axis_samples(wz, sz, high_z);
+        let side_y = ao_occlusion_weight(block_at(x, y_side, z_base));
+        let side_z = ao_occlusion_weight(block_at(x, y_base, z_side));
+        let corner = ao_occlusion_weight(block_at(x, y_side, z_side));
+        ao_corner_factor(side_y, side_z, corner)
+    };
+    let sample_xz = |y: i32, high_x: bool, high_z: bool| {
+        let (x_base, x_side) = ao_axis_samples(wx, sx, high_x);
+        let (z_base, z_side) = ao_axis_samples(wz, sz, high_z);
+        let side_x = ao_occlusion_weight(block_at(x_side, y, z_base));
+        let side_z = ao_occlusion_weight(block_at(x_base, y, z_side));
+        let corner = ao_occlusion_weight(block_at(x_side, y, z_side));
+        ao_corner_factor(side_x, side_z, corner)
+    };
+    let sample_xy = |z: i32, high_x: bool, high_y: bool| {
+        let (x_base, x_side) = ao_axis_samples(wx, sx, high_x);
+        let (y_base, y_side) = ao_axis_samples(wy, sy, high_y);
+        let side_x = ao_occlusion_weight(block_at(x_side, y_base, z));
+        let side_y = ao_occlusion_weight(block_at(x_base, y_side, z));
+        let corner = ao_occlusion_weight(block_at(x_side, y_side, z));
+        ao_corner_factor(side_x, side_y, corner)
+    };
+
+    match face {
+        0 => {
+            let x = wx + sx;
+            [
+                sample_yz(x, false, false),
+                sample_yz(x, true, false),
+                sample_yz(x, true, true),
+                sample_yz(x, false, true),
+            ]
+        }
+        1 => {
+            let x = wx - 1;
+            [
+                sample_yz(x, false, true),
+                sample_yz(x, true, true),
+                sample_yz(x, true, false),
+                sample_yz(x, false, false),
+            ]
+        }
+        2 => {
+            let y = wy + sy;
+            [
+                sample_xz(y, false, false),
+                sample_xz(y, false, true),
+                sample_xz(y, true, true),
+                sample_xz(y, true, false),
+            ]
+        }
+        3 => {
+            let y = wy - 1;
+            [
+                sample_xz(y, false, true),
+                sample_xz(y, false, false),
+                sample_xz(y, true, false),
+                sample_xz(y, true, true),
+            ]
+        }
+        4 => {
+            let z = wz + sz;
+            [
+                sample_xy(z, false, false),
+                sample_xy(z, true, false),
+                sample_xy(z, true, true),
+                sample_xy(z, false, true),
+            ]
+        }
+        _ => {
+            let z = wz - 1;
+            [
+                sample_xy(z, true, false),
+                sample_xy(z, false, false),
+                sample_xy(z, false, true),
+                sample_xy(z, true, true),
+            ]
+        }
+    }
+}
+
 fn local_idx(x: i32, y: i32, z: i32, size: i32) -> usize {
     (x + y * size + z * size * size) as usize
 }
@@ -1075,6 +1201,8 @@ where
                     width,
                     use_texture,
                     dequantize_light(key.light_bin),
+                    use_sky_shading,
+                    block_at,
                 );
                 z0 += width;
             }
@@ -1166,6 +1294,8 @@ where
                     width,
                     use_texture,
                     dequantize_light(key.light_bin),
+                    use_sky_shading,
+                    block_at,
                 );
                 z0 += width;
             }
@@ -1257,6 +1387,8 @@ where
                     width,
                     use_texture,
                     dequantize_light(key.light_bin),
+                    use_sky_shading,
+                    block_at,
                 );
                 z0 += width;
             }
@@ -1348,6 +1480,8 @@ where
                     width,
                     use_texture,
                     dequantize_light(key.light_bin),
+                    use_sky_shading,
+                    block_at,
                 );
                 z0 += width;
             }
@@ -1439,6 +1573,8 @@ where
                     1,
                     use_texture,
                     dequantize_light(key.light_bin),
+                    use_sky_shading,
+                    block_at,
                 );
                 x0 += width;
             }
@@ -1530,6 +1666,8 @@ where
                     1,
                     use_texture,
                     dequantize_light(key.light_bin),
+                    use_sky_shading,
+                    block_at,
                 );
                 x0 += width;
             }
@@ -1582,10 +1720,12 @@ fn emit_face<F>(
         sz,
         use_texture,
         light,
+        use_sky_shading,
+        block_at,
     );
 }
 
-fn emit_face_with_light(
+fn emit_face_with_light<F>(
     vertices: &mut Vec<ChunkVertex>,
     indices: &mut Vec<u32>,
     block: &BlockTexture,
@@ -1598,9 +1738,21 @@ fn emit_face_with_light(
     sz: i32,
     use_texture: u32,
     light: f32,
-) {
+    use_ambient_occlusion: bool,
+    block_at: &F,
+) where
+    F: Fn(i32, i32, i32) -> i8,
+{
     let base = vertices.len() as u32;
-    let color = [light, light, light, 1.0];
+    let ao = if use_ambient_occlusion {
+        compute_face_corner_ao(face, wx, wy, wz, sx, sy, sz, block_at)
+    } else {
+        [1.0; 4]
+    };
+    let color0 = [light * ao[0], light * ao[0], light * ao[0], 1.0];
+    let color1 = [light * ao[1], light * ao[1], light * ao[1], 1.0];
+    let color2 = [light * ao[2], light * ao[2], light * ao[2], 1.0];
+    let color3 = [light * ao[3], light * ao[3], light * ao[3], 1.0];
     let tile = block.tiles[face as usize];
     let rotation = block.rotations[face as usize];
     let transparent_mode = block.transparent_mode[face as usize];
@@ -1666,7 +1818,7 @@ fn emit_face_with_light(
         rotation,
         use_texture,
         transparent_mode,
-        color,
+        color: color0,
     });
     vertices.push(ChunkVertex {
         position: p1,
@@ -1676,7 +1828,7 @@ fn emit_face_with_light(
         rotation,
         use_texture,
         transparent_mode,
-        color,
+        color: color1,
     });
     vertices.push(ChunkVertex {
         position: p2,
@@ -1686,7 +1838,7 @@ fn emit_face_with_light(
         rotation,
         use_texture,
         transparent_mode,
-        color,
+        color: color2,
     });
     vertices.push(ChunkVertex {
         position: p3,
@@ -1696,7 +1848,7 @@ fn emit_face_with_light(
         rotation,
         use_texture,
         transparent_mode,
-        color,
+        color: color3,
     });
 
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
