@@ -13,7 +13,7 @@ use crate::world::worldgen::WorldGen;
 
 type CoordKey = (i32, i32, i32);
 type ChunkKey = (i32, i32, i32);
-const LEAF_DECAY_SEARCH_CAP: usize = 2048;
+const LEAF_DECAY_SEARCH_CAP: usize = 1024;
 const LEAF_DECAY_BREAK_DELAY_TICKS: u64 = 4;
 const FACE_NEIGHBORS: [(i32, i32, i32); 6] = [
     (1, 0, 0),

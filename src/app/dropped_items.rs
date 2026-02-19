@@ -8,6 +8,8 @@ use crate::world::blocks::{block_drop_rolls, item_max_stack_size};
 use crate::world::worldgen::WorldGen;
 
 const DROPPED_ITEM_DESPAWN_SECS: f32 = 5.0 * 60.0;
+const MAX_ACTIVE_DROPPED_ITEMS: usize = 900;
+const MAX_RENDERED_DROPPED_ITEMS: usize = 600;
 
 #[derive(Clone, Copy)]
 pub struct DroppedItem {
@@ -26,6 +28,9 @@ fn spawn_dropped_item(
     stack: ItemStack,
     pickup_delay: f32,
 ) {
+    if dropped_items.len() >= MAX_ACTIVE_DROPPED_ITEMS {
+        return;
+    }
     dropped_items.push(DroppedItem {
         position,
         velocity,
@@ -316,6 +321,14 @@ pub fn update_dropped_items(
     if dropped_items.len() > 1 {
         merge_stacks_in_same_block(dropped_items);
     }
+    if dropped_items.len() > MAX_ACTIVE_DROPPED_ITEMS {
+        dropped_items.sort_unstable_by(|a, b| {
+            let da = (a.position - player_pickup_center).length_squared();
+            let db = (b.position - player_pickup_center).length_squared();
+            da.total_cmp(&db)
+        });
+        dropped_items.truncate(MAX_ACTIVE_DROPPED_ITEMS);
+    }
 }
 
 pub fn build_dropped_item_render_data(
@@ -324,6 +337,7 @@ pub fn build_dropped_item_render_data(
 ) -> Vec<DroppedItemRender> {
     dropped_items
         .iter()
+        .take(MAX_RENDERED_DROPPED_ITEMS)
         .map(|drop| {
             let spin = render_time * 2.4 + drop.spin_phase;
             let bob = (render_time * 3.2 + drop.spin_phase).sin() * 0.06;
