@@ -1546,7 +1546,11 @@ pub fn apply_stream_results(
 
     let dirty_pending_after = fast_lane_enabled
         && (!pending_dirty_keys.is_empty()
-            || dirty_chunks.lock().unwrap().values().any(|state| *state > 0));
+            || dirty_chunks
+                .lock()
+                .unwrap()
+                .values()
+                .any(|state| *state > 0));
     let rebuild_budget = if prioritize_dirty && dirty_pending_after {
         max_rebuilds_per_tick.max(8)
     } else {
@@ -1749,11 +1753,17 @@ pub fn stream_tick(
             if !in_world_chunk_bounds(cx, cz) {
                 continue;
             }
-            let column_dist = (cx - current_chunk.x).abs().max((cz - current_chunk.z).abs());
+            let column_dist = (cx - current_chunk.x)
+                .abs()
+                .max((cz - current_chunk.z).abs());
             let surface_y = max_height_cached(cx, cz);
             let surface_chunk_y = world_y_to_chunk_y(surface_y);
-            let (y_start, y_end) =
-                column_stream_y_range(surface_chunk_y, current_chunk.y, surface_depth_chunks, column_dist);
+            let (y_start, y_end) = column_stream_y_range(
+                surface_chunk_y,
+                current_chunk.y,
+                surface_depth_chunks,
+                column_dist,
+            );
             for dy in y_start..=y_end {
                 let coord = (cx, dy, cz);
                 let step = 1;
@@ -1788,7 +1798,9 @@ pub fn stream_tick(
                 if !in_world_chunk_bounds(cx, cz) {
                     continue;
                 }
-                let column_dist = (cx - current_chunk.x).abs().max((cz - current_chunk.z).abs());
+                let column_dist = (cx - current_chunk.x)
+                    .abs()
+                    .max((cz - current_chunk.z).abs());
                 let surface_y = max_height_cached(cx, cz);
                 let surface_chunk_y = world_y_to_chunk_y(surface_y);
                 let (y_start, y_end) = column_stream_y_range(
@@ -1835,14 +1847,20 @@ pub fn stream_tick(
             if !in_world_chunk_bounds(cx, cz) {
                 continue;
             }
-            let column_dist = (cx - current_chunk.x).abs().max((cz - current_chunk.z).abs());
+            let column_dist = (cx - current_chunk.x)
+                .abs()
+                .max((cz - current_chunk.z).abs());
             if column_dist > stream_radius {
                 continue;
             }
             let surface_y = max_height_cached(cx, cz);
             let surface_chunk_y = world_y_to_chunk_y(surface_y);
-            let (y_start, y_end) =
-                column_stream_y_range(surface_chunk_y, current_chunk.y, surface_depth_chunks, column_dist);
+            let (y_start, y_end) = column_stream_y_range(
+                surface_chunk_y,
+                current_chunk.y,
+                surface_depth_chunks,
+                column_dist,
+            );
 
             for dy in y_start..=y_end {
                 if requested.len() >= max_inflight {
@@ -1886,14 +1904,20 @@ pub fn stream_tick(
         if !in_world_chunk_bounds(cx, cz) {
             continue;
         }
-        let column_dist = (cx - current_chunk.x).abs().max((cz - current_chunk.z).abs());
+        let column_dist = (cx - current_chunk.x)
+            .abs()
+            .max((cz - current_chunk.z).abs());
         if column_dist > stream_radius {
             continue;
         }
         let surface_y = max_height_cached(cx, cz);
         let surface_chunk_y = world_y_to_chunk_y(surface_y);
-        let (y_start, y_end) =
-            column_stream_y_range(surface_chunk_y, current_chunk.y, surface_depth_chunks, column_dist);
+        let (y_start, y_end) = column_stream_y_range(
+            surface_chunk_y,
+            current_chunk.y,
+            surface_depth_chunks,
+            column_dist,
+        );
 
         for dy in y_start..=y_end {
             if budget <= 0 {

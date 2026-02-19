@@ -3,10 +3,11 @@ use winit::window::{CursorGrabMode, Window};
 
 use crate::player::{Camera, PlayerInput};
 
-const KEYBIND_LINES: [&str; 16] = [
+const KEYBIND_LINES: [&str; 17] = [
     "--- NyraCraft Keybinds ---",
     "Movement: W/A/S/D | Jump: Space",
     "Sprint: Shift | Sneak: C | Descend (fly): C",
+    "Pause menu: Escape (return to game / quit)",
     "Sneak edge-guard: C prevents walking off ledges",
     "Mouse Left: Break block | Mouse Right: Place block / use crafting table",
     "Mine blocks: Hold Left Mouse (block hardness enabled)",

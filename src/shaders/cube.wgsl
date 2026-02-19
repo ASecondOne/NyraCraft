@@ -6,6 +6,10 @@ struct Uniforms {
     flags1: vec4<u32>,
     colormap_misc: vec4<f32>,
     item_misc: vec4<f32>,
+    light_misc: vec4<u32>,
+    sun_dir: vec4<f32>,
+    point_light_pos_radius: array<vec4<f32>, 12>,
+    point_light_color_intensity: array<vec4<f32>, 12>,
 };
 
 @group(0) @binding(0)
@@ -151,6 +155,34 @@ fn face_normal(face: u32) -> vec3<f32> {
         case 4u: { return vec3<f32>(0.0, 0.0, 1.0); }
         default: { return vec3<f32>(0.0, 0.0, -1.0); }
     }
+}
+
+const MAX_POINT_LIGHTS: u32 = 12u;
+
+fn point_light_add(normal: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
+    let count = min(uniforms.light_misc.x, MAX_POINT_LIGHTS);
+    var accum = vec3<f32>(0.0);
+    let n = normalize(normal);
+    for (var i = 0u; i < MAX_POINT_LIGHTS; i = i + 1u) {
+        if (i >= count) {
+            break;
+        }
+        let pos_radius = uniforms.point_light_pos_radius[i];
+        let to_light = pos_radius.xyz - world_pos;
+        let radius = max(pos_radius.w, 0.001);
+        let dist_sq = dot(to_light, to_light);
+        if (dist_sq >= radius * radius) {
+            continue;
+        }
+        let dist = sqrt(max(dist_sq, 0.000001));
+        let light_dir = to_light / dist;
+        let ndotl = max(dot(n, light_dir), 0.0);
+        let edge = 1.0 - (dist / radius);
+        let falloff = edge * edge;
+        let c = uniforms.point_light_color_intensity[i];
+        accum += c.rgb * (ndotl * falloff * c.w);
+    }
+    return accum;
 }
 
 fn hash12(p: vec2<f32>) -> f32 {
@@ -313,7 +345,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
     if (input.transparent_mode != sun_mode) {
-        color = vec4<f32>(color.rgb * day_factor, color.a);
+        let normal = face_normal(input.face);
+        let sun_lambert = max(dot(normal, uniforms.sun_dir.xyz), 0.0);
+        let sun_visibility = clamp(input.color.r * 1.25, 0.0, 1.0);
+        let sun_boost = mix(1.0, 1.0 + sun_lambert * 0.22, uniforms.sun_dir.w * sun_visibility);
+        var lit_rgb = color.rgb * day_factor * sun_boost;
+        lit_rgb += color.rgb * point_light_add(normal, input.world_pos);
+        color = vec4<f32>(min(lit_rgb, vec3<f32>(1.0)), color.a);
     }
     return color;
 }

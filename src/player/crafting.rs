@@ -173,7 +173,10 @@ pub fn craft_output_preview(
     craft_grid_side: usize,
 ) -> Option<ItemStack> {
     let matched = craft_match(input, craft_grid_side)?;
-    registry().recipes.get(matched.recipe_index).map(|r| r.output)
+    registry()
+        .recipes
+        .get(matched.recipe_index)
+        .map(|r| r.output)
 }
 
 pub fn craft_once(
@@ -438,7 +441,10 @@ fn build_shaped_recipe(
     })
 }
 
-fn build_shapeless_recipe(recipe_id: &str, ingredients: &[RawIngredient]) -> Option<ShapelessRecipe> {
+fn build_shapeless_recipe(
+    recipe_id: &str,
+    ingredients: &[RawIngredient],
+) -> Option<ShapelessRecipe> {
     if ingredients.is_empty() {
         eprintln!("shapeless recipe {} has no ingredients", recipe_id);
         return None;
@@ -561,7 +567,8 @@ fn shaped_recipe_matches_grid(recipe: &ShapedRecipe, grid: &NormalizedCraftGrid)
         for col in 0..grid.width {
             let index = row * CRAFT_GRID_SIDE + col;
             let expected = recipe.cells[index];
-            let got = grid.cells[index].and_then(|stack| (stack.count > 0).then_some(stack.block_id));
+            let got =
+                grid.cells[index].and_then(|stack| (stack.count > 0).then_some(stack.block_id));
             if expected != got {
                 return false;
             }
@@ -627,8 +634,7 @@ fn consume_shaped_ingredients(
                 continue;
             }
 
-            let slot_index =
-                (grid.origin_row + row) * CRAFT_GRID_SIDE + (grid.origin_col + col);
+            let slot_index = (grid.origin_row + row) * CRAFT_GRID_SIDE + (grid.origin_col + col);
             let Some(mut stack) = input.get(slot_index).copied().flatten() else {
                 return false;
             };

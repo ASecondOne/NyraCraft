@@ -20,15 +20,19 @@ where
         _ => 0.62f32, // sides
     };
     if !use_sky_shading {
-        return (0.12f32 + base * 0.88f32).clamp(0.08f32, 1.0f32);
+        // Fallback shading for non-sky passes (lower contrast, but not over-bright).
+        return (0.02f32 + base * 0.45f32).clamp(0.01f32, 0.55f32);
     }
-    let sky = if face == 3 {
-        0.44
-    } else {
-        let (cx, cy, cz) = face_center_sample(face, wx, wy, wz, sx, sy, sz);
-        sample_sky_visibility_fast(face, cx, cy, cz, block_at)
-    };
-    (0.06f32 + base * 0.94f32 * sky).clamp(0.05f32, 1.0f32)
+    let (cx, cy, cz) = face_center_sample(face, wx, wy, wz, sx, sy, sz);
+    let mut sky = sample_sky_visibility_fast(face, cx, cy, cz, block_at);
+    if face == 3 {
+        // Bottom faces receive less direct sky lighting.
+        sky *= 0.74;
+    }
+    // Square visibility so enclosed spaces drop off harder.
+    let sky_curve = 0.28f32 * sky + 0.72f32 * sky * sky;
+    let ambient = 0.004f32 + 0.022f32 * sky;
+    (ambient + base * sky_curve).clamp(0.0f32, 1.0f32)
 }
 
 fn face_center_sample(
@@ -107,7 +111,7 @@ where
             0.08
         };
     }
-    visibility *= (1.0 - roof_cover).clamp(0.26, 1.0);
+    visibility *= (1.0 - roof_cover).clamp(0.02, 1.0);
 
     let side_y = y.floor() as i32;
     let side_ids = [
@@ -126,17 +130,17 @@ where
             0.15
         };
     }
-    visibility *= (1.0 - enclosure).clamp(0.28, 1.0);
+    visibility *= (1.0 - enclosure).clamp(0.02, 1.0);
 
-    visibility.clamp(0.06, 1.0)
+    visibility.clamp(0.0, 1.0)
 }
 
 fn sun_visibility_mul(id: i8) -> f32 {
     if id < 0 {
         1.0
     } else if id == BLOCK_LEAVES as i8 {
-        0.82
+        0.72
     } else {
-        0.58
+        0.42
     }
 }

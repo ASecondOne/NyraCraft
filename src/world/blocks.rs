@@ -785,13 +785,9 @@ fn load_registry(tiles_x: u32) -> Registry {
             .breaktime
             .and_then(|value| (value.is_finite() && value > 0.0).then_some(value));
         let tool_type = parse_item_tool_type_or_default(&raw);
-        let durability = raw.durability.unwrap_or_else(|| {
-            if tool_type == ToolType::Hand {
-                0
-            } else {
-                64
-            }
-        });
+        let durability = raw
+            .durability
+            .unwrap_or_else(|| if tool_type == ToolType::Hand { 0 } else { 64 });
         let default_stack_size = if breaktime.is_some() || durability > 0 {
             1
         } else {
@@ -810,7 +806,10 @@ fn load_registry(tiles_x: u32) -> Registry {
             effects: raw.effects,
             breaktime,
             durability,
-            max_stack_size: raw.max_stack_size.unwrap_or(default_stack_size).clamp(1, 64),
+            max_stack_size: raw
+                .max_stack_size
+                .unwrap_or(default_stack_size)
+                .clamp(1, 64),
             tool_type,
         };
         upsert_item(item, raw.aliases);
@@ -972,8 +971,7 @@ pub fn item_break_strength(item_id: i8) -> Option<f32> {
 }
 
 pub fn item_max_durability(item_id: i8) -> Option<u16> {
-    item_def_by_id(item_id)
-        .and_then(|def| (def.durability > 0).then_some(def.durability))
+    item_def_by_id(item_id).and_then(|def| (def.durability > 0).then_some(def.durability))
 }
 
 pub fn placeable_block_id_for_item(item_id: i8) -> Option<i8> {

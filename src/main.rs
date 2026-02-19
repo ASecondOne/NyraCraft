@@ -25,18 +25,21 @@ use app::console::{
     execute_and_close_command_console, is_console_open_shortcut,
 };
 use app::controls::{
-    apply_look_delta, clear_movement_input, disable_mouse_look, keybind_lines, try_enable_mouse_look,
+    apply_look_delta, clear_movement_input, disable_mouse_look, keybind_lines,
+    try_enable_mouse_look,
 };
 use app::dropped_items::{
     DroppedItem, build_dropped_item_render_data, nudge_items_from_placed_block, spawn_block_drop,
     throw_hotbar_item, update_dropped_items,
 };
 use app::logger::{init_logger, install_panic_hook, log_info, log_warn};
+use app::menu::{PauseMenuButton, hit_test_pause_menu_button};
 use app::streaming::{
-    CacheMeshView, CacheWriteMsg, DebugPerfSnapshot, EditedChunkRanges, PackedMeshData, SharedRequestQueue,
-    WorkerResult, apply_stream_results, block_id_full_cached, build_stats_lines, chunk_coord_from_pos,
-    is_solid_cached, mesh_cache_dir, new_request_queue, pick_block, pop_request, request_queue_stats,
-    should_pack_far_lod, stream_tick, try_load_cached_mesh, write_cached_mesh,
+    CacheMeshView, CacheWriteMsg, DebugPerfSnapshot, EditedChunkRanges, PackedMeshData,
+    SharedRequestQueue, WorkerResult, apply_stream_results, block_id_full_cached,
+    build_stats_lines, chunk_coord_from_pos, is_solid_cached, mesh_cache_dir, new_request_queue,
+    pick_block, pop_request, request_queue_stats, should_pack_far_lod, stream_tick,
+    try_load_cached_mesh, write_cached_mesh,
 };
 use player::inventory::{InventorySlotRef, InventoryState, hit_test_slot};
 use player::{
@@ -103,7 +106,10 @@ fn main() {
     let block_index = build_block_index(tiles_x);
     if cfg!(debug_assertions) {
         eprintln!("Indexed {} block types:", block_index.len());
-        log_info(format!("startup: indexed {} block types", block_index.len()));
+        log_info(format!(
+            "startup: indexed {} block types",
+            block_index.len()
+        ));
         for entry in &block_index {
             eprintln!(
                 "  item_id={} block_id={} name={} texture_index={}",
@@ -201,6 +207,7 @@ fn main() {
     let mut last_cursor_pos: Option<(f64, f64)> = None;
     let mut debug_faces = false;
     let mut debug_chunks = false;
+    let mut pause_menu_open = false;
     let mut pause_stream = false;
     let mut pause_render = false;
     let mut debug_ui = false;
@@ -477,6 +484,14 @@ fn main() {
 
             let now = Instant::now();
             if now >= next_tick {
+                if pause_menu_open {
+                    last_update = now;
+                    tick_accum = Duration::ZERO;
+                    gpu.window().request_redraw();
+                    next_tick = now + delay;
+                    return;
+                }
+
                 let dt = (now - last_update).as_secs_f32();
                 let dt = dt.min(0.05);
                 last_update = now;
@@ -854,8 +869,7 @@ fn main() {
                     last_runtime_log = Instant::now();
                 }
 
-                if !pause_render {
-
+                if !pause_render || pause_menu_open {
                     gpu.window().request_redraw();
                 }
                 perf.tick_cpu_ms = ema_ms(perf.tick_cpu_ms, tick_start.elapsed().as_secs_f32() * 1000.0);
@@ -866,7 +880,7 @@ fn main() {
             event: WindowEvent::RedrawRequested,
             ..
         } => {
-            if !pause_render && !pregen_active {
+            if pause_menu_open || (!pause_render && !pregen_active) {
                 let window_size = gpu.window().inner_size();
                 let hovered_inventory_slot = if inventory.open {
                     ui_cursor_pos.and_then(|(mx, my)| {
@@ -891,11 +905,17 @@ fn main() {
                     build_dropped_item_render_data(&dropped_items, render_time);
                 let chat_recently_visible = Instant::now() < chat_visible_until;
                 let stats_overlay_visible = debug_ui || pregen_active;
-                gpu.set_selection(looked_block.map(|(coord, _)| coord));
+                let draw_world = !pause_menu_open && !pregen_active;
+                gpu.set_selection(if draw_world {
+                    looked_block.map(|(coord, _)| coord)
+                } else {
+                    None
+                });
                 let render_phase_start = Instant::now();
                 gpu.render(
                     &camera,
                     render_time,
+                    draw_world,
                     debug_faces,
                     debug_chunks,
                     draw_radius,
@@ -919,6 +939,8 @@ fn main() {
                     &command_console.input,
                     &command_console.chat_lines,
                     &dropped_render_items,
+                    pause_menu_open,
+                    ui_cursor_pos,
                 );
                 perf.render_cpu_ms = ema_ms(
                     perf.render_cpu_ms,
@@ -1017,6 +1039,46 @@ fn main() {
             let Some(key) = key else {
                 return;
             };
+
+            if pressed && key == KeyCode::Escape {
+                if pause_menu_open {
+                    pause_menu_open = false;
+                    try_enable_mouse_look(gpu.window(), &mut mouse_enabled, &mut last_cursor_pos);
+                    clear_movement_input(&mut input);
+                    mine_left_down = false;
+                    mining_target = None;
+                    mining_progress = 0.0;
+                    mining_overlay = None;
+                    inventory_left_mouse_down = false;
+                    inventory_right_mouse_down = false;
+                    inventory_drag_last_slot = None;
+                    gpu.window().set_ime_allowed(false);
+                    log_info("ui: pause menu closed");
+                } else {
+                    pause_menu_open = true;
+                    inventory.close();
+                    command_console.open = false;
+                    command_console.input.clear();
+                    let cached_cursor = last_cursor_pos.map(|(x, y)| (x as f32, y as f32));
+                    disable_mouse_look(gpu.window(), &mut mouse_enabled, &mut last_cursor_pos);
+                    ui_cursor_pos = cached_cursor;
+                    clear_movement_input(&mut input);
+                    mine_left_down = false;
+                    mining_target = None;
+                    mining_progress = 0.0;
+                    mining_overlay = None;
+                    inventory_left_mouse_down = false;
+                    inventory_right_mouse_down = false;
+                    inventory_drag_last_slot = None;
+                    gpu.window().set_ime_allowed(false);
+                    log_info("ui: pause menu opened");
+                }
+                gpu.window().request_redraw();
+                return;
+            }
+            if pause_menu_open {
+                return;
+            }
 
             if key == KeyCode::F1 {
                 if pressed {
@@ -1235,7 +1297,7 @@ fn main() {
             event: WindowEvent::MouseWheel { delta, .. },
             ..
         } => {
-            if command_console.open {
+            if command_console.open || pause_menu_open {
                 return;
             }
             let wheel_y = match delta {
@@ -1260,6 +1322,43 @@ fn main() {
             ..
         } => {
             let pressed = matches!(state, ElementState::Pressed);
+            if pause_menu_open {
+                if pressed && matches!(button, MouseButton::Left) {
+                    let size = gpu.window().inner_size();
+                    let cursor = ui_cursor_pos.or_else(|| {
+                        last_cursor_pos.map(|(x, y)| (x as f32, y as f32))
+                    });
+                    if let Some((mx, my)) = cursor {
+                        match hit_test_pause_menu_button(size.width, size.height, mx, my) {
+                            Some(PauseMenuButton::ReturnToGame) => {
+                                pause_menu_open = false;
+                                try_enable_mouse_look(
+                                    gpu.window(),
+                                    &mut mouse_enabled,
+                                    &mut last_cursor_pos,
+                                );
+                                clear_movement_input(&mut input);
+                                mine_left_down = false;
+                                mining_target = None;
+                                mining_progress = 0.0;
+                                mining_overlay = None;
+                                inventory_left_mouse_down = false;
+                                inventory_right_mouse_down = false;
+                                inventory_drag_last_slot = None;
+                                gpu.window().set_ime_allowed(false);
+                                log_info("ui: pause menu closed");
+                            }
+                            Some(PauseMenuButton::Quit) => {
+                                log_info("shutdown: quit selected from pause menu");
+                                elwt.exit();
+                            }
+                            None => {}
+                        }
+                    }
+                    gpu.window().request_redraw();
+                }
+                return;
+            }
             if command_console.open {
                 return;
             }
@@ -1394,7 +1493,7 @@ fn main() {
             event: DeviceEvent::MouseMotion { delta },
             ..
         } => {
-            if !mouse_enabled || inventory.open || command_console.open {
+            if !mouse_enabled || inventory.open || command_console.open || pause_menu_open {
                 return;
             }
             let (dx, dy) = (delta.0 as f32, delta.1 as f32);
@@ -1412,6 +1511,11 @@ fn main() {
             ..
         } => {
             ui_cursor_pos = Some((position.x as f32, position.y as f32));
+            if pause_menu_open {
+                last_cursor_pos = Some((position.x, position.y));
+                gpu.window().request_redraw();
+                return;
+            }
             if inventory.open {
                 if inventory_right_mouse_down {
                     let size = gpu.window().inner_size();
@@ -1466,7 +1570,7 @@ fn main() {
             event: WindowEvent::Focused(true),
             ..
         } => {
-            if !inventory.open && !command_console.open {
+            if !inventory.open && !command_console.open && !pause_menu_open {
                 try_enable_mouse_look(gpu.window(), &mut mouse_enabled, &mut last_cursor_pos);
             }
         }

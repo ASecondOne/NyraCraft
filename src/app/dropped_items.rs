@@ -186,7 +186,8 @@ fn merge_stacks_in_same_block(dropped_items: &mut Vec<DroppedItem>) {
         let mut j = i + 1;
         while j < dropped_items.len() {
             let same_kind = dropped_items[j].stack.block_id == block_i;
-            let same_durability = dropped_items[j].stack.durability == dropped_items[i].stack.durability;
+            let same_durability =
+                dropped_items[j].stack.durability == dropped_items[i].stack.durability;
             let same_cell = drop_cell(dropped_items[j].position) == cell_i;
             if !same_kind || !same_durability || !same_cell {
                 j += 1;
