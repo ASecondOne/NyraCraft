@@ -36,7 +36,7 @@ struct SceneUniform {
     colormap_misc: [f32; 4], // [colormap_strength, reserved, reserved, reserved]
     item_misc: [f32; 4], // [item_tile_uv_x, item_tile_uv_y, item_tiles_x, reserved]
     light_misc: [u32; 4], // [point_light_count, reserved, reserved, reserved]
-    sun_dir: [f32; 4],    // [dir_x, dir_y, dir_z, sun_strength]
+    sun_dir: [f32; 4], // [dir_x, dir_y, dir_z, sun_strength]
     point_light_pos_radius: [[f32; 4]; MAX_POINT_LIGHTS], // [x, y, z, radius]
     point_light_color_intensity: [[f32; 4]; MAX_POINT_LIGHTS], // [r, g, b, intensity]
 }
@@ -187,7 +187,8 @@ fn sample_day_cycle(elapsed_seconds: f32) -> DayCycleState {
 
 fn sun_direction(day_progress: f32, sun_height: f32) -> Vec3 {
     let orbit_angle = day_progress * std::f32::consts::TAU;
-    let dir = Vec3::new(orbit_angle.sin(), sun_height, orbit_angle.cos() * 0.55).normalize_or_zero();
+    let dir =
+        Vec3::new(orbit_angle.sin(), sun_height, orbit_angle.cos() * 0.55).normalize_or_zero();
     if dir.length_squared() > 1.0e-8 {
         dir
     } else {
@@ -370,16 +371,53 @@ impl Gpu {
         let cell = GpuCell::new(window, |window| {
             let size = window.inner_size();
 
-            let instance = wgpu::Instance::default();
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::all(),
+                dx12_shader_compiler: Default::default(),
+                flags: wgpu::InstanceFlags::default(),
+                gles_minor_version: wgpu::Gles3MinorVersion::Automatic,
+            });
             let surface = instance.create_surface(window).unwrap();
 
-            let adapter =
+            let request_adapter = |power_preference: wgpu::PowerPreference,
+                                   force_fallback_adapter: bool,
+                                   compatible_surface: Option<&wgpu::Surface<'_>>| {
                 pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                    compatible_surface: Some(&surface),
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    force_fallback_adapter: false,
+                    compatible_surface,
+                    power_preference,
+                    force_fallback_adapter,
                 }))
-                .unwrap();
+            };
+
+            let attempts = [
+                (wgpu::PowerPreference::HighPerformance, false),
+                (wgpu::PowerPreference::LowPower, false),
+                (wgpu::PowerPreference::HighPerformance, true),
+                (wgpu::PowerPreference::LowPower, true),
+            ];
+
+            let mut adapter = None;
+            for (power_preference, fallback) in attempts {
+                adapter = request_adapter(power_preference, fallback, Some(&surface));
+                if adapter.is_some() {
+                    break;
+                }
+            }
+            if adapter.is_none() {
+                for (power_preference, fallback) in attempts {
+                    adapter = request_adapter(power_preference, fallback, None)
+                        .filter(|a| a.is_surface_supported(&surface));
+                    if adapter.is_some() {
+                        break;
+                    }
+                }
+            }
+            let adapter = adapter
+                .unwrap_or_else(|| {
+                    panic!(
+                        "gpu: failed to acquire adapter for this surface after trying all backends/power prefs/fallbacks"
+                    )
+                });
             let adapter_info = adapter.get_info();
             let adapter_name = adapter_info.name.trim();
             let adapter_summary = format!(
@@ -399,7 +437,18 @@ impl Gpu {
             .unwrap();
 
             let caps = surface.get_capabilities(&adapter);
-            let format = caps.formats[0];
+            let format = caps
+                .formats
+                .iter()
+                .copied()
+                .find(|f| f.is_srgb())
+                .or_else(|| caps.formats.first().copied())
+                .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb);
+            let alpha_mode = caps
+                .alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto);
 
             let config = wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -407,7 +456,7 @@ impl Gpu {
                 width: size.width.max(1),
                 height: size.height.max(1),
                 present_mode: wgpu::PresentMode::Fifo,
-                alpha_mode: caps.alpha_modes[0],
+                alpha_mode,
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
             };
@@ -935,7 +984,7 @@ impl Gpu {
         pause_menu_cursor: Option<(f32, f32)>,
     ) {
         self.cell.with_dependent_mut(|_, gpu| {
-            apply_pending_uploads(gpu, 16);
+            apply_pending_uploads(gpu, 8);
             let mvp = build_mvp(gpu.config.width, gpu.config.height, camera);
             let day_cycle = sample_day_cycle(elapsed_seconds);
             let sun_dir = sun_direction(day_cycle.day_progress, day_cycle.sun_height);
@@ -1438,12 +1487,15 @@ impl Gpu {
                 std::mem::take(&mut gpu.dirty_supers)
             } else {
                 let split = len - take;
-                // Keep far supers in-place and extract only the nearest slice this tick.
-                gpu.dirty_supers.select_nth_unstable_by(split, |a, b| {
-                    let da = (super_chunk_center(*a) - camera_pos).length_squared();
-                    let db = (super_chunk_center(*b) - camera_pos).length_squared();
-                    db.total_cmp(&da)
-                });
+                // For large queues, skip nth-selection work and just drain a small tail slice.
+                if len <= 256 {
+                    // Keep far supers in-place and extract only the nearest slice this tick.
+                    gpu.dirty_supers.select_nth_unstable_by(split, |a, b| {
+                        let da = (super_chunk_center(*a) - camera_pos).length_squared();
+                        let db = (super_chunk_center(*b) - camera_pos).length_squared();
+                        db.total_cmp(&da)
+                    });
+                }
                 gpu.dirty_supers.split_off(split)
             };
             for coord in rebuild_now.drain(..) {

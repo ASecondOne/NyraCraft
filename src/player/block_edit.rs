@@ -451,15 +451,11 @@ fn queue_leaf_decay_neighbors(
     leaf_decay_queue: &LeafDecayQueue,
     center: IVec3,
 ) {
+    let store = edited_blocks.read().unwrap();
     for &(dx, dy, dz) in &FACE_NEIGHBORS {
         let candidate = IVec3::new(center.x + dx, center.y + dy, center.z + dz);
-        if block_id_with_edits(
-            world_gen,
-            edited_blocks,
-            candidate.x,
-            candidate.y,
-            candidate.z,
-        ) == BLOCK_LEAVES as i8
+        if block_id_with_store(world_gen, &store, candidate.x, candidate.y, candidate.z)
+            == BLOCK_LEAVES as i8
         {
             enqueue_leaf_decay_candidate(leaf_decay_queue, candidate);
         }
@@ -513,6 +509,7 @@ fn leaf_has_log_connection(
     edited_blocks: &EditedBlocks,
     start_leaf: IVec3,
 ) -> bool {
+    let store = edited_blocks.read().unwrap();
     let mut visited = HashSet::<CoordKey>::new();
     let mut queue = VecDeque::from([start_leaf]);
     visited.insert((start_leaf.x, start_leaf.y, start_leaf.z));
@@ -525,7 +522,7 @@ fn leaf_has_log_connection(
 
         for &(dx, dy, dz) in &FACE_NEIGHBORS {
             let next = IVec3::new(pos.x + dx, pos.y + dy, pos.z + dz);
-            let next_id = block_id_with_edits(world_gen, edited_blocks, next.x, next.y, next.z);
+            let next_id = block_id_with_store(world_gen, &store, next.x, next.y, next.z);
             if next_id == BLOCK_LOG as i8 {
                 return true;
             }

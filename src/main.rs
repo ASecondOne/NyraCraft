@@ -293,9 +293,9 @@ fn main() {
     let blocks_gen = blocks.clone();
     let gen_thread = world_gen.clone();
     let worker_count = std::thread::available_parallelism()
-        // Keep one core free for render/input, but allow enough workers so edits remesh quickly.
-        .map(|n| n.get().saturating_sub(1).clamp(2, 12))
-        .unwrap_or(2);
+        // Keep several cores free for render/input/OS and avoid startup/load saturation.
+        .map(|n| (n.get() / 2).clamp(1, 6))
+        .unwrap_or(1);
     log_info(format!("startup: worker threads = {worker_count}"));
     for worker_idx in 0..worker_count {
         let request_queue = Arc::clone(&request_queue);
@@ -418,10 +418,10 @@ fn main() {
     let base_draw_radius = 192;
     let lod_near_radius = 16;
     let lod_mid_radius = 32;
-    let request_budget = 112;
-    let max_inflight = 1024usize;
+    let request_budget = 56;
+    let max_inflight = 384usize;
     let surface_depth_chunks = 4;
-    let initial_burst_radius = 4;
+    let initial_burst_radius = 2;
     let loaded_chunk_cap = 100000usize; // important
     let mesh_memory_cap_mb = 12288usize; // 12 GB cap
     let mut current_chunk = chunk_coord_from_pos(player.position);
@@ -444,7 +444,7 @@ fn main() {
             pregen_radius_chunks * 2 + 1,
         ));
     }
-    let pregen_budget_per_tick = 64;
+    let pregen_budget_per_tick = 24;
     let pregen_total_columns = ((pregen_radius_chunks * 2 + 1) as usize).pow(2);
     let pregen_est_chunks_total = pregen_total_columns * (surface_depth_chunks as usize + 2);
     let mut pregen_active = false;
@@ -464,11 +464,12 @@ fn main() {
     let mut looked_hit: Option<(IVec3, i8, IVec3)> = None;
     let mut adaptive_request_budget = request_budget;
     let mut adaptive_pregen_budget = pregen_budget_per_tick;
-    let mut adaptive_max_apply_per_tick: usize = 16;
-    let mut adaptive_max_rebuilds_per_tick: usize = 3;
+    let mut adaptive_max_apply_per_tick: usize = 10;
+    let mut adaptive_max_rebuilds_per_tick: usize = 2;
     let mut adaptive_draw_radius_cap = base_draw_radius;
     let mut last_camera_pos = camera.position;
     let mut last_camera_forward = camera.forward;
+    let mut last_visibility_refresh = Instant::now();
 
     let _ = event_loop.run(move |event, elwt| match event {
         Event::AboutToWait => {
@@ -591,10 +592,15 @@ fn main() {
                     stream_calls += 1;
                     let camera_changed = (camera.position - last_camera_pos).length_squared() > 0.0009
                         || camera.forward.dot(last_camera_forward) < 0.9998;
-                    if camera_changed || !requested.is_empty() || pregen_active {
+                    let visibility_refresh_due =
+                        last_visibility_refresh.elapsed() >= Duration::from_millis(120);
+                    if camera_changed
+                        || ((!requested.is_empty() || pregen_active) && visibility_refresh_due)
+                    {
                         gpu.update_visible(&camera, draw_radius);
                         last_camera_pos = camera.position;
                         last_camera_forward = camera.forward;
+                        last_visibility_refresh = Instant::now();
                     }
                     looked_hit = pick_block(camera.position, camera.forward, 8.0, |x, y, z| {
                         block_id_with_edits(&world_gen, &edited_blocks, x, y, z)
@@ -680,8 +686,8 @@ fn main() {
                                                 &mut pregen_chunks_created,
                                                 loaded_chunk_cap,
                                                 mesh_memory_cap_mb,
-                                                48,
-                                                adaptive_max_rebuilds_per_tick.max(6),
+                                                20,
+                                                adaptive_max_rebuilds_per_tick.max(3),
                                                 true,
                                             );
                                         }
@@ -722,21 +728,21 @@ fn main() {
                             .count();
                         let apply_budget = if dirty_pending > 0 {
                             let burst_floor = if dirty_pending > 48 {
-                                28
-                            } else if dirty_pending > 12 {
-                                22
-                            } else {
                                 16
+                            } else if dirty_pending > 12 {
+                                12
+                            } else {
+                                8
                             };
                             adaptive_max_apply_per_tick.max(burst_floor)
                         } else if !requested.is_empty() {
-                            (adaptive_max_apply_per_tick / 2).max(4)
+                            (adaptive_max_apply_per_tick / 2).max(3)
                         } else {
-                            2
+                            1
                         };
                         let rebuild_budget = if dirty_pending > 0 {
                             let extra = if dirty_pending > 48 { 2 } else { 1 };
-                            (adaptive_max_rebuilds_per_tick + extra).min(6)
+                            (adaptive_max_rebuilds_per_tick + extra).min(4)
                         } else {
                             adaptive_max_rebuilds_per_tick.max(1)
                         };
@@ -787,17 +793,21 @@ fn main() {
                     tps_last = Instant::now();
 
                     if tps_value < 18 || fps_value < 35 {
-                        adaptive_request_budget = (adaptive_request_budget * 85 / 100).max(48);
-                        adaptive_pregen_budget = (adaptive_pregen_budget * 80 / 100).max(24);
-                        adaptive_max_apply_per_tick = adaptive_max_apply_per_tick.saturating_sub(2).max(8);
+                        adaptive_request_budget = (adaptive_request_budget * 82 / 100).max(28);
+                        adaptive_pregen_budget = (adaptive_pregen_budget * 75 / 100).max(8);
+                        adaptive_max_apply_per_tick =
+                            adaptive_max_apply_per_tick.saturating_sub(2).max(4);
                         adaptive_max_rebuilds_per_tick = adaptive_max_rebuilds_per_tick.saturating_sub(1).max(1);
-                        adaptive_draw_radius_cap = (adaptive_draw_radius_cap - 4).max(24);
+                        adaptive_draw_radius_cap = (adaptive_draw_radius_cap - 6).max(24);
                     } else if tps_value >= 20 && fps_value > 60 {
-                        adaptive_request_budget = (adaptive_request_budget + 12).min(request_budget);
-                        adaptive_pregen_budget = (adaptive_pregen_budget + 8).min(pregen_budget_per_tick);
-                        adaptive_max_apply_per_tick = (adaptive_max_apply_per_tick + 1).min(24);
-                        adaptive_max_rebuilds_per_tick = (adaptive_max_rebuilds_per_tick + 1).min(4);
-                        adaptive_draw_radius_cap = (adaptive_draw_radius_cap + 2).min(base_draw_radius + 32);
+                        adaptive_request_budget = (adaptive_request_budget + 6).min(request_budget);
+                        adaptive_pregen_budget =
+                            (adaptive_pregen_budget + 4).min(pregen_budget_per_tick);
+                        adaptive_max_apply_per_tick = (adaptive_max_apply_per_tick + 1).min(14);
+                        adaptive_max_rebuilds_per_tick =
+                            (adaptive_max_rebuilds_per_tick + 1).min(3);
+                        adaptive_draw_radius_cap =
+                            (adaptive_draw_radius_cap + 2).min(base_draw_radius + 24);
                     }
                 }
 
@@ -1483,8 +1493,8 @@ fn main() {
                     &mut pregen_chunks_created,
                     loaded_chunk_cap,
                     mesh_memory_cap_mb,
-                    48,
-                    adaptive_max_rebuilds_per_tick.max(6),
+                    20,
+                    adaptive_max_rebuilds_per_tick.max(3),
                     true,
                 );
             }
