@@ -165,7 +165,7 @@ fn main() {
         velocity: Vec3::ZERO,
         grounded: false,
     };
-    let player_config = PlayerConfig {
+    let mut player_config = PlayerConfig {
         height: 1.9,
         radius: 0.35,
         eye_height: 1.62,
@@ -493,7 +493,7 @@ fn main() {
                     camera.forward,
                     camera.up,
                     dt,
-                    &player_config,
+                    &mut player_config,
                     &is_solid,
                 );
                 update_dropped_items(
