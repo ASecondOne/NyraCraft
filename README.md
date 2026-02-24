@@ -1,3 +1,4 @@
 # NyraCraft
 
-Experimental voxel engine written in Rust using wgpu.
+Experimental voxel game written in Rust using wgpu.
+
