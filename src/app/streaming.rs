@@ -10,7 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::render::mesh::{ChunkVertex, PackedFarVertex};
-use crate::render::{Gpu, GpuStats};
+use crate::render::{GpuStats, MeshUploadBackend};
 use crate::world::CHUNK_SIZE;
 use crate::world::blocks::{
     block_break_time_with_item_seconds, block_hardness, block_name_by_id, can_break_block_with_item,
@@ -1300,8 +1300,8 @@ fn in_pregen_bounds(coord: (i32, i32, i32), center: IVec3, radius: i32) -> bool 
     (coord.0 - center.x).abs() <= radius && (coord.2 - center.z).abs() <= radius
 }
 
-fn enforce_memory_budget(
-    gpu: &mut Gpu,
+fn enforce_memory_budget<R: MeshUploadBackend>(
+    gpu: &mut R,
     loaded: &mut HashMap<(i32, i32, i32), i32>,
     requested: &mut HashMap<(i32, i32, i32), i32>,
     current_chunk: IVec3,
@@ -1359,8 +1359,8 @@ fn worker_result_key_and_rev(result: &WorkerResult) -> (ChunkKey, Option<u64>) {
     }
 }
 
-fn apply_worker_result(
-    gpu: &mut Gpu,
+fn apply_worker_result<R: MeshUploadBackend>(
+    gpu: &mut R,
     result: WorkerResult,
     dirty_chunks: &DirtyChunks,
     edited_chunk_ranges: &EditedChunkRanges,
@@ -1427,8 +1427,8 @@ fn apply_worker_result(
     true
 }
 
-pub fn apply_stream_results(
-    gpu: &mut Gpu,
+pub fn apply_stream_results<R: MeshUploadBackend>(
+    gpu: &mut R,
     rx_res: &mpsc::Receiver<WorkerResult>,
     dirty_chunks: &DirtyChunks,
     dirty_pending_hint: usize,
@@ -1561,8 +1561,8 @@ pub fn apply_stream_results(
     );
 }
 
-pub fn stream_tick(
-    gpu: &mut Gpu,
+pub fn stream_tick<R: MeshUploadBackend>(
+    gpu: &mut R,
     player_pos: Vec3,
     camera_forward: Vec3,
     current_chunk: &mut IVec3,

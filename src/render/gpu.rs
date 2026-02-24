@@ -145,6 +145,8 @@ const DAY_CYCLE_SECONDS: f32 = 48.0 * 60.0; // 2 min per in-game hour, 48 min fu
 const MAX_POINT_LIGHTS: usize = 12;
 const POINT_LIGHT_CULL_DISTANCE: f32 = 84.0;
 const POINT_LIGHT_DROPPED_SAMPLE_CAP: usize = 192;
+const RENDER_BACKEND: wgpu::Backends = wgpu::Backends::VULKAN;
+const REQUIRED_ADAPTER_BACKEND: wgpu::Backend = wgpu::Backend::Vulkan;
 
 #[derive(Clone, Copy)]
 struct DayCycleState {
@@ -384,7 +386,7 @@ impl Gpu {
             let size = window.inner_size();
 
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::all(),
+                backends: RENDER_BACKEND,
                 dx12_shader_compiler: Default::default(),
                 flags: wgpu::InstanceFlags::default(),
                 gles_minor_version: wgpu::Gles3MinorVersion::Automatic,
@@ -428,10 +430,15 @@ impl Gpu {
             let adapter = adapter
                 .unwrap_or_else(|| {
                     panic!(
-                        "gpu: failed to acquire adapter for this surface after trying all backends/power prefs/fallbacks"
+                        "gpu: failed to acquire a Vulkan adapter for this surface after trying all power prefs/fallbacks"
                     )
                 });
             let adapter_info = adapter.get_info();
+            assert!(
+                adapter_info.backend == REQUIRED_ADAPTER_BACKEND,
+                "gpu: renderer is Vulkan-only, but got {:?}",
+                adapter_info.backend
+            );
             let adapter_name = adapter_info.name.trim();
             let adapter_summary = format!(
                 "{} ({:?}, {:?})",
@@ -1531,6 +1538,50 @@ impl Gpu {
                 gpu.visible_supers.push(*coord);
             }
         });
+    }
+}
+
+impl crate::render::MeshUploadBackend for Gpu {
+    fn stats(&self) -> GpuStats {
+        Gpu::stats(self)
+    }
+
+    fn chunk_memory_bytes(&self, coord: IVec3) -> Option<u64> {
+        Gpu::chunk_memory_bytes(self, coord)
+    }
+
+    fn upsert_chunk(
+        &mut self,
+        coord: IVec3,
+        center: Vec3,
+        radius: f32,
+        vertices: Vec<ChunkVertex>,
+        indices: Vec<u32>,
+    ) {
+        Gpu::upsert_chunk(self, coord, center, radius, vertices, indices);
+    }
+
+    fn upsert_chunk_packed(
+        &mut self,
+        coord: IVec3,
+        center: Vec3,
+        radius: f32,
+        vertices: Arc<[PackedFarVertex]>,
+        indices: Arc<[u32]>,
+    ) {
+        Gpu::upsert_chunk_packed(self, coord, center, radius, vertices, indices);
+    }
+
+    fn remove_chunk(&mut self, coord: IVec3) {
+        Gpu::remove_chunk(self, coord);
+    }
+
+    fn clear_chunks(&mut self) {
+        Gpu::clear_chunks(self);
+    }
+
+    fn rebuild_dirty_superchunks(&mut self, camera_pos: Vec3, budget: usize) {
+        Gpu::rebuild_dirty_superchunks(self, camera_pos, budget);
     }
 }
 

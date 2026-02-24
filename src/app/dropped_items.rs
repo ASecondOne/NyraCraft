@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use crate::player::inventory::{InventoryState, ItemStack};
 use crate::player::{EditedBlocks, block_id_with_edits};
-use crate::render::gpu::DroppedItemRender;
+use crate::render::DroppedItemRender;
 use crate::world::blocks::{block_drop_rolls, item_max_stack_size};
 use crate::world::worldgen::WorldGen;
 
