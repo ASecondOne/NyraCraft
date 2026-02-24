@@ -236,7 +236,11 @@ impl WorldGen {
         let fy = y as f64;
         let base = self
             .cave_perlin
-            .get([fx * self.cave_freq, fy * self.cave_freq_y, fz * self.cave_freq])
+            .get([
+                fx * self.cave_freq,
+                fy * self.cave_freq_y,
+                fz * self.cave_freq,
+            ])
             .abs();
         let detail = self
             .cave_detail_perlin

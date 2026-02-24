@@ -25,18 +25,21 @@ use app::console::{
     execute_and_close_command_console, is_console_open_shortcut,
 };
 use app::controls::{
-    apply_look_delta, clear_movement_input, disable_mouse_look, keybind_lines, try_enable_mouse_look,
+    apply_look_delta, clear_movement_input, disable_mouse_look, keybind_lines,
+    try_enable_mouse_look,
 };
 use app::dropped_items::{
     DroppedItem, build_dropped_item_render_data, nudge_items_from_placed_block, spawn_block_drop,
     throw_hotbar_item, update_dropped_items,
 };
 use app::logger::{init_logger, install_panic_hook, log_info, log_warn};
+use app::menu::{PauseMenuButton, hit_test_pause_menu_button};
 use app::streaming::{
-    CacheMeshView, CacheWriteMsg, DebugPerfSnapshot, EditedChunkRanges, PackedMeshData, SharedRequestQueue,
-    WorkerResult, apply_stream_results, block_id_full_cached, build_stats_lines, chunk_coord_from_pos,
-    is_solid_cached, mesh_cache_dir, new_request_queue, pick_block, pop_request, request_queue_stats,
-    should_pack_far_lod, stream_tick, try_load_cached_mesh, write_cached_mesh,
+    CacheMeshView, CacheWriteMsg, DebugPerfSnapshot, EditedChunkRanges, PackedMeshData,
+    SharedRequestQueue, WorkerResult, apply_stream_results, block_id_full_cached,
+    build_stats_lines, chunk_coord_from_pos, is_solid_cached, mesh_cache_dir, new_request_queue,
+    pick_block, pop_request, request_queue_stats, should_pack_far_lod, stream_tick,
+    try_load_cached_mesh, write_cached_mesh,
 };
 use player::inventory::{InventorySlotRef, InventoryState, hit_test_slot};
 use player::{
@@ -103,7 +106,10 @@ fn main() {
     let block_index = build_block_index(tiles_x);
     if cfg!(debug_assertions) {
         eprintln!("Indexed {} block types:", block_index.len());
-        log_info(format!("startup: indexed {} block types", block_index.len()));
+        log_info(format!(
+            "startup: indexed {} block types",
+            block_index.len()
+        ));
         for entry in &block_index {
             eprintln!(
                 "  item_id={} block_id={} name={} texture_index={}",
@@ -204,6 +210,7 @@ fn main() {
     let mut last_cursor_pos: Option<(f64, f64)> = None;
     let mut debug_faces = false;
     let mut debug_chunks = false;
+    let mut pause_menu_open = false;
     let mut pause_stream = false;
     let mut pause_render = false;
     let mut debug_ui = false;
@@ -289,9 +296,9 @@ fn main() {
     let blocks_gen = blocks.clone();
     let gen_thread = world_gen.clone();
     let worker_count = std::thread::available_parallelism()
-        // Keep one core free for render/input, but allow enough workers so edits remesh quickly.
-        .map(|n| n.get().saturating_sub(1).clamp(2, 12))
-        .unwrap_or(2);
+        // Keep several cores free for render/input/OS and avoid startup/load saturation.
+        .map(|n| (n.get() / 2).clamp(1, 6))
+        .unwrap_or(1);
     log_info(format!("startup: worker threads = {worker_count}"));
     for worker_idx in 0..worker_count {
         let request_queue = Arc::clone(&request_queue);
@@ -414,10 +421,10 @@ fn main() {
     let base_draw_radius = 192;
     let lod_near_radius = 16;
     let lod_mid_radius = 32;
-    let request_budget = 112;
-    let max_inflight = 1024usize;
+    let request_budget = 56;
+    let max_inflight = 384usize;
     let surface_depth_chunks = 4;
-    let initial_burst_radius = 4;
+    let initial_burst_radius = 2;
     let loaded_chunk_cap = 100000usize; // important
     let mesh_memory_cap_mb = 12288usize; // 12 GB cap
     let mut current_chunk = chunk_coord_from_pos(player.position);
@@ -440,7 +447,7 @@ fn main() {
             pregen_radius_chunks * 2 + 1,
         ));
     }
-    let pregen_budget_per_tick = 64;
+    let pregen_budget_per_tick = 24;
     let pregen_total_columns = ((pregen_radius_chunks * 2 + 1) as usize).pow(2);
     let pregen_est_chunks_total = pregen_total_columns * (surface_depth_chunks as usize + 2);
     let mut pregen_active = false;
@@ -460,11 +467,12 @@ fn main() {
     let mut looked_hit: Option<(IVec3, i8, IVec3)> = None;
     let mut adaptive_request_budget = request_budget;
     let mut adaptive_pregen_budget = pregen_budget_per_tick;
-    let mut adaptive_max_apply_per_tick: usize = 16;
-    let mut adaptive_max_rebuilds_per_tick: usize = 3;
+    let mut adaptive_max_apply_per_tick: usize = 10;
+    let mut adaptive_max_rebuilds_per_tick: usize = 2;
     let mut adaptive_draw_radius_cap = base_draw_radius;
     let mut last_camera_pos = camera.position;
     let mut last_camera_forward = camera.forward;
+    let mut last_visibility_refresh = Instant::now();
 
     let _ = event_loop.run(move |event, elwt| match event {
         Event::AboutToWait => {
@@ -480,6 +488,14 @@ fn main() {
 
             let now = Instant::now();
             if now >= next_tick {
+                if pause_menu_open {
+                    last_update = now;
+                    tick_accum = Duration::ZERO;
+                    gpu.window().request_redraw();
+                    next_tick = now + delay;
+                    return;
+                }
+
                 let dt = (now - last_update).as_secs_f32();
                 let dt = dt.min(0.05);
                 last_update = now;
@@ -579,10 +595,15 @@ fn main() {
                     stream_calls += 1;
                     let camera_changed = (camera.position - last_camera_pos).length_squared() > 0.0009
                         || camera.forward.dot(last_camera_forward) < 0.9998;
-                    if camera_changed || !requested.is_empty() || pregen_active {
+                    let visibility_refresh_due =
+                        last_visibility_refresh.elapsed() >= Duration::from_millis(120);
+                    if camera_changed
+                        || ((!requested.is_empty() || pregen_active) && visibility_refresh_due)
+                    {
                         gpu.update_visible(&camera, draw_radius);
                         last_camera_pos = camera.position;
                         last_camera_forward = camera.forward;
+                        last_visibility_refresh = Instant::now();
                     }
                     looked_hit = pick_block(camera.position, camera.forward, 8.0, |x, y, z| {
                         block_id_with_edits(&world_gen, &edited_blocks, x, y, z)
@@ -668,8 +689,8 @@ fn main() {
                                                 &mut pregen_chunks_created,
                                                 loaded_chunk_cap,
                                                 mesh_memory_cap_mb,
-                                                48,
-                                                adaptive_max_rebuilds_per_tick.max(6),
+                                                20,
+                                                adaptive_max_rebuilds_per_tick.max(3),
                                                 true,
                                             );
                                         }
@@ -710,21 +731,21 @@ fn main() {
                             .count();
                         let apply_budget = if dirty_pending > 0 {
                             let burst_floor = if dirty_pending > 48 {
-                                28
-                            } else if dirty_pending > 12 {
-                                22
-                            } else {
                                 16
+                            } else if dirty_pending > 12 {
+                                12
+                            } else {
+                                8
                             };
                             adaptive_max_apply_per_tick.max(burst_floor)
                         } else if !requested.is_empty() {
-                            (adaptive_max_apply_per_tick / 2).max(4)
+                            (adaptive_max_apply_per_tick / 2).max(3)
                         } else {
-                            2
+                            1
                         };
                         let rebuild_budget = if dirty_pending > 0 {
                             let extra = if dirty_pending > 48 { 2 } else { 1 };
-                            (adaptive_max_rebuilds_per_tick + extra).min(6)
+                            (adaptive_max_rebuilds_per_tick + extra).min(4)
                         } else {
                             adaptive_max_rebuilds_per_tick.max(1)
                         };
@@ -775,17 +796,21 @@ fn main() {
                     tps_last = Instant::now();
 
                     if tps_value < 18 || fps_value < 35 {
-                        adaptive_request_budget = (adaptive_request_budget * 85 / 100).max(48);
-                        adaptive_pregen_budget = (adaptive_pregen_budget * 80 / 100).max(24);
-                        adaptive_max_apply_per_tick = adaptive_max_apply_per_tick.saturating_sub(2).max(8);
+                        adaptive_request_budget = (adaptive_request_budget * 82 / 100).max(28);
+                        adaptive_pregen_budget = (adaptive_pregen_budget * 75 / 100).max(8);
+                        adaptive_max_apply_per_tick =
+                            adaptive_max_apply_per_tick.saturating_sub(2).max(4);
                         adaptive_max_rebuilds_per_tick = adaptive_max_rebuilds_per_tick.saturating_sub(1).max(1);
-                        adaptive_draw_radius_cap = (adaptive_draw_radius_cap - 4).max(24);
+                        adaptive_draw_radius_cap = (adaptive_draw_radius_cap - 6).max(24);
                     } else if tps_value >= 20 && fps_value > 60 {
-                        adaptive_request_budget = (adaptive_request_budget + 12).min(request_budget);
-                        adaptive_pregen_budget = (adaptive_pregen_budget + 8).min(pregen_budget_per_tick);
-                        adaptive_max_apply_per_tick = (adaptive_max_apply_per_tick + 1).min(24);
-                        adaptive_max_rebuilds_per_tick = (adaptive_max_rebuilds_per_tick + 1).min(4);
-                        adaptive_draw_radius_cap = (adaptive_draw_radius_cap + 2).min(base_draw_radius + 32);
+                        adaptive_request_budget = (adaptive_request_budget + 6).min(request_budget);
+                        adaptive_pregen_budget =
+                            (adaptive_pregen_budget + 4).min(pregen_budget_per_tick);
+                        adaptive_max_apply_per_tick = (adaptive_max_apply_per_tick + 1).min(14);
+                        adaptive_max_rebuilds_per_tick =
+                            (adaptive_max_rebuilds_per_tick + 1).min(3);
+                        adaptive_draw_radius_cap =
+                            (adaptive_draw_radius_cap + 2).min(base_draw_radius + 24);
                     }
                 }
 
@@ -857,8 +882,7 @@ fn main() {
                     last_runtime_log = Instant::now();
                 }
 
-                if !pause_render {
-
+                if !pause_render || pause_menu_open {
                     gpu.window().request_redraw();
                 }
                 perf.tick_cpu_ms = ema_ms(perf.tick_cpu_ms, tick_start.elapsed().as_secs_f32() * 1000.0);
@@ -869,7 +893,7 @@ fn main() {
             event: WindowEvent::RedrawRequested,
             ..
         } => {
-            if !pause_render && !pregen_active {
+            if pause_menu_open || (!pause_render && !pregen_active) {
                 let window_size = gpu.window().inner_size();
                 let hovered_inventory_slot = if inventory.open {
                     ui_cursor_pos.and_then(|(mx, my)| {
@@ -894,11 +918,17 @@ fn main() {
                     build_dropped_item_render_data(&dropped_items, render_time);
                 let chat_recently_visible = Instant::now() < chat_visible_until;
                 let stats_overlay_visible = debug_ui || pregen_active;
-                gpu.set_selection(looked_block.map(|(coord, _)| coord));
+                let draw_world = !pause_menu_open && !pregen_active;
+                gpu.set_selection(if draw_world {
+                    looked_block.map(|(coord, _)| coord)
+                } else {
+                    None
+                });
                 let render_phase_start = Instant::now();
                 gpu.render(
                     &camera,
                     render_time,
+                    draw_world,
                     debug_faces,
                     debug_chunks,
                     draw_radius,
@@ -922,6 +952,8 @@ fn main() {
                     &command_console.input,
                     &command_console.chat_lines,
                     &dropped_render_items,
+                    pause_menu_open,
+                    ui_cursor_pos,
                 );
                 perf.render_cpu_ms = ema_ms(
                     perf.render_cpu_ms,
@@ -1020,6 +1052,46 @@ fn main() {
             let Some(key) = key else {
                 return;
             };
+
+            if pressed && key == KeyCode::Escape {
+                if pause_menu_open {
+                    pause_menu_open = false;
+                    try_enable_mouse_look(gpu.window(), &mut mouse_enabled, &mut last_cursor_pos);
+                    clear_movement_input(&mut input);
+                    mine_left_down = false;
+                    mining_target = None;
+                    mining_progress = 0.0;
+                    mining_overlay = None;
+                    inventory_left_mouse_down = false;
+                    inventory_right_mouse_down = false;
+                    inventory_drag_last_slot = None;
+                    gpu.window().set_ime_allowed(false);
+                    log_info("ui: pause menu closed");
+                } else {
+                    pause_menu_open = true;
+                    inventory.close();
+                    command_console.open = false;
+                    command_console.input.clear();
+                    let cached_cursor = last_cursor_pos.map(|(x, y)| (x as f32, y as f32));
+                    disable_mouse_look(gpu.window(), &mut mouse_enabled, &mut last_cursor_pos);
+                    ui_cursor_pos = cached_cursor;
+                    clear_movement_input(&mut input);
+                    mine_left_down = false;
+                    mining_target = None;
+                    mining_progress = 0.0;
+                    mining_overlay = None;
+                    inventory_left_mouse_down = false;
+                    inventory_right_mouse_down = false;
+                    inventory_drag_last_slot = None;
+                    gpu.window().set_ime_allowed(false);
+                    log_info("ui: pause menu opened");
+                }
+                gpu.window().request_redraw();
+                return;
+            }
+            if pause_menu_open {
+                return;
+            }
 
             if key == KeyCode::F1 {
                 if pressed {
@@ -1238,7 +1310,7 @@ fn main() {
             event: WindowEvent::MouseWheel { delta, .. },
             ..
         } => {
-            if command_console.open {
+            if command_console.open || pause_menu_open {
                 return;
             }
             let wheel_y = match delta {
@@ -1263,6 +1335,43 @@ fn main() {
             ..
         } => {
             let pressed = matches!(state, ElementState::Pressed);
+            if pause_menu_open {
+                if pressed && matches!(button, MouseButton::Left) {
+                    let size = gpu.window().inner_size();
+                    let cursor = ui_cursor_pos.or_else(|| {
+                        last_cursor_pos.map(|(x, y)| (x as f32, y as f32))
+                    });
+                    if let Some((mx, my)) = cursor {
+                        match hit_test_pause_menu_button(size.width, size.height, mx, my) {
+                            Some(PauseMenuButton::ReturnToGame) => {
+                                pause_menu_open = false;
+                                try_enable_mouse_look(
+                                    gpu.window(),
+                                    &mut mouse_enabled,
+                                    &mut last_cursor_pos,
+                                );
+                                clear_movement_input(&mut input);
+                                mine_left_down = false;
+                                mining_target = None;
+                                mining_progress = 0.0;
+                                mining_overlay = None;
+                                inventory_left_mouse_down = false;
+                                inventory_right_mouse_down = false;
+                                inventory_drag_last_slot = None;
+                                gpu.window().set_ime_allowed(false);
+                                log_info("ui: pause menu closed");
+                            }
+                            Some(PauseMenuButton::Quit) => {
+                                log_info("shutdown: quit selected from pause menu");
+                                elwt.exit();
+                            }
+                            None => {}
+                        }
+                    }
+                    gpu.window().request_redraw();
+                }
+                return;
+            }
             if command_console.open {
                 return;
             }
@@ -1387,8 +1496,8 @@ fn main() {
                     &mut pregen_chunks_created,
                     loaded_chunk_cap,
                     mesh_memory_cap_mb,
-                    48,
-                    adaptive_max_rebuilds_per_tick.max(6),
+                    20,
+                    adaptive_max_rebuilds_per_tick.max(3),
                     true,
                 );
             }
@@ -1397,7 +1506,7 @@ fn main() {
             event: DeviceEvent::MouseMotion { delta },
             ..
         } => {
-            if !mouse_enabled || inventory.open || command_console.open {
+            if !mouse_enabled || inventory.open || command_console.open || pause_menu_open {
                 return;
             }
             let (dx, dy) = (delta.0 as f32, delta.1 as f32);
@@ -1415,6 +1524,11 @@ fn main() {
             ..
         } => {
             ui_cursor_pos = Some((position.x as f32, position.y as f32));
+            if pause_menu_open {
+                last_cursor_pos = Some((position.x, position.y));
+                gpu.window().request_redraw();
+                return;
+            }
             if inventory.open {
                 if inventory_right_mouse_down {
                     let size = gpu.window().inner_size();
@@ -1469,7 +1583,7 @@ fn main() {
             event: WindowEvent::Focused(true),
             ..
         } => {
-            if !inventory.open && !command_console.open {
+            if !inventory.open && !command_console.open && !pause_menu_open {
                 try_enable_mouse_look(gpu.window(), &mut mouse_enabled, &mut last_cursor_pos);
             }
         }

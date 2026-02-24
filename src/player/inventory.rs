@@ -10,9 +10,7 @@ pub const INVENTORY_ROWS: usize = 4;
 pub const INVENTORY_COLS: usize = HOTBAR_SLOTS;
 pub const INVENTORY_STORAGE_SLOTS: usize = INVENTORY_ROWS * INVENTORY_COLS;
 pub const MAX_STACK_SIZE: u8 = 64;
-pub use crate::player::crafting::{
-    CRAFT_GRID_SIDE, CRAFT_GRID_SLOTS, CraftGridMode,
-};
+pub use crate::player::crafting::{CRAFT_GRID_SIDE, CRAFT_GRID_SLOTS, CraftGridMode};
 
 fn item_stack_limit(item_id: i8) -> u8 {
     item_max_stack_size(item_id).clamp(1, MAX_STACK_SIZE)
@@ -358,8 +356,11 @@ impl InventoryState {
                 if let Some(mut item) = slot_item {
                     let take = ((item.count as u16).saturating_add(1) / 2) as u8;
                     let remain = item.count.saturating_sub(take);
-                    self.dragged_item =
-                        Some(ItemStack::with_durability(item.block_id, take, item.durability));
+                    self.dragged_item = Some(ItemStack::with_durability(
+                        item.block_id,
+                        take,
+                        item.durability,
+                    ));
                     if remain == 0 {
                         self.set_slot_item(slot_ref, None);
                     } else {
