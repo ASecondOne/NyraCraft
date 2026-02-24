@@ -1,7 +1,7 @@
 use glam::{IVec3, Vec3};
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -506,7 +506,7 @@ fn request_chunk_remesh_with_priority(queue: &SharedRequestQueue, coord: IVec3, 
         coord,
         1,
         MeshMode::Full,
-        false,
+        true,
         RequestClass::Edit,
         priority,
     );
@@ -525,18 +525,6 @@ pub fn request_chunk_remesh_decay(queue: &SharedRequestQueue, coord: IVec3) {
         true,
         RequestClass::Near,
         i32::MAX,
-    );
-}
-
-pub fn request_chunk_remesh_lighting(queue: &SharedRequestQueue, coord: IVec3) {
-    enqueue_request(
-        queue,
-        coord,
-        1,
-        MeshMode::Full,
-        true,
-        RequestClass::Edit,
-        i32::MIN / 2,
     );
 }
 
@@ -1376,7 +1364,7 @@ fn apply_worker_result(
     result: WorkerResult,
     dirty_chunks: &DirtyChunks,
     edited_chunk_ranges: &EditedChunkRanges,
-    request_queue: &SharedRequestQueue,
+    _request_queue: &SharedRequestQueue,
     loaded: &mut HashMap<ChunkKey, i32>,
     requested: &mut HashMap<ChunkKey, i32>,
     pregen_center_chunk: IVec3,
@@ -1407,7 +1395,6 @@ fn apply_worker_result(
 
     if clear_edit_range {
         edited_chunk_ranges.lock().unwrap().remove(&k);
-        request_chunk_remesh_lighting(request_queue, IVec3::new(k.0, k.1, k.2));
     }
 
     let lod = match result {
@@ -1462,16 +1449,6 @@ pub fn apply_stream_results(
     let apply_start = Instant::now();
     let fast_lane_enabled = prioritize_dirty && dirty_pending_hint > 0;
     let mut deferred_non_dirty: Vec<WorkerResult> = Vec::with_capacity(max_apply_per_tick);
-    let mut pending_dirty_keys: HashSet<ChunkKey> = if fast_lane_enabled {
-        dirty_chunks
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|(&k, &state)| if state > 0 { Some(k) } else { None })
-            .collect()
-    } else {
-        HashSet::new()
-    };
 
     if fast_lane_enabled {
         let fast_lane_budget = max_apply_per_tick.max(6);
@@ -1489,7 +1466,11 @@ pub fn apply_stream_results(
             };
             scanned += 1;
             let (k, _) = worker_result_key_and_rev(&result);
-            let pending_now = pending_dirty_keys.contains(&k);
+            let pending_now = dirty_chunks
+                .lock()
+                .unwrap()
+                .get(&k)
+                .is_some_and(|state| *state > 0);
             if pending_now {
                 if apply_worker_result(
                     gpu,
@@ -1503,7 +1484,6 @@ pub fn apply_stream_results(
                     pregen_radius_chunks,
                     pregen_chunks_created,
                 ) {
-                    pending_dirty_keys.remove(&k);
                     dirty_applied += 1;
                 }
             } else {
@@ -1557,12 +1537,11 @@ pub fn apply_stream_results(
     }
 
     let dirty_pending_after = fast_lane_enabled
-        && (!pending_dirty_keys.is_empty()
-            || dirty_chunks
-                .lock()
-                .unwrap()
-                .values()
-                .any(|state| *state > 0));
+        && dirty_chunks
+            .lock()
+            .unwrap()
+            .values()
+            .any(|state| *state > 0);
     let mut rebuild_budget = if prioritize_dirty && dirty_pending_after {
         max_rebuilds_per_tick.max(3)
     } else {

@@ -17,6 +17,7 @@ const GRAVEL_DESERT_TEMPERATURE_MAX: f64 = 0.42;
 const SAND_DESERT_TEMPERATURE_MIN: f64 = 0.62;
 const CAVE_MIN_Y: i32 = -96;
 const SURFACE_CAVE_DEPTH: i32 = 10;
+const TREE_MIN_SUPPORT_LAYERS: i32 = 3;
 const WORLDGEN_LAYOUT_VERSION: u64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -290,6 +291,18 @@ impl WorldGen {
         density < self.cave_threshold + deep_t * 0.03
     }
 
+    fn has_tree_support_layers(&self, x: i32, z: i32, height: i32) -> bool {
+        let min_y = height - (TREE_MIN_SUPPORT_LAYERS - 1);
+        let mut y = min_y;
+        while y <= height {
+            if self.should_carve_cave_at(x, y, z, height) {
+                return false;
+            }
+            y += 1;
+        }
+        true
+    }
+
     pub fn block_id_at(&self, x: i32, y: i32, z: i32, height: i32) -> i8 {
         if !self.in_world_bounds(x, z) {
             return -1;
@@ -348,6 +361,9 @@ impl WorldGen {
             return None;
         }
         if !matches!(self.surface_biome_at(x, z, height), SurfaceBiome::Temperate) {
+            return None;
+        }
+        if !self.has_tree_support_layers(x, z, height) {
             return None;
         }
 
@@ -485,4 +501,31 @@ fn grid_marker_block_id(x: i32, y: i32, z: i32, height: i32) -> Option<i8> {
 
 fn is_grid_marker_column(x: i32, z: i32) -> bool {
     x.rem_euclid(4) == 0 && z.rem_euclid(4) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trees_have_supported_base_layers_in_normal_mode() {
+        let seeds = [1_u32, 42_u32, 777_u32];
+        for &seed in &seeds {
+            let world = WorldGen::new(seed, WorldMode::Normal);
+            for z in -96..=96 {
+                for x in -96..=96 {
+                    let height = world.height_at(x, z);
+                    if world.tree_at(x, z, height).is_some() {
+                        let min_y = height - (TREE_MIN_SUPPORT_LAYERS - 1);
+                        for y in min_y..=height {
+                            assert!(
+                                !world.should_carve_cave_at(x, y, z, height),
+                                "floating tree support detected at seed={seed} x={x} z={z} y={y} height={height}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

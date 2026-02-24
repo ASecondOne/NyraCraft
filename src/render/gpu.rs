@@ -322,7 +322,19 @@ struct GpuInner<'a> {
     ui_vertex_capacity: usize,
     ui_item_tiles_x: u32,
     ui_item_tile_uv_size: [f32; 2],
+    dropped_mesh: DynamicMeshBuffer,
+    break_overlay_mesh: DynamicMeshBuffer,
+    sun_mesh: DynamicMeshBuffer,
     staged_indices: Vec<u32>,
+}
+
+#[derive(Default)]
+struct DynamicMeshBuffer {
+    vertex_buffer: Option<wgpu::Buffer>,
+    index_buffer: Option<wgpu::Buffer>,
+    vertex_capacity: usize,
+    index_capacity: usize,
+    index_count: u32,
 }
 
 self_cell! {
@@ -379,15 +391,16 @@ impl Gpu {
             });
             let surface = instance.create_surface(window).unwrap();
 
-            let request_adapter = |power_preference: wgpu::PowerPreference,
-                                   force_fallback_adapter: bool,
-                                   compatible_surface: Option<&wgpu::Surface<'_>>| {
-                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                    compatible_surface,
-                    power_preference,
-                    force_fallback_adapter,
-                }))
-            };
+            let request_adapter =
+                |power_preference: wgpu::PowerPreference,
+                 force_fallback_adapter: bool,
+                 compatible_surface: Option<&wgpu::Surface<'_>>| {
+                    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                        compatible_surface,
+                        power_preference,
+                        force_fallback_adapter,
+                    }))
+                };
 
             let attempts = [
                 (wgpu::PowerPreference::HighPerformance, false),
@@ -933,6 +946,9 @@ impl Gpu {
                 ui_vertex_capacity,
                 ui_item_tiles_x,
                 ui_item_tile_uv_size,
+                dropped_mesh: DynamicMeshBuffer::default(),
+                break_overlay_mesh: DynamicMeshBuffer::default(),
+                sun_mesh: DynamicMeshBuffer::default(),
                 staged_indices: Vec::new(),
             }
         });
@@ -1100,80 +1116,49 @@ impl Gpu {
                 );
             }
 
-            let dropped_draw = if draw_world {
+            if draw_world {
                 let (drop_vertices, drop_indices) = build_dropped_item_mesh(dropped_items);
-                if drop_vertices.is_empty() || drop_indices.is_empty() {
-                    None
-                } else {
-                    let vertex_buffer =
-                        gpu.device
-                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                label: Some("dropped_item_vertex_buffer"),
-                                contents: bytemuck::cast_slice(&drop_vertices),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            });
-                    let index_buffer =
-                        gpu.device
-                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                label: Some("dropped_item_index_buffer"),
-                                contents: bytemuck::cast_slice(&drop_indices),
-                                usage: wgpu::BufferUsages::INDEX,
-                            });
-                    Some((vertex_buffer, index_buffer, drop_indices.len() as u32))
-                }
-            } else {
-                None
-            };
-            let break_overlay_draw = if draw_world {
-                break_overlay.and_then(|(coord, stage)| {
+                upload_dynamic_chunk_mesh(
+                    &gpu.device,
+                    &gpu.queue,
+                    &mut gpu.dropped_mesh,
+                    &drop_vertices,
+                    &drop_indices,
+                    "dropped_item_vertex_buffer",
+                    "dropped_item_index_buffer",
+                );
+
+                if let Some((coord, stage)) = break_overlay {
                     let (vertices, indices) = build_break_overlay_mesh(coord, stage);
-                    if vertices.is_empty() || indices.is_empty() {
-                        return None;
-                    }
-                    let vertex_buffer =
-                        gpu.device
-                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                label: Some("break_overlay_vertex_buffer"),
-                                contents: bytemuck::cast_slice(&vertices),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            });
-                    let index_buffer =
-                        gpu.device
-                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                label: Some("break_overlay_index_buffer"),
-                                contents: bytemuck::cast_slice(&indices),
-                                usage: wgpu::BufferUsages::INDEX,
-                            });
-                    Some((vertex_buffer, index_buffer, indices.len() as u32))
-                })
-            } else {
-                None
-            };
-            let sun_draw = if draw_world {
-                let (vertices, indices) =
-                    build_sun_mesh(camera, day_cycle.day_progress, day_cycle.sun_height);
-                if vertices.is_empty() || indices.is_empty() {
-                    None
+                    upload_dynamic_chunk_mesh(
+                        &gpu.device,
+                        &gpu.queue,
+                        &mut gpu.break_overlay_mesh,
+                        &vertices,
+                        &indices,
+                        "break_overlay_vertex_buffer",
+                        "break_overlay_index_buffer",
+                    );
                 } else {
-                    let vertex_buffer =
-                        gpu.device
-                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                label: Some("sun_vertex_buffer"),
-                                contents: bytemuck::cast_slice(&vertices),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            });
-                    let index_buffer =
-                        gpu.device
-                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                label: Some("sun_index_buffer"),
-                                contents: bytemuck::cast_slice(&indices),
-                                usage: wgpu::BufferUsages::INDEX,
-                            });
-                    Some((vertex_buffer, index_buffer, indices.len() as u32))
+                    gpu.break_overlay_mesh.index_count = 0;
                 }
+
+                let (sun_vertices, sun_indices) =
+                    build_sun_mesh(camera, day_cycle.day_progress, day_cycle.sun_height);
+                upload_dynamic_chunk_mesh(
+                    &gpu.device,
+                    &gpu.queue,
+                    &mut gpu.sun_mesh,
+                    &sun_vertices,
+                    &sun_indices,
+                    "sun_vertex_buffer",
+                    "sun_index_buffer",
+                );
             } else {
-                None
-            };
+                gpu.dropped_mesh.index_count = 0;
+                gpu.break_overlay_mesh.index_count = 0;
+                gpu.sun_mesh.index_count = 0;
+            }
 
             {
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1243,26 +1228,38 @@ impl Gpu {
                         rpass.draw_indexed(0..chunk.packed_index_count, 0, 0..1);
                     }
 
-                    if let Some((vertex_buffer, index_buffer, index_count)) = dropped_draw.as_ref()
+                    if gpu.dropped_mesh.index_count > 0
+                        && let (Some(vertex_buffer), Some(index_buffer)) = (
+                            gpu.dropped_mesh.vertex_buffer.as_ref(),
+                            gpu.dropped_mesh.index_buffer.as_ref(),
+                        )
                     {
                         rpass.set_pipeline(&gpu.render_pipeline);
                         rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
                         rpass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                        rpass.draw_indexed(0..*index_count, 0, 0..1);
+                        rpass.draw_indexed(0..gpu.dropped_mesh.index_count, 0, 0..1);
                     }
-                    if let Some((vertex_buffer, index_buffer, index_count)) =
-                        break_overlay_draw.as_ref()
+                    if gpu.break_overlay_mesh.index_count > 0
+                        && let (Some(vertex_buffer), Some(index_buffer)) = (
+                            gpu.break_overlay_mesh.vertex_buffer.as_ref(),
+                            gpu.break_overlay_mesh.index_buffer.as_ref(),
+                        )
                     {
                         rpass.set_pipeline(&gpu.render_pipeline);
                         rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
                         rpass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                        rpass.draw_indexed(0..*index_count, 0, 0..1);
+                        rpass.draw_indexed(0..gpu.break_overlay_mesh.index_count, 0, 0..1);
                     }
-                    if let Some((vertex_buffer, index_buffer, index_count)) = sun_draw.as_ref() {
+                    if gpu.sun_mesh.index_count > 0
+                        && let (Some(vertex_buffer), Some(index_buffer)) = (
+                            gpu.sun_mesh.vertex_buffer.as_ref(),
+                            gpu.sun_mesh.index_buffer.as_ref(),
+                        )
+                    {
                         rpass.set_pipeline(&gpu.render_pipeline);
                         rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
                         rpass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                        rpass.draw_indexed(0..*index_count, 0, 0..1);
+                        rpass.draw_indexed(0..gpu.sun_mesh.index_count, 0, 0..1);
                     }
 
                     if debug_chunks {
@@ -1869,6 +1866,76 @@ fn create_depth_view(
     });
 
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn ensure_dynamic_chunk_mesh_capacity(
+    device: &wgpu::Device,
+    mesh: &mut DynamicMeshBuffer,
+    required_vertices: usize,
+    required_indices: usize,
+    vertex_label: &'static str,
+    index_label: &'static str,
+) {
+    if required_vertices > mesh.vertex_capacity || mesh.vertex_buffer.is_none() {
+        let mut new_capacity = mesh.vertex_capacity.max(1);
+        while new_capacity < required_vertices {
+            new_capacity = new_capacity.saturating_mul(2);
+        }
+        mesh.vertex_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(vertex_label),
+            size: (new_capacity * std::mem::size_of::<ChunkVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        mesh.vertex_capacity = new_capacity;
+    }
+    if required_indices > mesh.index_capacity || mesh.index_buffer.is_none() {
+        let mut new_capacity = mesh.index_capacity.max(1);
+        while new_capacity < required_indices {
+            new_capacity = new_capacity.saturating_mul(2);
+        }
+        mesh.index_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(index_label),
+            size: (new_capacity * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        mesh.index_capacity = new_capacity;
+    }
+}
+
+fn upload_dynamic_chunk_mesh(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mesh: &mut DynamicMeshBuffer,
+    vertices: &[ChunkVertex],
+    indices: &[u32],
+    vertex_label: &'static str,
+    index_label: &'static str,
+) {
+    if vertices.is_empty() || indices.is_empty() {
+        mesh.index_count = 0;
+        return;
+    }
+
+    ensure_dynamic_chunk_mesh_capacity(
+        device,
+        mesh,
+        vertices.len(),
+        indices.len(),
+        vertex_label,
+        index_label,
+    );
+
+    if let (Some(vertex_buffer), Some(index_buffer)) =
+        (mesh.vertex_buffer.as_ref(), mesh.index_buffer.as_ref())
+    {
+        queue.write_buffer(vertex_buffer, 0, bytemuck::cast_slice(vertices));
+        queue.write_buffer(index_buffer, 0, bytemuck::cast_slice(indices));
+        mesh.index_count = indices.len() as u32;
+    } else {
+        mesh.index_count = 0;
+    }
 }
 
 fn ensure_ui_vertex_capacity(gpu: &mut GpuInner, required_vertices: usize) {
