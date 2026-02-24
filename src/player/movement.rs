@@ -17,6 +17,9 @@ pub struct PlayerConfig {
     pub sneak_multiplier: f32,
     pub jump_speed: f32,
     pub gravity: f32,
+    pub acceleration: f32,
+    pub friction: f32,
+    pub air_control: f32,
 }
 
 pub struct PlayerInput {
@@ -89,8 +92,17 @@ where
         move_speed *= config.sneak_multiplier;
     }
 
-    state.velocity.x = move_dir.x * move_speed;
-    state.velocity.z = move_dir.z * move_speed;
+    let target_vel_x = move_dir.x * move_speed;
+    let target_vel_z = move_dir.z * move_speed;
+
+    let accel_rate = 15.0;
+    let friction_rate = 20.0;
+
+    let lerp_x = if target_vel_x.abs() > state.velocity.x.abs() { accel_rate } else { friction_rate };
+    let lerp_z = if target_vel_z.abs() > state.velocity.z.abs() { accel_rate } else { friction_rate };
+
+    state.velocity.x += (target_vel_x - state.velocity.x) * (lerp_x * dt).min(1.0);
+    state.velocity.z += (target_vel_z - state.velocity.z) * (lerp_z * dt).min(1.0);
 
     if input.fly_mode {
         state.velocity.y = move_dir.y * move_speed;
