@@ -1,4 +1,5 @@
 use glam::{IVec3, Vec3};
+use std::collections::HashMap;
 
 use crate::player::inventory::{InventoryState, ItemStack};
 use crate::player::{EditedBlocks, block_id_with_edits};
@@ -7,6 +8,8 @@ use crate::world::blocks::{block_drop_rolls, item_max_stack_size};
 use crate::world::worldgen::WorldGen;
 
 const DROPPED_ITEM_DESPAWN_SECS: f32 = 5.0 * 60.0;
+const MAX_ACTIVE_DROPPED_ITEMS: usize = 900;
+const MAX_RENDERED_DROPPED_ITEMS: usize = 600;
 
 #[derive(Clone, Copy)]
 pub struct DroppedItem {
@@ -25,6 +28,9 @@ fn spawn_dropped_item(
     stack: ItemStack,
     pickup_delay: f32,
 ) {
+    if dropped_items.len() >= MAX_ACTIVE_DROPPED_ITEMS {
+        return;
+    }
     dropped_items.push(DroppedItem {
         position,
         velocity,
@@ -179,40 +185,65 @@ pub fn nudge_items_from_placed_block(
 }
 
 fn merge_stacks_in_same_block(dropped_items: &mut Vec<DroppedItem>) {
+    let mut merge_targets: HashMap<(i32, i32, i32, i8, u16), usize> =
+        HashMap::with_capacity(dropped_items.len());
     let mut i = 0usize;
     while i < dropped_items.len() {
-        let cell_i = drop_cell(dropped_items[i].position);
-        let block_i = dropped_items[i].stack.block_id;
-        let mut j = i + 1;
-        while j < dropped_items.len() {
-            let same_kind = dropped_items[j].stack.block_id == block_i;
-            let same_durability = dropped_items[j].stack.durability == dropped_items[i].stack.durability;
-            let same_cell = drop_cell(dropped_items[j].position) == cell_i;
-            if !same_kind || !same_durability || !same_cell {
-                j += 1;
+        let cell = drop_cell(dropped_items[i].position);
+        let key = (
+            cell.x,
+            cell.y,
+            cell.z,
+            dropped_items[i].stack.block_id,
+            dropped_items[i].stack.durability,
+        );
+
+        if let Some(&target_idx) = merge_targets.get(&key) {
+            if target_idx == i {
+                i += 1;
                 continue;
             }
 
-            let free = item_max_stack_size(block_i).saturating_sub(dropped_items[i].stack.count);
-            if free > 0 {
-                let moved = free.min(dropped_items[j].stack.count);
-                dropped_items[i].stack.count += moved;
-                dropped_items[j].stack.count -= moved;
-                dropped_items[i].pickup_delay = dropped_items[i]
-                    .pickup_delay
-                    .min(dropped_items[j].pickup_delay);
-                dropped_items[i].despawn_timer = dropped_items[i]
-                    .despawn_timer
-                    .min(dropped_items[j].despawn_timer);
+            let free = item_max_stack_size(dropped_items[i].stack.block_id)
+                .saturating_sub(dropped_items[target_idx].stack.count);
+            if free == 0 {
+                merge_targets.insert(key, i);
+                i += 1;
+                continue;
             }
 
-            if dropped_items[j].stack.count == 0 {
-                dropped_items.swap_remove(j);
+            let moved = free.min(dropped_items[i].stack.count);
+            dropped_items[target_idx].stack.count += moved;
+            dropped_items[i].stack.count -= moved;
+            dropped_items[target_idx].pickup_delay = dropped_items[target_idx]
+                .pickup_delay
+                .min(dropped_items[i].pickup_delay);
+            dropped_items[target_idx].despawn_timer = dropped_items[target_idx]
+                .despawn_timer
+                .min(dropped_items[i].despawn_timer);
+
+            if dropped_items[i].stack.count == 0 {
+                dropped_items.swap_remove(i);
+                if i < dropped_items.len() {
+                    let moved_cell = drop_cell(dropped_items[i].position);
+                    let moved_key = (
+                        moved_cell.x,
+                        moved_cell.y,
+                        moved_cell.z,
+                        dropped_items[i].stack.block_id,
+                        dropped_items[i].stack.durability,
+                    );
+                    merge_targets.insert(moved_key, i);
+                }
             } else {
-                j += 1;
+                // The original merge target is now full; let this remainder become the next target.
+                merge_targets.insert(key, i);
+                i += 1;
             }
+        } else {
+            merge_targets.insert(key, i);
+            i += 1;
         }
-        i += 1;
     }
 }
 
@@ -290,6 +321,14 @@ pub fn update_dropped_items(
     if dropped_items.len() > 1 {
         merge_stacks_in_same_block(dropped_items);
     }
+    if dropped_items.len() > MAX_ACTIVE_DROPPED_ITEMS {
+        dropped_items.sort_unstable_by(|a, b| {
+            let da = (a.position - player_pickup_center).length_squared();
+            let db = (b.position - player_pickup_center).length_squared();
+            da.total_cmp(&db)
+        });
+        dropped_items.truncate(MAX_ACTIVE_DROPPED_ITEMS);
+    }
 }
 
 pub fn build_dropped_item_render_data(
@@ -298,6 +337,7 @@ pub fn build_dropped_item_render_data(
 ) -> Vec<DroppedItemRender> {
     dropped_items
         .iter()
+        .take(MAX_RENDERED_DROPPED_ITEMS)
         .map(|drop| {
             let spin = render_time * 2.4 + drop.spin_phase;
             let bob = (render_time * 3.2 + drop.spin_phase).sin() * 0.06;

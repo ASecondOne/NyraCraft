@@ -18,14 +18,13 @@ pub const BLOCK_PLANKS_OAK: usize = 5;
 pub const BLOCK_CRAFTING_TABLE: usize = 6;
 pub const BLOCK_GRAVEL: usize = 7;
 pub const BLOCK_SAND: usize = 8;
-pub const BLOCK_COUNT: usize = 9;
-pub const ITEM_APPLE: i8 = BLOCK_COUNT as i8;
-pub const ITEM_STICK: i8 = BLOCK_COUNT as i8 + 1;
-pub const ITEM_FLINT_AXE: i8 = BLOCK_COUNT as i8 + 3;
-pub const ITEM_FLINT_KNIFE: i8 = BLOCK_COUNT as i8 + 4;
-pub const ITEM_FLINT_PICKAXE: i8 = BLOCK_COUNT as i8 + 5;
-pub const ITEM_FLINT_SHOVEL: i8 = BLOCK_COUNT as i8 + 6;
-pub const ITEM_FLINT_SWORD: i8 = BLOCK_COUNT as i8 + 7;
+pub const ITEM_APPLE: i8 = -1; // 2:1
+pub const ITEM_STICK: i8 = -2; // 2:2
+pub const ITEM_FLINT_AXE: i8 = -4; // 2:4
+pub const ITEM_FLINT_KNIFE: i8 = -5; // 2:5
+pub const ITEM_FLINT_PICKAXE: i8 = -6; // 2:6
+pub const ITEM_FLINT_SHOVEL: i8 = -7; // 2:7
+pub const ITEM_FLINT_SWORD: i8 = -8; // 2:8
 pub const HOTBAR_SLOTS: usize = 9;
 pub const HOTBAR_LOADOUT: [Option<i8>; HOTBAR_SLOTS] = [
     Some(ITEM_FLINT_PICKAXE),
@@ -442,7 +441,9 @@ fn parse_item_file_id(id: &RawIdValue, register_name: &str) -> Option<(i8, Optio
                     );
                     return None;
                 }
-                let raw = BLOCK_COUNT as i64 + local as i64 - 1;
+                // Keep explicit item ids in their own signed range (2:1 => -1, 2:2 => -2, ...).
+                // This avoids accidental collisions with block-backed item ids as block count grows.
+                let raw = -(local as i64);
                 return i8::try_from(raw)
                     .ok()
                     .map(|id| (id, Some(local)))
@@ -785,13 +786,9 @@ fn load_registry(tiles_x: u32) -> Registry {
             .breaktime
             .and_then(|value| (value.is_finite() && value > 0.0).then_some(value));
         let tool_type = parse_item_tool_type_or_default(&raw);
-        let durability = raw.durability.unwrap_or_else(|| {
-            if tool_type == ToolType::Hand {
-                0
-            } else {
-                64
-            }
-        });
+        let durability = raw
+            .durability
+            .unwrap_or_else(|| if tool_type == ToolType::Hand { 0 } else { 64 });
         let default_stack_size = if breaktime.is_some() || durability > 0 {
             1
         } else {
@@ -810,7 +807,10 @@ fn load_registry(tiles_x: u32) -> Registry {
             effects: raw.effects,
             breaktime,
             durability,
-            max_stack_size: raw.max_stack_size.unwrap_or(default_stack_size).clamp(1, 64),
+            max_stack_size: raw
+                .max_stack_size
+                .unwrap_or(default_stack_size)
+                .clamp(1, 64),
             tool_type,
         };
         upsert_item(item, raw.aliases);
@@ -972,8 +972,7 @@ pub fn item_break_strength(item_id: i8) -> Option<f32> {
 }
 
 pub fn item_max_durability(item_id: i8) -> Option<u16> {
-    item_def_by_id(item_id)
-        .and_then(|def| (def.durability > 0).then_some(def.durability))
+    item_def_by_id(item_id).and_then(|def| (def.durability > 0).then_some(def.durability))
 }
 
 pub fn placeable_block_id_for_item(item_id: i8) -> Option<i8> {
@@ -1094,15 +1093,14 @@ fn matching_tool_multiplier(tool: ToolType) -> f32 {
     }
 }
 
-fn off_tool_multiplier(tool: ToolType) -> f32 {
-    match tool {
-        ToolType::Hand => 1.0,
-        ToolType::Pickaxe => 0.60,
-        ToolType::Axe => 0.80,
-        ToolType::Shovel => 0.0,
-        ToolType::Knife => 0.0,
-        ToolType::Sword => 0.0,
+fn tool_passes_filter(required_tool: ToolType, held_tool: ToolType) -> bool {
+    if held_tool == required_tool {
+        return true;
     }
+
+    // Allow hand mining for softer tool-typed blocks (like logs/leaves),
+    // but enforce pickaxe-only behavior for stone-like blocks.
+    held_tool == ToolType::Hand && required_tool != ToolType::Pickaxe
 }
 
 fn adjusted_break_strength(id: i8, held_item_id: Option<i8>, break_strength: f32) -> Option<f32> {
@@ -1112,21 +1110,14 @@ fn adjusted_break_strength(id: i8, held_item_id: Option<i8>, break_strength: f32
     };
 
     let held_tool = held_item_id.map(item_tool_type).unwrap_or(ToolType::Hand);
-    if held_tool == ToolType::Hand {
-        // Hand is universal: no tool-type lockout, only strength/hardness decides.
-        return Some(strength);
-    }
-    if held_tool == required_tool {
-        strength *= matching_tool_multiplier(held_tool);
-        return Some(strength);
-    }
-
-    let multiplier = off_tool_multiplier(held_tool);
-    if multiplier <= 0.0 {
+    if !tool_passes_filter(required_tool, held_tool) {
         return None;
     }
-    strength *= multiplier;
-    (strength > 0.0).then_some(strength)
+
+    if held_tool == required_tool {
+        strength *= matching_tool_multiplier(held_tool);
+    }
+    Some(strength)
 }
 
 pub fn can_break_block_with_item(id: i8, held_item_id: Option<i8>, break_strength: f32) -> bool {
@@ -1262,4 +1253,59 @@ pub fn parse_item_id(name_or_id: &str) -> Option<i8> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stone_is_unbreakable_by_hand() {
+        let can_break = can_break_block_with_item(BLOCK_STONE as i8, None, 1.0);
+        let break_time = block_break_time_with_item_seconds(BLOCK_STONE as i8, None, 1.0);
+        assert!(!can_break);
+        assert!(break_time.is_none());
+    }
+
+    #[test]
+    fn stone_is_breakable_with_pickaxe() {
+        let pick_strength = item_break_strength(ITEM_FLINT_PICKAXE).unwrap_or(1.0);
+        let can_break =
+            can_break_block_with_item(BLOCK_STONE as i8, Some(ITEM_FLINT_PICKAXE), pick_strength);
+        let break_time = block_break_time_with_item_seconds(
+            BLOCK_STONE as i8,
+            Some(ITEM_FLINT_PICKAXE),
+            pick_strength,
+        );
+        assert!(can_break);
+        assert!(break_time.is_some());
+    }
+
+    #[test]
+    fn logs_break_by_hand_and_axe_is_faster() {
+        let hand_time = block_break_time_with_item_seconds(BLOCK_LOG as i8, None, 1.0)
+            .expect("hand should break logs");
+        let axe_strength = item_break_strength(ITEM_FLINT_AXE).unwrap_or(1.0);
+        let axe_time = block_break_time_with_item_seconds(
+            BLOCK_LOG as i8,
+            Some(ITEM_FLINT_AXE),
+            axe_strength,
+        )
+        .expect("axe should break logs");
+        assert!(axe_time < hand_time);
+    }
+
+    #[test]
+    fn wrong_tool_is_filtered_out() {
+        let axe_strength = item_break_strength(ITEM_FLINT_AXE).unwrap_or(1.0);
+        assert!(!can_break_block_with_item(
+            BLOCK_STONE as i8,
+            Some(ITEM_FLINT_AXE),
+            axe_strength
+        ));
+        assert!(
+            block_break_time_with_item_seconds(BLOCK_STONE as i8, Some(ITEM_FLINT_AXE), axe_strength)
+                .is_none()
+        );
+    }
 }
