@@ -174,6 +174,9 @@ fn main() {
         sneak_multiplier: 0.45,
         jump_speed: 7.0,
         gravity: -18.0,
+        acceleration: 15.0,
+        friction: 20.0,
+        air_control: 0.3,
     };
 
     let mut camera = Camera {
