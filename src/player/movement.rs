@@ -95,14 +95,11 @@ where
     let target_vel_x = move_dir.x * move_speed;
     let target_vel_z = move_dir.z * move_speed;
 
-    let (accel, friction) = if state.grounded {
-        (config.acceleration, config.friction)
-    } else {
-        (config.acceleration * config.air_control, config.friction * config.air_control)
-    };
+    let accel_rate = 15.0;
+    let friction_rate = 20.0;
 
-    let lerp_x = if target_vel_x.abs() > 0.001 { accel } else { friction };
-    let lerp_z = if target_vel_z.abs() > 0.001 { accel } else { friction };
+    let lerp_x = if target_vel_x.abs() > state.velocity.x.abs() { accel_rate } else { friction_rate };
+    let lerp_z = if target_vel_z.abs() > state.velocity.z.abs() { accel_rate } else { friction_rate };
 
     state.velocity.x += (target_vel_x - state.velocity.x) * (lerp_x * dt).min(1.0);
     state.velocity.z += (target_vel_z - state.velocity.z) * (lerp_z * dt).min(1.0);
