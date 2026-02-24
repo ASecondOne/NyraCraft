@@ -41,7 +41,7 @@ pub fn update_player<F>(
     camera_forward: Vec3,
     camera_up: Vec3,
     dt: f32,
-    config: &PlayerConfig,
+    config: &mut PlayerConfig,
     is_solid: &F,
 ) -> Vec3
 where
@@ -90,6 +90,11 @@ where
     }
     if input.sneak {
         move_speed *= config.sneak_multiplier;
+        config.height = 1.45;
+        config.eye_height = 1.23;
+    } else {
+        config.height = 1.9;
+        config.eye_height = 1.62;
     }
 
     let target_vel_x = move_dir.x * move_speed;
