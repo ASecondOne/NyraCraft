@@ -2,8 +2,9 @@ use glam::{IVec3, Vec3};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use winit::{
@@ -41,6 +42,7 @@ use app::streaming::{
     pick_block, pop_request, request_queue_stats, should_pack_far_lod, stream_tick,
     try_load_cached_mesh, write_cached_mesh,
 };
+use player::crafting::reload_recipes;
 use player::inventory::{InventorySlotRef, InventoryState, hit_test_slot};
 use player::{
     Camera, EditedBlocks, LeafDecayQueue, PlayerConfig, PlayerInput, PlayerState,
@@ -48,12 +50,13 @@ use player::{
     tick_leaf_decay, update_player,
 };
 use render::Gpu;
+use render::gpu::reload_cpu_item_atlas_cache;
 use render::mesh::pack_far_vertices;
 use render::{CubeStyle, TextureAtlas};
 use world::CHUNK_SIZE;
 use world::blocks::{
     BLOCK_CRAFTING_TABLE, BLOCK_LEAVES, DEFAULT_TILES_X, HOTBAR_SLOTS, block_break_stage,
-    block_break_time_with_item_seconds, build_block_index, default_blocks,
+    block_break_time_with_item_seconds, build_block_index, default_blocks, reload_registry,
 };
 use world::mesher::generate_chunk_mesh;
 use world::worldgen::{TreeSpec, WorldGen};
@@ -102,7 +105,8 @@ fn main() {
     };
 
     let tiles_x = DEFAULT_TILES_X;
-    let blocks = default_blocks(tiles_x);
+    let runtime_blocks = Arc::new(RwLock::new(default_blocks(tiles_x)));
+    let content_reload_epoch = Arc::new(AtomicU64::new(1));
     let block_index = build_block_index(tiles_x);
     if cfg!(debug_assertions) {
         eprintln!("Indexed {} block types:", block_index.len());
@@ -293,7 +297,7 @@ fn main() {
                 }
             }
         });
-    let blocks_gen = blocks.clone();
+    let blocks_gen = Arc::clone(&runtime_blocks);
     let gen_thread = world_gen.clone();
     let worker_count = std::thread::available_parallelism()
         // Keep several cores free for render/input/OS and avoid startup/load saturation.
@@ -304,7 +308,8 @@ fn main() {
         let request_queue = Arc::clone(&request_queue);
         let tx_res = tx_res.clone();
         let tx_cache = tx_cache.clone();
-        let blocks_gen = blocks_gen.clone();
+        let blocks_gen = Arc::clone(&blocks_gen);
+        let content_reload_epoch = Arc::clone(&content_reload_epoch);
         let gen_thread = gen_thread.clone();
         let cache_dir = cache_dir.clone();
         let edited_blocks = Arc::clone(&edited_blocks);
@@ -319,6 +324,7 @@ fn main() {
                     thread::current().id()
                 ));
                 while let Some(task) = pop_request(&request_queue) {
+                    let task_epoch = content_reload_epoch.load(Ordering::Acquire);
                     let coord = task.coord;
                     let step = task.step;
                     let mode = task.mode;
@@ -350,7 +356,9 @@ fn main() {
                         && !has_overrides
                         && let Some(cached) = try_load_cached_mesh(&cache_dir, coord, step, mode)
                     {
-                        let _ = tx_res.send(cached.into_worker_result(coord, step, mode));
+                        let _ = tx_res.send(cached.into_worker_result(
+                            coord, step, mode, task_epoch,
+                        ));
                         continue;
                     }
 
@@ -375,9 +383,13 @@ fn main() {
                             block_id_full_cached(&gen_thread, &height_cache, &tree_cache, x, y, z)
                         })
                     };
+                    let blocks_for_task = {
+                        let guard = blocks_gen.read().unwrap();
+                        guard.clone()
+                    };
                     let mesh = generate_chunk_mesh(
                         coord,
-                        &blocks_gen,
+                        &blocks_for_task,
                         &gen_thread,
                         &block_at,
                         edit_range,
@@ -408,9 +420,17 @@ fn main() {
                                 indices: packed_indices,
                             });
                         }
-                        let _ = tx_res.send(WorkerResult::Packed { packed, dirty_rev });
+                        let _ = tx_res.send(WorkerResult::Packed {
+                            packed,
+                            dirty_rev,
+                            epoch: task_epoch,
+                        });
                     } else {
-                        let _ = tx_res.send(WorkerResult::Raw { mesh, dirty_rev });
+                        let _ = tx_res.send(WorkerResult::Raw {
+                            mesh,
+                            dirty_rev,
+                            epoch: task_epoch,
+                        });
                     }
                 }
             });
@@ -677,6 +697,7 @@ fn main() {
                                             apply_stream_results(
                                                 &mut gpu,
                                                 &rx_res,
+                                                content_reload_epoch.load(Ordering::Acquire),
                                                 &dirty_chunks,
                                                 1,
                                                 &edited_chunk_ranges,
@@ -753,6 +774,7 @@ fn main() {
                         apply_stream_results(
                             &mut gpu,
                             &rx_res,
+                            content_reload_epoch.load(Ordering::Acquire),
                             &dirty_chunks,
                             dirty_pending,
                             &edited_chunk_ranges,
@@ -1217,8 +1239,27 @@ fn main() {
                         ));
                     }
                     KeyCode::KeyR => {
+                        // Phase 1: move to a transient epoch so in-flight work becomes stale.
+                        let next_epoch = content_reload_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+                        log_info("runtime: hot reload requested (textures/content)");
+                        generate_texture_atlases();
+                        reload_registry(DEFAULT_TILES_X);
+                        reload_recipes();
+                        {
+                            let mut shared_blocks = runtime_blocks.write().unwrap();
+                            *shared_blocks = default_blocks(DEFAULT_TILES_X);
+                        }
+                        gpu.reload_textures(Some(TextureAtlas {
+                            path: "src/texturing/atlas_output/atls_blocks.png".to_string(),
+                            tile_size: 16,
+                        }));
+                        reload_cpu_item_atlas_cache();
+                        let _ = fs::remove_dir_all(&cache_dir);
+                        let _ = fs::create_dir_all(&cache_dir);
+                        // Phase 2: publish the final epoch for freshly generated work.
+                        content_reload_epoch.store(next_epoch + 1, Ordering::Release);
                         force_reload = true;
-                        log_info("runtime: force chunk reload requested");
+                        log_info("runtime: hot reload complete");
                     }
                     KeyCode::KeyM => {
                         fly_mode = !fly_mode;
@@ -1484,6 +1525,7 @@ fn main() {
                 apply_stream_results(
                     &mut gpu,
                     &rx_res,
+                    content_reload_epoch.load(Ordering::Acquire),
                     &dirty_chunks,
                     1,
                     &edited_chunk_ranges,

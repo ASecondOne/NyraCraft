@@ -22,10 +22,12 @@ pub enum WorkerResult {
     Raw {
         mesh: MeshData,
         dirty_rev: Option<u64>,
+        epoch: u64,
     },
     Packed {
         packed: PackedMeshData,
         dirty_rev: Option<u64>,
+        epoch: u64,
     },
 }
 
@@ -184,7 +186,13 @@ pub struct CacheMeshView<'a> {
 }
 
 impl MeshCacheEntry {
-    pub fn into_worker_result(self, coord: IVec3, step: i32, mode: MeshMode) -> WorkerResult {
+    pub fn into_worker_result(
+        self,
+        coord: IVec3,
+        step: i32,
+        mode: MeshMode,
+        epoch: u64,
+    ) -> WorkerResult {
         WorkerResult::Packed {
             packed: PackedMeshData {
                 coord,
@@ -196,6 +204,7 @@ impl MeshCacheEntry {
                 indices: self.indices.into(),
             },
             dirty_rev: None,
+            epoch,
         }
     }
 }
@@ -1350,18 +1359,27 @@ fn enforce_memory_budget(
 
 fn worker_result_key_and_rev(result: &WorkerResult) -> (ChunkKey, Option<u64>) {
     match result {
-        WorkerResult::Raw { mesh, dirty_rev } => {
+        WorkerResult::Raw { mesh, dirty_rev, .. } => {
             ((mesh.coord.x, mesh.coord.y, mesh.coord.z), *dirty_rev)
         }
-        WorkerResult::Packed { packed, dirty_rev } => {
+        WorkerResult::Packed {
+            packed, dirty_rev, ..
+        } => {
             ((packed.coord.x, packed.coord.y, packed.coord.z), *dirty_rev)
         }
+    }
+}
+
+fn worker_result_epoch(result: &WorkerResult) -> u64 {
+    match result {
+        WorkerResult::Raw { epoch, .. } | WorkerResult::Packed { epoch, .. } => *epoch,
     }
 }
 
 fn apply_worker_result(
     gpu: &mut Gpu,
     result: WorkerResult,
+    active_epoch: u64,
     dirty_chunks: &DirtyChunks,
     edited_chunk_ranges: &EditedChunkRanges,
     _request_queue: &SharedRequestQueue,
@@ -1371,6 +1389,9 @@ fn apply_worker_result(
     pregen_radius_chunks: i32,
     pregen_chunks_created: &mut usize,
 ) -> bool {
+    if worker_result_epoch(&result) != active_epoch {
+        return false;
+    }
     let (k, dirty_rev) = worker_result_key_and_rev(&result);
 
     let mut clear_edit_range = false;
@@ -1430,6 +1451,7 @@ fn apply_worker_result(
 pub fn apply_stream_results(
     gpu: &mut Gpu,
     rx_res: &mpsc::Receiver<WorkerResult>,
+    active_epoch: u64,
     dirty_chunks: &DirtyChunks,
     dirty_pending_hint: usize,
     edited_chunk_ranges: &EditedChunkRanges,
@@ -1475,6 +1497,7 @@ pub fn apply_stream_results(
                 if apply_worker_result(
                     gpu,
                     result,
+                    active_epoch,
                     dirty_chunks,
                     edited_chunk_ranges,
                     request_queue,
@@ -1503,6 +1526,7 @@ pub fn apply_stream_results(
         if apply_worker_result(
             gpu,
             result,
+            active_epoch,
             dirty_chunks,
             edited_chunk_ranges,
             request_queue,
@@ -1523,6 +1547,7 @@ pub fn apply_stream_results(
         if apply_worker_result(
             gpu,
             result,
+            active_epoch,
             dirty_chunks,
             edited_chunk_ranges,
             request_queue,

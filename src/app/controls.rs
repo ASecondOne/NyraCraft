@@ -19,7 +19,7 @@ const KEYBIND_LINES: [&str; 17] = [
     "F3: Toggle debug stats panel",
     "F1 + F : Toggle face debug colors",
     "F1 + W : Toggle chunk wireframe",
-    "F1 + P/V/R/M/X : Stream pause / render pause / reload / fly / fullscreen",
+    "F1 + P/V/R/M/X : Stream pause / render pause / hot reload / fly / fullscreen",
     "F1 + D : Toggle debug stats panel",
 ];
 

@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 pub const DEFAULT_TILES_X: u32 = 16;
 pub const BLOCK_STONE: usize = 0;
@@ -197,14 +197,28 @@ struct RawItemFile {
     tool_type: Option<String>,
 }
 
-static REGISTRY: OnceLock<Registry> = OnceLock::new();
+static REGISTRY: OnceLock<RwLock<&'static Registry>> = OnceLock::new();
+
+fn registry_lock_with_tiles_x(tiles_x: u32) -> &'static RwLock<&'static Registry> {
+    REGISTRY.get_or_init(|| {
+        let loaded = Box::leak(Box::new(load_registry(tiles_x.max(1))));
+        RwLock::new(loaded)
+    })
+}
 
 fn registry_with_tiles_x(tiles_x: u32) -> &'static Registry {
-    REGISTRY.get_or_init(|| load_registry(tiles_x.max(1)))
+    let guard = registry_lock_with_tiles_x(tiles_x).read().unwrap();
+    *guard
 }
 
 fn registry() -> &'static Registry {
     registry_with_tiles_x(DEFAULT_TILES_X)
+}
+
+pub fn reload_registry(tiles_x: u32) {
+    let loaded = Box::leak(Box::new(load_registry(tiles_x.max(1))));
+    let mut guard = registry_lock_with_tiles_x(tiles_x).write().unwrap();
+    *guard = loaded;
 }
 
 fn sanitize_slot_1based(slot_1based: u32, max_tiles: u32) -> u32 {

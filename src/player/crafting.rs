@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 pub const PLAYER_CRAFT_GRID_SIDE: usize = 2;
 pub const TABLE_CRAFT_GRID_SIDE: usize = 3;
@@ -156,7 +156,7 @@ enum ParsedRecipeKind {
     Shapeless,
 }
 
-static RECIPES: OnceLock<Registry> = OnceLock::new();
+static RECIPES: OnceLock<RwLock<&'static Registry>> = OnceLock::new();
 
 pub fn normalize_craft_side(side: usize) -> usize {
     side.clamp(1, CRAFT_GRID_SIDE)
@@ -198,8 +198,22 @@ pub fn craft_once(
     consumed.then_some(output)
 }
 
+fn recipes_lock() -> &'static RwLock<&'static Registry> {
+    RECIPES.get_or_init(|| {
+        let loaded = Box::leak(Box::new(load_registry()));
+        RwLock::new(loaded)
+    })
+}
+
 fn registry() -> &'static Registry {
-    RECIPES.get_or_init(load_registry)
+    let guard = recipes_lock().read().unwrap();
+    *guard
+}
+
+pub fn reload_recipes() {
+    let loaded = Box::leak(Box::new(load_registry()));
+    let mut guard = recipes_lock().write().unwrap();
+    *guard = loaded;
 }
 
 fn default_one_u8() -> u8 {
