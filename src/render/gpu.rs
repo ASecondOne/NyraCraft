@@ -22,6 +22,7 @@ use glam::{IVec3, Mat3, Mat4, Vec2, Vec3};
 use self_cell::self_cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, OnceLock};
 use wgpu::util::DeviceExt;
 
@@ -965,6 +966,129 @@ impl Gpu {
             gpu.config.height = new_size.height;
             gpu.surface.configure(&gpu.device, &gpu.config);
             gpu.depth_view = create_depth_view(&gpu.device, &gpu.config);
+        });
+    }
+
+    pub fn reload_textures(&mut self, atlas: Option<TextureAtlas>) {
+        let use_texture = self.style.use_texture;
+        self.cell.with_dependent_mut(|_, gpu| {
+            let AtlasTexture {
+                view: texture_view,
+                sampler: atlas_sampler,
+                tiles_x,
+                tile_uv_size,
+            } = if use_texture {
+                let atlas = atlas
+                    .as_ref()
+                    .expect("TextureAtlas required when use_texture is true");
+                load_atlas_texture(&gpu.device, &gpu.queue, &atlas)
+            } else {
+                create_dummy_texture(&gpu.device, &gpu.queue)
+            };
+
+            let grass_colormap = load_grass_colormap_texture(&gpu.device, &gpu.queue);
+            let AtlasTexture {
+                view: ui_item_texture_view,
+                sampler: ui_item_sampler,
+                tiles_x: ui_item_tiles_x,
+                tile_uv_size: ui_item_tile_uv_size,
+            } = load_atlas_texture(
+                &gpu.device,
+                &gpu.queue,
+                &TextureAtlas {
+                    path: "src/texturing/atlas_output/atlas_items.png".to_string(),
+                    tile_size: 16,
+                },
+            );
+            let AtlasTexture {
+                view: sun_texture_view,
+                sampler: sun_sampler,
+                ..
+            } = if Path::new("src/texturing/sun_vv.png").exists() {
+                load_atlas_texture(
+                    &gpu.device,
+                    &gpu.queue,
+                    &TextureAtlas {
+                        path: "src/texturing/sun_vv.png".to_string(),
+                        tile_size: 32,
+                    },
+                )
+            } else {
+                create_dummy_texture(&gpu.device, &gpu.queue)
+            };
+
+            let scene_bind_group_layout = gpu.render_pipeline.get_bind_group_layout(0);
+            gpu.bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("scene_bind_group_reload"),
+                layout: &scene_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: gpu.uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&atlas_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&grass_colormap.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&grass_colormap.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&ui_item_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::Sampler(&ui_item_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(&sun_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::Sampler(&sun_sampler),
+                    },
+                ],
+            });
+
+            let ui_bind_group_layout = gpu.ui_pipeline.get_bind_group_layout(0);
+            gpu.ui_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ui_bind_group_reload"),
+                layout: &ui_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&ui_item_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&ui_item_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&atlas_sampler),
+                    },
+                ],
+            });
+
+            gpu.tiles_x = tiles_x;
+            gpu.tile_uv_size = tile_uv_size;
+            gpu.ui_item_tiles_x = ui_item_tiles_x;
+            gpu.ui_item_tile_uv_size = ui_item_tile_uv_size;
         });
     }
 
@@ -3155,6 +3279,30 @@ fn tile_uv_bounds(
     Some(([u0, v0], [u1, v1]))
 }
 
+fn rotate_uv_local(uv: [f32; 2], rot: u32) -> [f32; 2] {
+    match rot & 3 {
+        0 => uv,
+        1 => [1.0 - uv[1], uv[0]],
+        2 => [1.0 - uv[0], 1.0 - uv[1]],
+        _ => [uv[1], 1.0 - uv[0]],
+    }
+}
+
+fn face_uvs_p0123_with_rotation(
+    uv_min: [f32; 2],
+    uv_max: [f32; 2],
+    rotation: u32,
+) -> [[f32; 2]; 4] {
+    let uv_w = uv_max[0] - uv_min[0];
+    let uv_h = uv_max[1] - uv_min[1];
+    let map = |base_uv: [f32; 2]| -> [f32; 2] {
+        let r = rotate_uv_local(base_uv, rotation);
+        [uv_min[0] + r[0] * uv_w, uv_min[1] + r[1] * uv_h]
+    };
+    // Match world-mesh face vertex UVs: p0,p1,p2,p3 -> (0,1),(1,1),(1,0),(0,0)
+    [map([0.0, 1.0]), map([1.0, 1.0]), map([1.0, 0.0]), map([0.0, 0.0])]
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_block_icon_textured(
     out: &mut Vec<UiVertex>,
@@ -3175,7 +3323,7 @@ fn push_block_icon_textured(
         return;
     }
 
-    let (tiles, _, _) = dropped_block_face_data(block_id);
+    let (tiles, rotations, _) = dropped_block_face_data(block_id);
     let (top_uv_min, top_uv_max) = match tile_uv_bounds(tiles[2], tiles_x, tile_uv_size) {
         Some(v) => v,
         None => {
@@ -3185,7 +3333,7 @@ fn push_block_icon_textured(
             return;
         }
     };
-    let (left_uv_min, left_uv_max) = match tile_uv_bounds(tiles[1], tiles_x, tile_uv_size) {
+    let (left_uv_min, left_uv_max) = match tile_uv_bounds(tiles[4], tiles_x, tile_uv_size) {
         Some(v) => v,
         None => {
             push_block_icon(
@@ -3203,6 +3351,9 @@ fn push_block_icon_textured(
             return;
         }
     };
+    let top_uv = face_uvs_p0123_with_rotation(top_uv_min, top_uv_max, rotations[2]);
+    let left_uv = face_uvs_p0123_with_rotation(left_uv_min, left_uv_max, rotations[4]);
+    let right_uv = face_uvs_p0123_with_rotation(right_uv_min, right_uv_max, rotations[0]);
 
     // Isometric-ish mini cube for the hotbar icon.
     let half_w = size * 0.56;
@@ -3232,8 +3383,6 @@ fn push_block_icon_textured(
         1.0,
     ];
 
-    let top_u_mid = (top_uv_min[0] + top_uv_max[0]) * 0.5;
-    let top_v_mid = (top_uv_min[1] + top_uv_max[1]) * 0.5;
     push_ui_textured_quad(
         out,
         width,
@@ -3242,10 +3391,10 @@ fn push_block_icon_textured(
         right,
         bottom,
         left,
-        [top_u_mid, top_uv_min[1]],
-        [top_uv_max[0], top_v_mid],
-        [top_u_mid, top_uv_max[1]],
-        [top_uv_min[0], top_v_mid],
+        top_uv[0],
+        top_uv[3],
+        top_uv[2],
+        top_uv[1],
         top_tint,
         UI_ATLAS_BLOCK,
     );
@@ -3257,10 +3406,10 @@ fn push_block_icon_textured(
         bottom,
         down,
         down_left,
-        [left_uv_min[0], left_uv_min[1]],
-        [left_uv_max[0], left_uv_min[1]],
-        [left_uv_max[0], left_uv_max[1]],
-        [left_uv_min[0], left_uv_max[1]],
+        left_uv[3],
+        left_uv[2],
+        left_uv[1],
+        left_uv[0],
         left_tint,
         UI_ATLAS_BLOCK,
     );
@@ -3272,10 +3421,10 @@ fn push_block_icon_textured(
         down_right,
         down,
         bottom,
-        [right_uv_min[0], right_uv_min[1]],
-        [right_uv_max[0], right_uv_min[1]],
-        [right_uv_max[0], right_uv_max[1]],
-        [right_uv_min[0], right_uv_max[1]],
+        right_uv[1],
+        right_uv[0],
+        right_uv[3],
+        right_uv[2],
         right_tint,
         UI_ATLAS_BLOCK,
     );
@@ -3986,9 +4135,57 @@ struct CpuItemAtlas {
     rgba: Vec<u8>,
 }
 
+enum CpuItemAtlasState {
+    Missing,
+    Loaded(CpuItemAtlas),
+}
+
+fn cpu_item_atlas_state_ptr() -> &'static AtomicPtr<CpuItemAtlasState> {
+    static ATLAS: OnceLock<AtomicPtr<CpuItemAtlasState>> = OnceLock::new();
+    ATLAS.get_or_init(|| AtomicPtr::new(std::ptr::null_mut()))
+}
+
 fn cpu_item_atlas() -> Option<&'static CpuItemAtlas> {
-    static ATLAS: OnceLock<Option<CpuItemAtlas>> = OnceLock::new();
-    ATLAS.get_or_init(load_cpu_item_atlas).as_ref()
+    let state_ptr = cpu_item_atlas_state_ptr();
+    let mut ptr = state_ptr.load(Ordering::Acquire);
+    if ptr.is_null() {
+        let loaded_state = Box::new(match load_cpu_item_atlas() {
+            Some(atlas) => CpuItemAtlasState::Loaded(atlas),
+            None => CpuItemAtlasState::Missing,
+        });
+        let leaked = Box::into_raw(loaded_state);
+        match state_ptr.compare_exchange(
+            std::ptr::null_mut(),
+            leaked,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => ptr = leaked,
+            Err(existing) => {
+                // Another thread won the initialization race.
+                unsafe {
+                    drop(Box::from_raw(leaked));
+                }
+                ptr = existing;
+            }
+        }
+    }
+    if ptr.is_null() {
+        return None;
+    }
+    match unsafe { &*ptr } {
+        CpuItemAtlasState::Missing => None,
+        CpuItemAtlasState::Loaded(atlas) => Some(atlas),
+    }
+}
+
+pub fn reload_cpu_item_atlas_cache() {
+    let loaded_state = Box::new(match load_cpu_item_atlas() {
+        Some(atlas) => CpuItemAtlasState::Loaded(atlas),
+        None => CpuItemAtlasState::Missing,
+    });
+    let leaked = Box::into_raw(loaded_state);
+    cpu_item_atlas_state_ptr().store(leaked, Ordering::Release);
 }
 
 fn load_cpu_item_atlas() -> Option<CpuItemAtlas> {
@@ -4061,9 +4258,9 @@ fn emit_dropped_item_prism(
     item_tile_index: u32,
 ) {
     // Thin cuboid so item drops still look like items, but with visible depth.
-    let half_x = 0.18f32;
-    let half_y = 0.20f32;
-    let half_z = 0.055f32;
+    let half_x = 0.27f32;
+    let half_y = 0.27f32;
+    let half_z = 0.030f32;
     let rot = Mat3::from_rotation_y(item.spin_y) * Mat3::from_rotation_z(item.tilt_z);
     let to_world = |p: Vec3| -> [f32; 3] { (rot * p + item.position).to_array() };
 
@@ -4091,7 +4288,8 @@ fn emit_dropped_item_prism(
         1,
         [1.0, 1.0, 1.0, 1.0],
     );
-    let mirrored_side_rotation = if item.block_id == ITEM_APPLE { 2 } else { 0 };
+    // Keep the back side upright for all non-block items.
+    let mirrored_side_rotation = 2;
     emit_dropped_item_face_mirror_y(
         vertices,
         indices,
