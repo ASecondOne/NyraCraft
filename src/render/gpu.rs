@@ -1,9 +1,9 @@
 use crate::app::menu::{PauseMenuButton, compute_pause_menu_layout, hit_test_pause_menu_button};
 use crate::player::Camera;
 use crate::player::inventory::{
-    CRAFT_GRID_SIDE, CRAFT_GRID_SLOTS, INVENTORY_STORAGE_SLOTS, InventorySlotRef, ItemStack,
-    compute_inventory_layout, craft_input_slot_rect, craft_output_slot_rect, hotbar_slot_rect,
-    storage_slot_rect,
+    CRAFT_GRID_SIDE, CRAFT_GRID_SLOTS, HOTBAR_SLOTS, INVENTORY_STORAGE_SLOTS, InventorySlotRef,
+    ItemStack, compute_inventory_layout, craft_input_slot_rect, craft_output_slot_rect,
+    hotbar_slot_rect, storage_slot_rect,
 };
 use crate::render::CubeStyle;
 use crate::render::atlas::TextureAtlas;
@@ -12,13 +12,12 @@ use crate::render::texture::{
     AtlasTexture, create_dummy_texture, load_atlas_texture, load_grass_colormap_texture,
 };
 use crate::world::blocks::{
-    BLOCK_CRAFTING_TABLE, BLOCK_DIRT, BLOCK_GRASS, BLOCK_GRAVEL, BLOCK_LEAVES, BLOCK_LOG,
-    BLOCK_PLANKS_OAK, BLOCK_SAND, BLOCK_STONE, DESTROY_STAGE_COUNT, DESTROY_STAGE_TILE_START,
-    HOTBAR_SLOTS, ITEM_APPLE, ITEM_STICK, block_count, block_texture_by_id, item_icon_tile_index,
-    item_max_durability, item_max_stack_size, placeable_block_id_for_item,
+    DESTROY_STAGE_COUNT, DESTROY_STAGE_TILE_START, block_count, block_texture_by_id,
+    core_block_ids, core_item_ids, item_icon_tile_index, item_max_durability, item_name_by_id,
+    placeable_block_id_for_item,
 };
 use bytemuck::{Pod, Zeroable};
-use glam::{IVec3, Mat3, Mat4, Vec2, Vec3};
+use glam::{IVec3, Mat3, Mat4, Vec3};
 use self_cell::self_cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -1099,7 +1098,7 @@ impl Gpu {
         draw_world: bool,
         debug_faces: bool,
         debug_chunks: bool,
-        _draw_radius: i32,
+        draw_radius: i32,
         selected_hotbar_slot: u8,
         hotbar_slots: &[Option<ItemStack>; HOTBAR_SLOT_COUNT],
         inventory_open: bool,
@@ -1125,7 +1124,7 @@ impl Gpu {
     ) {
         self.cell.with_dependent_mut(|_, gpu| {
             apply_pending_uploads(gpu, 8);
-            let mvp = build_mvp(gpu.config.width, gpu.config.height, camera);
+            let mvp = build_mvp(gpu.config.width, gpu.config.height, camera, draw_radius);
             let day_cycle = sample_day_cycle(elapsed_seconds);
             let sun_dir = sun_direction(day_cycle.day_progress, day_cycle.sun_height);
             let sun_strength = day_cycle.daylight.clamp(0.0, 1.0);
@@ -1630,6 +1629,8 @@ impl Gpu {
         self.cell.with_dependent_mut(|_, gpu| {
             let draw_radius = draw_radius as f32 * crate::world::CHUNK_SIZE as f32;
             let draw_radius_sq = draw_radius * draw_radius;
+            let horizon_cutoff = draw_radius * 0.35;
+            let horizon_cutoff_sq = horizon_cutoff * horizon_cutoff;
             let camera_forward = if camera.forward.length_squared() > 1.0e-8 {
                 camera.forward.normalize()
             } else {
@@ -1639,13 +1640,14 @@ impl Gpu {
             gpu.visible_supers.reserve(gpu.super_chunks.len());
             for (coord, chunk) in &gpu.super_chunks {
                 let to_center = chunk.center - camera.position;
-                if to_center.length_squared() > draw_radius_sq {
+                let dist_sq = to_center.length_squared();
+                if dist_sq > draw_radius_sq {
                     continue;
                 }
 
                 // Cheap horizon/underground cull for far terrain columns.
-                let horiz_dist = Vec2::new(to_center.x, to_center.z).length();
-                if horiz_dist > draw_radius * 0.35 && to_center.y < -(chunk.radius * 1.8) {
+                let horiz_dist_sq = to_center.x * to_center.x + to_center.z * to_center.z;
+                if horiz_dist_sq > horizon_cutoff_sq && to_center.y < -(chunk.radius * 1.8) {
                     continue;
                 }
 
@@ -1658,9 +1660,19 @@ impl Gpu {
     }
 }
 
-fn build_mvp(width: u32, height: u32, camera: &Camera) -> Mat4 {
+fn build_mvp(width: u32, height: u32, camera: &Camera, draw_radius_chunks: i32) -> Mat4 {
     let aspect = width as f32 / height as f32;
-    let proj = Mat4::perspective_rh_gl(45f32.to_radians(), aspect, 0.1, 6000.0);
+    let draw_radius_world =
+        (draw_radius_chunks.max(8) as f32 * crate::world::CHUNK_SIZE as f32).max(128.0);
+    let near = if draw_radius_world > 1800.0 {
+        0.12
+    } else {
+        0.08
+    };
+    let far = (draw_radius_world + crate::world::CHUNK_SIZE as f32 * 8.0)
+        .max(1200.0)
+        .min(3600.0);
+    let proj = Mat4::perspective_rh_gl(45f32.to_radians(), aspect, near, far);
     let view = camera.view_matrix();
     let model = Mat4::IDENTITY;
     proj * view * model
@@ -1740,11 +1752,10 @@ fn rebuild_superchunk(gpu: &mut GpuInner, coord: IVec3) {
                 if chunk_vertex_len == 0 || chunk.indices.is_empty() {
                     continue;
                 }
-                let vertex_capacity = next_pow2_u32(chunk_vertex_len.max(1) as u32);
-                let mut index_capacity = next_pow2_u32(chunk.indices.len().max(3) as u32);
-                if !index_capacity.is_multiple_of(3) {
-                    index_capacity += 3 - (index_capacity % 3);
-                }
+                let required_vertex_count = chunk_vertex_len.max(1) as u32;
+                let required_index_count = chunk.indices.len().max(3) as u32;
+                let vertex_capacity = super_slot_vertex_capacity(required_vertex_count);
+                let index_capacity = super_slot_index_capacity(required_index_count);
                 match &chunk.vertices {
                     ChunkVertices::Raw(raw) => {
                         let slot = ChunkSlot {
@@ -2205,53 +2216,29 @@ fn build_inventory_ui_vertices(
                 item_tiles_x,
                 item_tile_uv_size,
             );
-            push_stack_meter(
-                &mut vertices,
-                width_f,
-                height_f,
-                rect,
-                stack.block_id,
-                stack.count,
-            );
-            if stack.count > 1 {
-                let count_text = stack.count.to_string();
-                let pixel = (rect.w * 0.06).clamp(1.0, 2.4);
-                let text_w = text_width_3x5(&count_text, pixel);
-                let text_x = rect.x + rect.w - text_w - pixel * 1.3;
-                let text_y = rect.y + rect.h - pixel * 6.0;
-                push_text_3x5_shadow(
-                    &mut vertices,
-                    width_f,
-                    height_f,
-                    text_x,
-                    text_y,
-                    pixel,
-                    &count_text,
-                    [0.96, 0.96, 0.96, 0.95],
-                );
-            }
+            push_item_stack_overlay(&mut vertices, width_f, height_f, rect, stack);
         }
     }
 
     if let Some(selected_stack) = hotbar_slots.get(selected).copied().flatten() {
-        if let Some(max_durability) = item_max_durability(selected_stack.block_id) {
-            let cur_durability = selected_stack.durability.max(1).min(max_durability.max(1));
-            let text = format!("{}/{}", cur_durability, max_durability.max(1));
-            let pixel = (layout.slot * 0.072).clamp(1.2, 2.8);
-            let text_w = text_width_3x5(&text, pixel);
-            let text_x = (width_f - text_w) * 0.5;
-            let text_y = (layout.hotbar_y - pixel * 7.0).max(4.0);
-            push_text_3x5_shadow(
-                &mut vertices,
-                width_f,
-                height_f,
-                text_x,
-                text_y,
-                pixel,
-                &text,
-                [0.90, 0.94, 0.98, 0.96],
-            );
-        }
+        let raw_name = item_name_by_id(selected_stack.block_id);
+        let item_name = raw_name.replace('_', " ");
+        let pixel = (layout.slot * 0.072).clamp(1.2, 2.8);
+        let max_chars = (((width_f * 0.82) / (pixel * 4.0)).floor() as usize).max(1);
+        let text = clipped_text(&item_name, max_chars);
+        let text_w = text_width_3x5(&text, pixel);
+        let text_x = (width_f - text_w) * 0.5;
+        let text_y = (layout.hotbar_y - pixel * 7.0).max(4.0);
+        push_text_3x5_shadow(
+            &mut vertices,
+            width_f,
+            height_f,
+            text_x,
+            text_y,
+            pixel,
+            &text,
+            [0.90, 0.94, 0.98, 0.96],
+        );
     }
 
     if !inventory_open {
@@ -2301,14 +2288,7 @@ fn build_inventory_ui_vertices(
                     item_tiles_x,
                     item_tile_uv_size,
                 );
-                push_stack_meter(
-                    &mut vertices,
-                    width_f,
-                    height_f,
-                    rect,
-                    stack.block_id,
-                    stack.count,
-                );
+                push_item_stack_overlay(&mut vertices, width_f, height_f, rect, stack);
             }
         }
 
@@ -2341,14 +2321,7 @@ fn build_inventory_ui_vertices(
                 item_tiles_x,
                 item_tile_uv_size,
             );
-            push_stack_meter(
-                &mut vertices,
-                width_f,
-                height_f,
-                output_rect,
-                stack.block_id,
-                stack.count,
-            );
+            push_item_stack_overlay(&mut vertices, width_f, height_f, output_rect, stack);
         }
 
         let grid_right = layout.craft_input_start_x
@@ -2420,14 +2393,7 @@ fn build_inventory_ui_vertices(
                     item_tiles_x,
                     item_tile_uv_size,
                 );
-                push_stack_meter(
-                    &mut vertices,
-                    width_f,
-                    height_f,
-                    rect,
-                    stack.block_id,
-                    stack.count,
-                );
+                push_item_stack_overlay(&mut vertices, width_f, height_f, rect, stack);
             }
         }
 
@@ -3045,25 +3011,83 @@ fn push_slot_box(
     }
 }
 
-fn push_stack_meter(
+fn push_item_stack_overlay(
     out: &mut Vec<UiVertex>,
     width: f32,
     height: f32,
     rect: crate::player::inventory::UiRect,
-    item_id: i8,
+    stack: ItemStack,
+) {
+    if stack.count == 0 {
+        return;
+    }
+    if let Some(max_durability) = item_max_durability(stack.block_id) {
+        push_durability_meter(
+            out,
+            width,
+            height,
+            rect,
+            stack.durability,
+            max_durability.max(1),
+        );
+    } else {
+        push_stack_count_text(out, width, height, rect, stack.count);
+    }
+}
+
+fn push_stack_count_text(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    rect: crate::player::inventory::UiRect,
     count: u8,
 ) {
     if count == 0 {
         return;
     }
+    let count_text = count.to_string();
+    let pixel = (rect.w * 0.06).clamp(1.0, 2.4);
+    let text_w = text_width_3x5(&count_text, pixel);
+    let text_x = rect.x + rect.w - text_w - pixel * 1.3;
+    let text_y = rect.y + rect.h - pixel * 6.0;
+    push_text_3x5_shadow(
+        out,
+        width,
+        height,
+        text_x,
+        text_y,
+        pixel,
+        &count_text,
+        [0.96, 0.96, 0.96, 0.95],
+    );
+}
+
+fn push_durability_meter(
+    out: &mut Vec<UiVertex>,
+    width: f32,
+    height: f32,
+    rect: crate::player::inventory::UiRect,
+    durability: u16,
+    max_durability: u16,
+) {
+    if max_durability == 0 {
+        return;
+    }
+    let cur = durability.max(1).min(max_durability);
     let bar_margin = (rect.w * 0.12).clamp(2.0, 6.0);
     let bar_h = (rect.h * 0.09).clamp(2.0, 5.0);
     let bar_w = (rect.w - bar_margin * 2.0).max(2.0);
     let bar_x = rect.x + bar_margin;
     let bar_y = rect.y + rect.h - bar_h - (rect.h * 0.08).clamp(1.0, 4.0);
-    let max_count = item_max_stack_size(item_id).max(1);
-    let fill_ratio = (count as f32 / max_count as f32).clamp(0.0, 1.0);
+    let fill_ratio = (cur as f32 / max_durability as f32).clamp(0.0, 1.0);
     let fill_w = (bar_w * fill_ratio).max(1.0);
+    let fill_color = if fill_ratio > 0.66 {
+        [0.30, 0.86, 0.36, 0.95]
+    } else if fill_ratio > 0.33 {
+        [0.88, 0.76, 0.28, 0.95]
+    } else {
+        [0.86, 0.28, 0.28, 0.95]
+    };
 
     push_ui_rect(
         out,
@@ -3075,16 +3099,7 @@ fn push_stack_meter(
         bar_h,
         [0.04, 0.04, 0.04, 0.92],
     );
-    push_ui_rect(
-        out,
-        width,
-        height,
-        bar_x,
-        bar_y,
-        fill_w,
-        bar_h,
-        [0.80, 0.88, 0.36, 0.95],
-    );
+    push_ui_rect(out, width, height, bar_x, bar_y, fill_w, bar_h, fill_color);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3300,7 +3315,12 @@ fn face_uvs_p0123_with_rotation(
         [uv_min[0] + r[0] * uv_w, uv_min[1] + r[1] * uv_h]
     };
     // Match world-mesh face vertex UVs: p0,p1,p2,p3 -> (0,1),(1,1),(1,0),(0,0)
-    [map([0.0, 1.0]), map([1.0, 1.0]), map([1.0, 0.0]), map([0.0, 0.0])]
+    [
+        map([0.0, 1.0]),
+        map([1.0, 1.0]),
+        map([1.0, 0.0]),
+        map([0.0, 0.0]),
+    ]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3674,61 +3694,52 @@ fn push_block_icon(
 }
 
 fn block_icon_colors(block_id: i8) -> ([f32; 4], [f32; 4], [f32; 4]) {
+    let ids = core_block_ids();
     match block_id {
-        x if x == BLOCK_STONE as i8 => (
+        x if x == ids.stone => (
             [0.76, 0.76, 0.76, 1.0],
             [0.56, 0.56, 0.56, 1.0],
             [0.46, 0.46, 0.46, 1.0],
         ),
-        x if x == BLOCK_DIRT as i8 => (
+        x if x == ids.dirt => (
             [0.61, 0.45, 0.27, 1.0],
             [0.46, 0.33, 0.20, 1.0],
             [0.37, 0.26, 0.16, 1.0],
         ),
-        x if x == BLOCK_GRASS as i8 => (
+        x if x == ids.grass => (
             [0.45, 0.73, 0.35, 1.0],
             [0.49, 0.38, 0.23, 1.0],
             [0.40, 0.30, 0.19, 1.0],
         ),
-        x if x == BLOCK_LOG as i8 => (
+        x if x == ids.log => (
             [0.72, 0.58, 0.38, 1.0],
             [0.55, 0.40, 0.24, 1.0],
             [0.44, 0.31, 0.18, 1.0],
         ),
-        x if x == BLOCK_LEAVES as i8 => (
+        x if x == ids.leaves => (
             [0.39, 0.63, 0.32, 0.95],
             [0.29, 0.48, 0.24, 0.95],
             [0.23, 0.39, 0.19, 0.95],
         ),
-        x if x == BLOCK_PLANKS_OAK as i8 => (
+        x if x == ids.planks_oak => (
             [0.72, 0.57, 0.36, 1.0],
             [0.54, 0.41, 0.25, 1.0],
             [0.44, 0.33, 0.20, 1.0],
         ),
-        x if x == BLOCK_CRAFTING_TABLE as i8 => (
+        x if x == ids.crafting_table => (
             [0.73, 0.59, 0.40, 1.0],
             [0.55, 0.42, 0.28, 1.0],
             [0.46, 0.34, 0.22, 1.0],
         ),
-        x if x == BLOCK_GRAVEL as i8 => (
+        x if x == ids.gravel => (
             [0.65, 0.65, 0.66, 1.0],
             [0.50, 0.50, 0.51, 1.0],
             [0.40, 0.40, 0.41, 1.0],
         ),
-        x if x == BLOCK_SAND as i8 => (
+        x if x == ids.sand => (
             [0.88, 0.80, 0.57, 1.0],
             [0.69, 0.61, 0.43, 1.0],
             [0.56, 0.49, 0.34, 1.0],
-        ),
-        x if x == ITEM_APPLE => (
-            [0.92, 0.20, 0.18, 1.0],
-            [0.74, 0.13, 0.12, 1.0],
-            [0.58, 0.10, 0.10, 1.0],
-        ),
-        x if x == ITEM_STICK => (
-            [0.76, 0.62, 0.36, 1.0],
-            [0.57, 0.44, 0.24, 1.0],
-            [0.45, 0.33, 0.19, 1.0],
         ),
         _ => (
             [0.7, 0.7, 0.7, 1.0],
@@ -4237,10 +4248,13 @@ fn item_tile_pixel_rgba(tile_index: u32, px: u32, py: u32) -> Option<[u8; 4]> {
 }
 
 fn dropped_item_side_color(item_id: i8) -> [f32; 4] {
-    match item_id {
-        ITEM_APPLE => [0.82, 0.20, 0.18, 1.0],
-        ITEM_STICK => [0.66, 0.50, 0.30, 1.0],
-        _ => [0.70, 0.70, 0.70, 1.0],
+    let ids = core_item_ids();
+    if ids.apple == Some(item_id) {
+        [0.82, 0.20, 0.18, 1.0]
+    } else if ids.stick == Some(item_id) {
+        [0.66, 0.50, 0.30, 1.0]
+    } else {
+        [0.70, 0.70, 0.70, 1.0]
     }
 }
 
@@ -4586,6 +4600,10 @@ fn chunk_visible(
         return true;
     }
     let dist = dist_sq.sqrt();
+    // Keep nearby supers visible even if their center falls outside the view cone.
+    if dist <= chunk.radius * 2.2 {
+        return true;
+    }
     let dir = to_center / dist;
     let dot = camera_forward_normalized.dot(dir);
     if dot <= 0.0 {
@@ -4597,8 +4615,32 @@ fn chunk_visible(
     dot >= (half_fov + margin).cos()
 }
 
-fn next_pow2_u32(v: u32) -> u32 {
-    v.next_power_of_two().max(1)
+fn align_up_u32(value: u32, align: u32) -> u32 {
+    if align <= 1 {
+        return value;
+    }
+    let rem = value % align;
+    if rem == 0 {
+        value
+    } else {
+        value.saturating_add(align - rem)
+    }
+}
+
+fn super_slot_vertex_capacity(required: u32) -> u32 {
+    const MIN_CAPACITY: u32 = 16;
+    const ALIGN: u32 = 16;
+    // Reserve moderate headroom to reduce full superchunk rebuild churn on edits
+    // without doubling geometry like power-of-two rounding.
+    let grown = required.saturating_add(required / 4).saturating_add(4);
+    align_up_u32(grown.max(MIN_CAPACITY), ALIGN)
+}
+
+fn super_slot_index_capacity(required: u32) -> u32 {
+    const MIN_CAPACITY: u32 = 24;
+    const ALIGN: u32 = 24; // keep index capacities aligned to full triangles
+    let grown = required.saturating_add(required / 4).saturating_add(12);
+    align_up_u32(grown.max(MIN_CAPACITY), ALIGN)
 }
 
 fn raw_slot_memory_bytes(slot: &ChunkSlot) -> u64 {

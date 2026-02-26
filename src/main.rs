@@ -1,6 +1,6 @@
 use glam::{IVec3, Vec3};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -35,19 +35,22 @@ use app::dropped_items::{
 };
 use app::logger::{init_logger, install_panic_hook, log_info, log_warn};
 use app::menu::{PauseMenuButton, hit_test_pause_menu_button};
+use app::save::{SaveIo, SavedPlayerState};
 use app::streaming::{
-    CacheMeshView, CacheWriteMsg, DebugPerfSnapshot, EditedChunkRanges, PackedMeshData,
+    ApplyDebugStats, CacheMeshView, CacheWriteMsg, DebugPerfSnapshot, EditedChunkRanges,
+    PackedMeshData,
     SharedRequestQueue, WorkerResult, apply_stream_results, block_id_full_cached,
     build_stats_lines, chunk_coord_from_pos, is_solid_cached, mesh_cache_dir, new_request_queue,
     pick_block, pop_request, request_queue_stats, should_pack_far_lod, stream_tick,
     try_load_cached_mesh, write_cached_mesh,
 };
 use player::crafting::reload_recipes;
-use player::inventory::{InventorySlotRef, InventoryState, hit_test_slot};
+use player::inventory::{HOTBAR_SLOTS, InventorySlotRef, InventoryState, hit_test_slot};
 use player::{
-    Camera, EditedBlocks, LeafDecayQueue, PlayerConfig, PlayerInput, PlayerState,
-    block_id_with_edits, handle_block_mouse_input, new_edited_blocks, new_leaf_decay_queue,
-    tick_leaf_decay, update_player,
+    Camera, EditedBlockEntry, EditedBlocks, LeafDecayQueue, PlayerConfig, PlayerInput,
+    PlayerState, restore_loaded_edit_metadata,
+    block_id_with_edits, break_blocks_batch, handle_block_mouse_input, leaf_decay_stats,
+    new_edited_blocks, new_leaf_decay_queue, tick_leaf_decay, update_player,
 };
 use render::Gpu;
 use render::gpu::reload_cpu_item_atlas_cache;
@@ -55,8 +58,8 @@ use render::mesh::pack_far_vertices;
 use render::{CubeStyle, TextureAtlas};
 use world::CHUNK_SIZE;
 use world::blocks::{
-    BLOCK_CRAFTING_TABLE, BLOCK_LEAVES, DEFAULT_TILES_X, HOTBAR_SLOTS, block_break_stage,
-    block_break_time_with_item_seconds, build_block_index, default_blocks, reload_registry,
+    DEFAULT_TILES_X, block_break_stage, block_break_time_with_item_seconds, build_block_index,
+    core_block_ids, default_blocks, reload_registry,
 };
 use world::mesher::generate_chunk_mesh;
 use world::worldgen::{TreeSpec, WorldGen};
@@ -66,12 +69,166 @@ type DirtyChunks = Arc<Mutex<HashMap<CoordKey, i64>>>;
 const DIRTY_EDIT_CHUNK_HALO: i32 = 1;
 const HAND_BREAK_STRENGTH: f32 = 1.0;
 const CHAT_HIDE_DELAY: Duration = Duration::from_secs(10);
+const MULTI_BREAK_MAX_BLOCKS: usize = 12;
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(2);
 
 fn ema_ms(previous: f32, sample_ms: f32) -> f32 {
     if previous <= 0.001 {
         sample_ms
     } else {
         previous * 0.82 + sample_ms * 0.18
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LodLogSummary {
+    full: usize,
+    sides: usize,
+    surface: usize,
+    step_min: i32,
+    step_max: i32,
+    step_1: usize,
+    step_2_4: usize,
+    step_5_16: usize,
+    step_17p: usize,
+}
+
+impl Default for LodLogSummary {
+    fn default() -> Self {
+        Self {
+            full: 0,
+            sides: 0,
+            surface: 0,
+            step_min: 0,
+            step_max: 0,
+            step_1: 0,
+            step_2_4: 0,
+            step_5_16: 0,
+            step_17p: 0,
+        }
+    }
+}
+
+fn summarize_lod_map(map: &HashMap<(i32, i32, i32), i32>) -> LodLogSummary {
+    if map.is_empty() {
+        return LodLogSummary::default();
+    }
+    let mut out = LodLogSummary {
+        step_min: i32::MAX,
+        ..LodLogSummary::default()
+    };
+    for &packed in map.values() {
+        let mode = (packed >> 16) & 0xFFFF;
+        let step = (packed & 0xFFFF).max(1);
+        match mode {
+            0 => out.full += 1,
+            1 => out.sides += 1,
+            _ => out.surface += 1,
+        }
+        out.step_min = out.step_min.min(step);
+        out.step_max = out.step_max.max(step);
+        if step <= 1 {
+            out.step_1 += 1;
+        } else if step <= 4 {
+            out.step_2_4 += 1;
+        } else if step <= 16 {
+            out.step_5_16 += 1;
+        } else {
+            out.step_17p += 1;
+        }
+    }
+    if out.step_min == i32::MAX {
+        out.step_min = 0;
+    }
+    out
+}
+
+fn collect_break_targets(
+    world_gen: &WorldGen,
+    edited_blocks: &EditedBlocks,
+    target_block: IVec3,
+    target_id: i8,
+    multi_break: bool,
+) -> Vec<IVec3> {
+    let mut out = vec![target_block];
+    if !multi_break {
+        return out;
+    }
+
+    let mut nearby = Vec::<(i32, IVec3)>::new();
+    for dz in -1..=1 {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    continue;
+                }
+                let candidate = IVec3::new(
+                    target_block.x + dx,
+                    target_block.y + dy,
+                    target_block.z + dz,
+                );
+                let id = block_id_with_edits(
+                    world_gen,
+                    edited_blocks,
+                    candidate.x,
+                    candidate.y,
+                    candidate.z,
+                );
+                if id != target_id {
+                    continue;
+                }
+                let dist_sq = dx * dx + dy * dy + dz * dz;
+                nearby.push((dist_sq, candidate));
+            }
+        }
+    }
+    nearby.sort_by_key(|entry| entry.0);
+    for (_, candidate) in nearby
+        .into_iter()
+        .take(MULTI_BREAK_MAX_BLOCKS.saturating_sub(1))
+    {
+        out.push(candidate);
+    }
+    out
+}
+
+fn current_saved_player_state(
+    player: &PlayerState,
+    camera: &Camera,
+    selected_hotbar_slot: u8,
+    fly_mode: bool,
+) -> SavedPlayerState {
+    SavedPlayerState {
+        position: player.position.to_array(),
+        velocity: player.velocity.to_array(),
+        grounded: player.grounded,
+        camera_forward: camera.forward.to_array(),
+        camera_up: camera.up.to_array(),
+        selected_hotbar_slot,
+        fly_mode,
+    }
+}
+
+fn save_runtime_state(
+    save_io: &SaveIo,
+    player: &PlayerState,
+    camera: &Camera,
+    selected_hotbar_slot: u8,
+    fly_mode: bool,
+    inventory: &InventoryState,
+    edited_blocks: &EditedBlocks,
+    include_edits: bool,
+) -> std::io::Result<usize> {
+    let player_state = current_saved_player_state(player, camera, selected_hotbar_slot, fly_mode);
+    save_io.save_player(&player_state)?;
+    save_io.save_inventory(&inventory.snapshot())?;
+    if include_edits {
+        let edits = edited_blocks.read().unwrap().snapshot_entries();
+        let count = edits.len();
+        save_io.save_edited_blocks(&edits)?;
+        Ok(count)
+    } else {
+        Ok(0)
     }
 }
 
@@ -106,6 +263,7 @@ fn main() {
 
     let tiles_x = DEFAULT_TILES_X;
     let runtime_blocks = Arc::new(RwLock::new(default_blocks(tiles_x)));
+    let mut core_ids = core_block_ids();
     let content_reload_epoch = Arc::new(AtomicU64::new(1));
     let block_index = build_block_index(tiles_x);
     if cfg!(debug_assertions) {
@@ -142,6 +300,26 @@ fn main() {
     let leaf_decay_queue: LeafDecayQueue = new_leaf_decay_queue();
     let dirty_chunks: DirtyChunks = Arc::new(Mutex::new(HashMap::new()));
     let edited_chunk_ranges: EditedChunkRanges = Arc::new(Mutex::new(HashMap::new()));
+    let save_io = SaveIo::new(&world_gen);
+    let loaded_save = save_io.load();
+    for warning in &loaded_save.warnings {
+        log_warn(format!("save-load: {warning}"));
+    }
+    let loaded_player_state = loaded_save.player;
+    let loaded_inventory_snapshot = loaded_save.inventory;
+    let loaded_edited_entries: Vec<EditedBlockEntry> = loaded_save.edited_blocks;
+    if !loaded_edited_entries.is_empty() {
+        edited_blocks
+            .write()
+            .unwrap()
+            .replace_entries(&loaded_edited_entries);
+        let (edit_count, dirty_chunk_count) =
+            restore_loaded_edit_metadata(&edited_blocks, &edited_chunk_ranges, &dirty_chunks);
+        log_info(format!(
+            "save-load: restored {edit_count} edited blocks across {dirty_chunk_count} chunks from {}",
+            save_io.save_dir().display()
+        ));
+    }
 
     let mut gpu = Gpu::new(window, style, Some(atlas));
     let gpu_label = gpu.adapter_summary();
@@ -222,6 +400,32 @@ fn main() {
     let mut force_reload = false;
     let mut selected_hotbar_slot: u8 = 0;
     let mut inventory = InventoryState::new();
+    if let Some(saved_player) = loaded_player_state {
+        player.position = Vec3::from_array(saved_player.position);
+        player.velocity = Vec3::from_array(saved_player.velocity);
+        player.grounded = saved_player.grounded;
+        camera.forward = Vec3::from_array(saved_player.camera_forward).normalize_or_zero();
+        if camera.forward.length_squared() == 0.0 {
+            camera.forward = Vec3::new(0.0, 0.0, -1.0);
+        }
+        camera.up = Vec3::from_array(saved_player.camera_up).normalize_or_zero();
+        if camera.up.length_squared() == 0.0 {
+            camera.up = Vec3::Y;
+        }
+        selected_hotbar_slot = saved_player
+            .selected_hotbar_slot
+            .min((HOTBAR_SLOTS.saturating_sub(1)) as u8);
+        fly_mode = saved_player.fly_mode;
+        let restored_forward = camera.forward.normalize();
+        yaw = restored_forward.z.atan2(restored_forward.x);
+        pitch = restored_forward.y.asin();
+        log_info("save-load: restored player state");
+    }
+    if let Some(snapshot) = loaded_inventory_snapshot.as_ref() {
+        inventory.apply_snapshot(snapshot);
+        log_info("save-load: restored inventory");
+    }
+    camera.position = player.position + Vec3::new(0.0, player_config.eye_height, 0.0);
     let mut dropped_items: Vec<DroppedItem> = Vec::new();
     let mut command_console = CommandConsoleState::default();
     let keybind_overlay_lines = keybind_lines();
@@ -229,6 +433,8 @@ fn main() {
     let mut stats_overlay_lines: Vec<String> = Vec::new();
     let mut chat_visible_until = Instant::now();
     let mut last_runtime_log = Instant::now();
+    let mut last_autosave = Instant::now();
+    let mut edits_save_dirty = false;
     let mut ui_cursor_pos: Option<(f32, f32)> = None;
     let mut f1_down = false;
     let mut f1_combo_used = false;
@@ -356,9 +562,8 @@ fn main() {
                         && !has_overrides
                         && let Some(cached) = try_load_cached_mesh(&cache_dir, coord, step, mode)
                     {
-                        let _ = tx_res.send(cached.into_worker_result(
-                            coord, step, mode, task_epoch,
-                        ));
+                        let _ =
+                            tx_res.send(cached.into_worker_result(coord, step, mode, task_epoch));
                         continue;
                     }
 
@@ -436,17 +641,17 @@ fn main() {
             });
     }
 
-    let base_render_radius = 512;
-    let max_render_radius = 1024;
-    let base_draw_radius = 192;
+    let base_render_radius = 384;
+    let max_render_radius = 768;
+    let base_draw_radius = 160;
     let lod_near_radius = 16;
     let lod_mid_radius = 32;
     let request_budget = 56;
     let max_inflight = 384usize;
     let surface_depth_chunks = 4;
     let initial_burst_radius = 2;
-    let loaded_chunk_cap = 100000usize; // important
-    let mesh_memory_cap_mb = 12288usize; // 12 GB cap
+    let loaded_chunk_cap = 36000usize; // trim residency so render doesn't drown in far chunks
+    let mesh_memory_cap_mb = 3072usize; // 3 GB cap
     let mut current_chunk = chunk_coord_from_pos(player.position);
     let pregen_center_chunk = current_chunk;
     let requested_pregen_span_chunks = 1000;
@@ -478,6 +683,7 @@ fn main() {
     let mut pregen_chunks_created: usize = 0;
     let mut loaded: HashMap<(i32, i32, i32), i32> = HashMap::new();
     let mut requested: HashMap<(i32, i32, i32), i32> = HashMap::new();
+    let mut deferred_apply_results: VecDeque<WorkerResult> = VecDeque::new();
     let mut column_height_cache: HashMap<(i32, i32), i32> = HashMap::new();
     let mut ring_r: i32 = 0;
     let mut ring_i: i32 = 0;
@@ -487,7 +693,7 @@ fn main() {
     let mut looked_hit: Option<(IVec3, i8, IVec3)> = None;
     let mut adaptive_request_budget = request_budget;
     let mut adaptive_pregen_budget = pregen_budget_per_tick;
-    let mut adaptive_max_apply_per_tick: usize = 10;
+    let mut adaptive_max_apply_per_tick: usize = 12;
     let mut adaptive_max_rebuilds_per_tick: usize = 2;
     let mut adaptive_draw_radius_cap = base_draw_radius;
     let mut last_camera_pos = camera.position;
@@ -532,6 +738,12 @@ fn main() {
                     &mut player_config,
                     &is_solid,
                 );
+                perf.player_ms = ema_ms(
+                    perf.player_ms,
+                    player_phase_start.elapsed().as_secs_f32() * 1000.0,
+                );
+
+                let dropped_phase_start = Instant::now();
                 update_dropped_items(
                     &mut dropped_items,
                     dt,
@@ -541,19 +753,24 @@ fn main() {
                     &edited_blocks,
                     &mut inventory,
                 );
-                perf.player_ms = ema_ms(
-                    perf.player_ms,
-                    player_phase_start.elapsed().as_secs_f32() * 1000.0,
+                perf.dropped_ms = ema_ms(
+                    perf.dropped_ms,
+                    dropped_phase_start.elapsed().as_secs_f32() * 1000.0,
                 );
 
                 tick_accum = tick_accum.saturating_add(Duration::from_secs_f32(dt));
                 let mut stream_ms_accum = 0.0f32;
                 let mut stream_calls = 0u32;
+                let mut leaf_decay_ms_accum = 0.0f32;
+                let mut leaf_decay_calls = 0u32;
+                let mut visibility_ms_accum = 0.0f32;
+                let mut visibility_calls = 0u32;
                 while tick_accum >= tick_dt {
                     tick_accum -= tick_dt;
                     if pause_stream {
                         continue;
                     }
+                    let leaf_decay_phase_start = Instant::now();
                     if let Some(decayed_leaf) = tick_leaf_decay(
                         &world_gen,
                         &edited_blocks,
@@ -562,13 +779,20 @@ fn main() {
                         &dirty_chunks,
                         &request_queue,
                     ) {
-                        spawn_block_drop(&mut dropped_items, decayed_leaf, BLOCK_LEAVES as i8);
+                        spawn_block_drop(&mut dropped_items, decayed_leaf, core_ids.leaves);
+                        edits_save_dirty = true;
                     }
+                    leaf_decay_ms_accum +=
+                        leaf_decay_phase_start.elapsed().as_secs_f32() * 1000.0;
+                    leaf_decay_calls += 1;
                     let height_chunks = (player.position.y / CHUNK_SIZE as f32).max(0.0) as i32;
                     let render_radius =
                         (base_render_radius + height_chunks * 2).min(max_render_radius);
                     let draw_radius_base = (base_draw_radius + height_chunks).min(render_radius);
                     let draw_radius = draw_radius_base.min(adaptive_draw_radius_cap.max(16));
+                    if force_reload {
+                        deferred_apply_results.clear();
+                    }
                     let stream_phase_start = Instant::now();
                     stream_tick(
                         &mut gpu,
@@ -613,14 +837,18 @@ fn main() {
                     );
                     stream_ms_accum += stream_phase_start.elapsed().as_secs_f32() * 1000.0;
                     stream_calls += 1;
-                    let camera_changed = (camera.position - last_camera_pos).length_squared() > 0.0009
-                        || camera.forward.dot(last_camera_forward) < 0.9998;
+                    let camera_changed = (camera.position - last_camera_pos).length_squared() > 0.16
+                        || camera.forward.dot(last_camera_forward) < 0.9992;
                     let visibility_refresh_due =
-                        last_visibility_refresh.elapsed() >= Duration::from_millis(120);
-                    if camera_changed
-                        || ((!requested.is_empty() || pregen_active) && visibility_refresh_due)
+                        last_visibility_refresh.elapsed() >= Duration::from_millis(66);
+                    if visibility_refresh_due
+                        && (camera_changed || !requested.is_empty() || pregen_active)
                     {
+                        let visibility_phase_start = Instant::now();
                         gpu.update_visible(&camera, draw_radius);
+                        visibility_ms_accum +=
+                            visibility_phase_start.elapsed().as_secs_f32() * 1000.0;
+                        visibility_calls += 1;
                         last_camera_pos = camera.position;
                         last_camera_forward = camera.forward;
                         last_visibility_refresh = Instant::now();
@@ -634,6 +862,16 @@ fn main() {
                 }
                 if stream_calls > 0 {
                     perf.stream_ms = ema_ms(perf.stream_ms, stream_ms_accum / stream_calls as f32);
+                }
+                if leaf_decay_calls > 0 {
+                    perf.leaf_decay_ms =
+                        ema_ms(perf.leaf_decay_ms, leaf_decay_ms_accum / leaf_decay_calls as f32);
+                }
+                if visibility_calls > 0 {
+                    perf.visibility_ms = ema_ms(
+                        perf.visibility_ms,
+                        visibility_ms_accum / visibility_calls as f32,
+                    );
                 }
 
                 let active_break_strength = inventory
@@ -670,33 +908,40 @@ fn main() {
                                 let stage = block_break_stage(mining_progress, break_time);
                                 mining_overlay = Some((target_block, stage));
                                 if mining_progress >= break_time {
-                                    let edit_result = handle_block_mouse_input(
-                                        MouseButton::Left,
-                                        looked_hit,
+                                    let break_targets = collect_break_targets(
+                                        &world_gen,
+                                        &edited_blocks,
+                                        target_block,
+                                        current_target_id,
+                                        input.sneak && !input.fly_mode,
+                                    );
+                                    let edit_result = break_blocks_batch(
+                                        &break_targets,
                                         &world_gen,
                                         &edited_blocks,
                                         &leaf_decay_queue,
                                         &edited_chunk_ranges,
                                         &dirty_chunks,
                                         &request_queue,
-                                        player.position,
-                                        player_config.height,
-                                        player_config.radius,
-                                        inventory.selected_hotbar_block(selected_hotbar_slot),
                                     );
-                                    if let Some((broken_pos, broken_id)) = edit_result.broke {
-                                        spawn_block_drop(&mut dropped_items, broken_pos, broken_id);
-                                        let _ = inventory.apply_selected_hotbar_durability_loss(
-                                            selected_hotbar_slot,
-                                            1,
-                                        );
+
+                                    if !edit_result.broke.is_empty() {
+                                        edits_save_dirty = true;
+                                        for (broken_pos, broken_id) in edit_result.broke.iter().copied() {
+                                            spawn_block_drop(&mut dropped_items, broken_pos, broken_id);
+                                            let _ = inventory.apply_selected_hotbar_durability_loss(
+                                                selected_hotbar_slot,
+                                                1,
+                                            );
+                                        }
                                         mining_target = None;
                                         mining_progress = 0.0;
                                         mining_overlay = None;
                                         if !pause_stream {
-                                            apply_stream_results(
+                                            let _ = apply_stream_results(
                                                 &mut gpu,
                                                 &rx_res,
+                                                &mut deferred_apply_results,
                                                 content_reload_epoch.load(Ordering::Acquire),
                                                 &dirty_chunks,
                                                 1,
@@ -710,8 +955,8 @@ fn main() {
                                                 &mut pregen_chunks_created,
                                                 loaded_chunk_cap,
                                                 mesh_memory_cap_mb,
-                                                20,
-                                                adaptive_max_rebuilds_per_tick.max(3),
+                                                32,
+                                                adaptive_max_rebuilds_per_tick.max(5),
                                                 true,
                                             );
                                         }
@@ -742,6 +987,7 @@ fn main() {
                     mining_phase_start.elapsed().as_secs_f32() * 1000.0,
                 );
 
+                let mut apply_debug_tick = ApplyDebugStats::default();
                 let (dirty_pending_debug, apply_budget_debug, rebuild_budget_debug) =
                     if !pause_stream {
                         let dirty_pending = dirty_chunks
@@ -752,11 +998,11 @@ fn main() {
                             .count();
                         let apply_budget = if dirty_pending > 0 {
                             let burst_floor = if dirty_pending > 48 {
-                                16
+                                24
                             } else if dirty_pending > 12 {
-                                12
+                                18
                             } else {
-                                8
+                                12
                             };
                             adaptive_max_apply_per_tick.max(burst_floor)
                         } else if !requested.is_empty() {
@@ -771,9 +1017,10 @@ fn main() {
                             adaptive_max_rebuilds_per_tick.max(1)
                         };
                         let apply_phase_start = Instant::now();
-                        apply_stream_results(
+                        apply_debug_tick = apply_stream_results(
                             &mut gpu,
                             &rx_res,
+                            &mut deferred_apply_results,
                             content_reload_epoch.load(Ordering::Acquire),
                             &dirty_chunks,
                             dirty_pending,
@@ -817,22 +1064,22 @@ fn main() {
                     tps_ticks = 0;
                     tps_last = Instant::now();
 
-                    if tps_value < 18 || fps_value < 35 {
+                    if tps_value < 18 || fps_value < 45 {
                         adaptive_request_budget = (adaptive_request_budget * 82 / 100).max(28);
                         adaptive_pregen_budget = (adaptive_pregen_budget * 75 / 100).max(8);
                         adaptive_max_apply_per_tick =
-                            adaptive_max_apply_per_tick.saturating_sub(2).max(4);
+                            adaptive_max_apply_per_tick.saturating_sub(2).max(6);
                         adaptive_max_rebuilds_per_tick = adaptive_max_rebuilds_per_tick.saturating_sub(1).max(1);
-                        adaptive_draw_radius_cap = (adaptive_draw_radius_cap - 6).max(24);
-                    } else if tps_value >= 20 && fps_value > 60 {
+                        adaptive_draw_radius_cap = (adaptive_draw_radius_cap - 8).max(24);
+                    } else if tps_value >= 20 && fps_value > 72 {
                         adaptive_request_budget = (adaptive_request_budget + 6).min(request_budget);
                         adaptive_pregen_budget =
                             (adaptive_pregen_budget + 4).min(pregen_budget_per_tick);
-                        adaptive_max_apply_per_tick = (adaptive_max_apply_per_tick + 1).min(14);
+                        adaptive_max_apply_per_tick = (adaptive_max_apply_per_tick + 2).min(20);
                         adaptive_max_rebuilds_per_tick =
                             (adaptive_max_rebuilds_per_tick + 1).min(3);
                         adaptive_draw_radius_cap =
-                            (adaptive_draw_radius_cap + 2).min(base_draw_radius + 24);
+                            (adaptive_draw_radius_cap + 2).min(base_draw_radius + 16);
                     }
                 }
 
@@ -886,28 +1133,150 @@ fn main() {
                     stats_overlay_lines.clear();
                 }
 
-                if last_runtime_log.elapsed() >= Duration::from_secs(5) {
+                if last_runtime_log.elapsed() >= Duration::from_secs(1) {
                     let req_stats = request_queue_stats(&request_queue);
+                    let gpu_stats = gpu.stats();
+                    let leaf_stats = leaf_decay_stats(&leaf_decay_queue);
+                    let loaded_lod = summarize_lod_map(&loaded);
+                    let requested_lod = summarize_lod_map(&requested);
+                    let tick_ms = perf.tick_cpu_ms.max(0.0001);
+                    let mut bottleneck_label = "render";
+                    let mut bottleneck_ms = perf.render_cpu_ms;
+                    for (label, ms) in [
+                        ("stream", perf.stream_ms),
+                        ("apply", perf.apply_ms),
+                        ("player", perf.player_ms),
+                        ("drops", perf.dropped_ms),
+                        ("leaf", perf.leaf_decay_ms),
+                        ("vis", perf.visibility_ms),
+                        ("mining", perf.mining_ms),
+                        ("other", perf.untracked_ms),
+                    ] {
+                        if ms > bottleneck_ms {
+                            bottleneck_label = label;
+                            bottleneck_ms = ms;
+                        }
+                    }
+                    let render_pct = (perf.render_cpu_ms / tick_ms * 100.0).max(0.0);
+                    let stream_pct = (perf.stream_ms / tick_ms * 100.0).max(0.0);
+                    let apply_pct = (perf.apply_ms / tick_ms * 100.0).max(0.0);
+                    let player_pct = (perf.player_ms / tick_ms * 100.0).max(0.0);
+                    let dropped_pct = (perf.dropped_ms / tick_ms * 100.0).max(0.0);
+                    let leaf_pct = (perf.leaf_decay_ms / tick_ms * 100.0).max(0.0);
+                    let visibility_pct = (perf.visibility_ms / tick_ms * 100.0).max(0.0);
+                    let mining_pct = (perf.mining_ms / tick_ms * 100.0).max(0.0);
+                    let other_pct = (perf.untracked_ms / tick_ms * 100.0).max(0.0);
+                    let bottleneck_pct = (bottleneck_ms / tick_ms * 100.0).max(0.0);
+                    let render_ms = perf.render_cpu_ms;
+                    let stream_ms = perf.stream_ms;
+                    let apply_ms = perf.apply_ms;
+                    let player_ms = perf.player_ms;
+                    let dropped_ms = perf.dropped_ms;
+                    let leaf_ms = perf.leaf_decay_ms;
+                    let visibility_ms = perf.visibility_ms;
+                    let mining_ms = perf.mining_ms;
+                    let other_ms = perf.untracked_ms;
                     log_info(format!(
-                        "runtime: fps={} tps={} loaded={} requested={} req(edit/near/far)={}/{}/{} apply_ms={:.2} stream_ms={:.2} render_ms={:.2}",
-                        fps_value,
-                        tps_value,
-                        loaded.len(),
-                        requested.len(),
-                        req_stats.edit,
-                        req_stats.near,
-                        req_stats.far,
-                        perf.apply_ms,
-                        perf.stream_ms,
-                        perf.render_cpu_ms,
+                        "runtime-bottleneck: fps={fps_value} tps={tps_value} bottleneck={bottleneck_label}({bottleneck_ms:.2}ms,{bottleneck_pct:.0}%tick) tick_ms={tick_ms:.2} phases_ms[r/s/a/p/d/l/v/m/o]={render_ms:.2}/{stream_ms:.2}/{apply_ms:.2}/{player_ms:.2}/{dropped_ms:.2}/{leaf_ms:.2}/{visibility_ms:.2}/{mining_ms:.2}/{other_ms:.2} phases_pct[r/s/a/p/d/l/v/m/o]={render_pct:.0}/{stream_pct:.0}/{apply_pct:.0}/{player_pct:.0}/{dropped_pct:.0}/{leaf_pct:.0}/{visibility_pct:.0}/{mining_pct:.0}/{other_pct:.0} chunks[loaded/requested/dirty]={loaded_len}/{requested_len}/{dirty_pending_debug} req[edit/near/far/inflight]={req_edit}/{req_near}/{req_far}/{req_inflight} stream_cursor[r/i]={stream_ring_r}/{stream_ring_i} deferred={deferred_len} lod_loaded[f/s/o]={lod_loaded_full}/{lod_loaded_sides}/{lod_loaded_surface} lod_req[f/s/o]={lod_req_full}/{lod_req_sides}/{lod_req_surface} lod_step_loaded[min/max/1/2_4/5_16/17p]={lod_loaded_step_min}/{lod_loaded_step_max}/{lod_loaded_step_1}/{lod_loaded_step_2_4}/{lod_loaded_step_5_16}/{lod_loaded_step_17p} lod_step_req[min/max/1/2_4/5_16/17p]={lod_req_step_min}/{lod_req_step_max}/{lod_req_step_1}/{lod_req_step_2_4}/{lod_req_step_5_16}/{lod_req_step_17p} apply_dbg[ok/raw/packed/skip_epoch/skip_rev/defer_push/defer_pop/fast_scan/fast_ok/rebuild]={apply_ok}/{apply_raw}/{apply_packed}/{apply_skip_epoch}/{apply_skip_rev}/{apply_defer_push}/{apply_defer_pop}/{apply_fast_scan}/{apply_fast_ok}/{apply_rebuild_budget} leaf_q[check/break/check_p/break_p/tick]={leaf_check}/{leaf_break}/{leaf_check_pending}/{leaf_break_pending}/{leaf_tick} gpu[vis_supers={gpu_vis_supers}/{gpu_total_supers} vis_draw={gpu_vis_draw}/{gpu_total_draw} vis_idx={gpu_vis_idx} raw_idx={gpu_vis_raw_idx} packed_idx={gpu_vis_packed_idx} dirty_supers={gpu_dirty_supers} pending_upd={gpu_pending_updates} pending_q={gpu_pending_queue}] budgets[req/pregen/apply/rebuild/apply_now/rebuild_now/draw_cap]={adaptive_request_budget}/{adaptive_pregen_budget}/{adaptive_max_apply_per_tick}/{adaptive_max_rebuilds_per_tick}/{apply_budget_debug}/{rebuild_budget_debug}/{adaptive_draw_radius_cap} flags[pause_stream/pause_render/pregen]={pause_stream}/{pause_render}/{pregen_active}",
+                        loaded_len = loaded.len(),
+                        requested_len = requested.len(),
+                        req_edit = req_stats.edit,
+                        req_near = req_stats.near,
+                        req_far = req_stats.far,
+                        req_inflight = req_stats.inflight_chunks,
+                        stream_ring_r = ring_r,
+                        stream_ring_i = ring_i,
+                        deferred_len = deferred_apply_results.len(),
+                        leaf_check = leaf_stats.check_queue,
+                        leaf_break = leaf_stats.break_queue,
+                        leaf_check_pending = leaf_stats.check_pending,
+                        leaf_break_pending = leaf_stats.break_pending,
+                        leaf_tick = leaf_stats.tick,
+                        gpu_vis_supers = gpu_stats.visible_supers,
+                        gpu_total_supers = gpu_stats.super_chunks,
+                        gpu_vis_draw = gpu_stats.visible_draw_calls_est,
+                        gpu_total_draw = gpu_stats.total_draw_calls_est,
+                        gpu_vis_idx = gpu_stats.visible_indices,
+                        gpu_vis_raw_idx = gpu_stats.visible_raw_indices,
+                        gpu_vis_packed_idx = gpu_stats.visible_packed_indices,
+                        gpu_dirty_supers = gpu_stats.dirty_supers,
+                        gpu_pending_updates = gpu_stats.pending_updates,
+                        gpu_pending_queue = gpu_stats.pending_queue,
+                        lod_loaded_full = loaded_lod.full,
+                        lod_loaded_sides = loaded_lod.sides,
+                        lod_loaded_surface = loaded_lod.surface,
+                        lod_req_full = requested_lod.full,
+                        lod_req_sides = requested_lod.sides,
+                        lod_req_surface = requested_lod.surface,
+                        lod_loaded_step_min = loaded_lod.step_min,
+                        lod_loaded_step_max = loaded_lod.step_max,
+                        lod_loaded_step_1 = loaded_lod.step_1,
+                        lod_loaded_step_2_4 = loaded_lod.step_2_4,
+                        lod_loaded_step_5_16 = loaded_lod.step_5_16,
+                        lod_loaded_step_17p = loaded_lod.step_17p,
+                        lod_req_step_min = requested_lod.step_min,
+                        lod_req_step_max = requested_lod.step_max,
+                        lod_req_step_1 = requested_lod.step_1,
+                        lod_req_step_2_4 = requested_lod.step_2_4,
+                        lod_req_step_5_16 = requested_lod.step_5_16,
+                        lod_req_step_17p = requested_lod.step_17p,
+                        apply_ok = apply_debug_tick.applied_total,
+                        apply_raw = apply_debug_tick.applied_raw,
+                        apply_packed = apply_debug_tick.applied_packed,
+                        apply_skip_epoch = apply_debug_tick.skipped_epoch,
+                        apply_skip_rev = apply_debug_tick.skipped_dirty_rev,
+                        apply_defer_push = apply_debug_tick.deferred_pushed,
+                        apply_defer_pop = apply_debug_tick.deferred_popped,
+                        apply_fast_scan = apply_debug_tick.fast_lane_scanned,
+                        apply_fast_ok = apply_debug_tick.fast_lane_applied,
+                        apply_rebuild_budget = apply_debug_tick.rebuild_budget,
                     ));
                     last_runtime_log = Instant::now();
+                }
+
+                if last_autosave.elapsed() >= AUTOSAVE_INTERVAL {
+                    match save_runtime_state(
+                        &save_io,
+                        &player,
+                        &camera,
+                        selected_hotbar_slot,
+                        fly_mode,
+                        &inventory,
+                        &edited_blocks,
+                        edits_save_dirty,
+                    ) {
+                        Ok(saved_edit_count) => {
+                            if edits_save_dirty {
+                                log_info(format!(
+                                    "save: autosaved {} edited blocks to {}",
+                                    saved_edit_count,
+                                    save_io.save_dir().display()
+                                ));
+                                edits_save_dirty = false;
+                            }
+                        }
+                        Err(err) => {
+                            log_warn(format!("save: autosave failed: {err}"));
+                        }
+                    }
+                    last_autosave = Instant::now();
                 }
 
                 if !pause_render || pause_menu_open {
                     gpu.window().request_redraw();
                 }
-                perf.tick_cpu_ms = ema_ms(perf.tick_cpu_ms, tick_start.elapsed().as_secs_f32() * 1000.0);
+                let tick_ms_sample = tick_start.elapsed().as_secs_f32() * 1000.0;
+                let measured_sum_ms = perf.render_cpu_ms
+                    + perf.stream_ms
+                    + perf.apply_ms
+                    + perf.player_ms
+                    + perf.dropped_ms
+                    + perf.leaf_decay_ms
+                    + perf.visibility_ms
+                    + perf.mining_ms;
+                let untracked_ms = (tick_ms_sample - measured_sum_ms).max(0.0);
+                perf.untracked_ms = ema_ms(perf.untracked_ms, untracked_ms);
+                perf.tick_cpu_ms = ema_ms(perf.tick_cpu_ms, tick_ms_sample);
                 next_tick = now + delay;
             }
         }
@@ -1244,6 +1613,7 @@ fn main() {
                         log_info("runtime: hot reload requested (textures/content)");
                         generate_texture_atlases();
                         reload_registry(DEFAULT_TILES_X);
+                        core_ids = core_block_ids();
                         reload_recipes();
                         {
                             let mut shared_blocks = runtime_blocks.write().unwrap();
@@ -1476,7 +1846,7 @@ fn main() {
                 return;
             }
             if matches!(button, MouseButton::Right)
-                && looked_hit.is_some_and(|(_, block_id, _)| block_id == BLOCK_CRAFTING_TABLE as i8)
+                && looked_hit.is_some_and(|(_, block_id, _)| block_id == core_ids.crafting_table)
             {
                 inventory.open_crafting_table();
                 let cached_cursor = last_cursor_pos.map(|(x, y)| (x as f32, y as f32));
@@ -1508,10 +1878,10 @@ fn main() {
                 player_config.radius,
                 inventory.selected_hotbar_block(selected_hotbar_slot),
             );
-            if let Some((broken_pos, broken_id)) = edit_result.broke {
+            for (broken_pos, broken_id) in edit_result.broke.iter().copied() {
                 spawn_block_drop(&mut dropped_items, broken_pos, broken_id);
             }
-            if let Some((placed_pos, _placed_id)) = edit_result.placed {
+            for (placed_pos, _placed_id) in edit_result.placed.iter().copied() {
                 let _ = inventory.consume_selected_hotbar(selected_hotbar_slot, 1);
                 nudge_items_from_placed_block(
                     &mut dropped_items,
@@ -1520,11 +1890,15 @@ fn main() {
                     &edited_blocks,
                 );
             }
-            let edited_world = edit_result.broke.is_some() || edit_result.placed.is_some();
+            let edited_world = edit_result.edited_world();
+            if edited_world {
+                edits_save_dirty = true;
+            }
             if edited_world && !pause_stream {
-                apply_stream_results(
+                let _ = apply_stream_results(
                     &mut gpu,
                     &rx_res,
+                    &mut deferred_apply_results,
                     content_reload_epoch.load(Ordering::Acquire),
                     &dirty_chunks,
                     1,
@@ -1538,8 +1912,8 @@ fn main() {
                     &mut pregen_chunks_created,
                     loaded_chunk_cap,
                     mesh_memory_cap_mb,
-                    20,
-                    adaptive_max_rebuilds_per_tick.max(3),
+                    32,
+                    adaptive_max_rebuilds_per_tick.max(5),
                     true,
                 );
             }
@@ -1654,6 +2028,25 @@ fn main() {
             let size = gpu.window().inner_size();
             gpu.resize(size);
         }
+        Event::LoopExiting => match save_runtime_state(
+            &save_io,
+            &player,
+            &camera,
+            selected_hotbar_slot,
+            fly_mode,
+            &inventory,
+            &edited_blocks,
+            true,
+        ) {
+            Ok(saved_edit_count) => {
+                log_info(format!(
+                    "save: final flush complete (edited_blocks={saved_edit_count})"
+                ));
+            }
+            Err(err) => {
+                log_warn(format!("save: final flush failed: {err}"));
+            }
+        },
         Event::WindowEvent {
             event: WindowEvent::CloseRequested,
             ..

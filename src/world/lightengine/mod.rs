@@ -1,4 +1,4 @@
-use crate::world::blocks::BLOCK_LEAVES;
+use crate::world::blocks::core_block_ids;
 
 pub fn compute_face_light<F>(
     face: u32,
@@ -14,6 +14,7 @@ pub fn compute_face_light<F>(
 where
     F: Fn(i32, i32, i32) -> i8,
 {
+    let leaves_id = core_block_ids().leaves;
     let base = match face {
         2 => 1.00f32, // top
         3 => 0.36f32, // bottom
@@ -24,7 +25,7 @@ where
         return (0.02f32 + base * 0.45f32).clamp(0.01f32, 0.55f32);
     }
     let (cx, cy, cz) = face_center_sample(face, wx, wy, wz, sx, sy, sz);
-    let mut sky = sample_sky_visibility_fast(face, cx, cy, cz, block_at);
+    let mut sky = sample_sky_visibility_fast(face, cx, cy, cz, leaves_id, block_at);
     if face == 3 {
         // Bottom faces receive less direct sky lighting.
         sky *= 0.74;
@@ -61,7 +62,14 @@ fn face_center_sample(
     }
 }
 
-fn sample_sky_visibility_fast<F>(face: u32, x: f32, y: f32, z: f32, block_at: &F) -> f32
+fn sample_sky_visibility_fast<F>(
+    face: u32,
+    x: f32,
+    y: f32,
+    z: f32,
+    leaves_id: i8,
+    block_at: &F,
+) -> f32
 where
     F: Fn(i32, i32, i32) -> i8,
 {
@@ -69,11 +77,11 @@ where
     let bz = z.floor() as i32;
     let by = y.floor() as i32;
 
-    let above0 = sun_visibility_mul(block_at(bx, by, bz));
-    let above1 = sun_visibility_mul(block_at(bx, by + 1, bz));
-    let above2 = sun_visibility_mul(block_at(bx, by + 2, bz));
+    let above0 = sun_visibility_mul(block_at(bx, by, bz), leaves_id);
+    let above1 = sun_visibility_mul(block_at(bx, by + 1, bz), leaves_id);
+    let above2 = sun_visibility_mul(block_at(bx, by + 2, bz), leaves_id);
     let above3 = if face == 2 {
-        sun_visibility_mul(block_at(bx, by + 4, bz))
+        sun_visibility_mul(block_at(bx, by + 4, bz), leaves_id)
     } else {
         1.0
     };
@@ -96,7 +104,7 @@ where
     for id in ring_ids_near {
         roof_cover += if id < 0 {
             0.0
-        } else if id == BLOCK_LEAVES as i8 {
+        } else if id == leaves_id {
             0.06
         } else {
             0.12
@@ -105,7 +113,7 @@ where
     for id in ring_ids_far {
         roof_cover += if id < 0 {
             0.0
-        } else if id == BLOCK_LEAVES as i8 {
+        } else if id == leaves_id {
             0.04
         } else {
             0.08
@@ -124,7 +132,7 @@ where
     for id in side_ids {
         enclosure += if id < 0 {
             0.0
-        } else if id == BLOCK_LEAVES as i8 {
+        } else if id == leaves_id {
             0.07
         } else {
             0.15
@@ -135,10 +143,10 @@ where
     visibility.clamp(0.0, 1.0)
 }
 
-fn sun_visibility_mul(id: i8) -> f32 {
+fn sun_visibility_mul(id: i8, leaves_id: i8) -> f32 {
     if id < 0 {
         1.0
-    } else if id == BLOCK_LEAVES as i8 {
+    } else if id == leaves_id {
         0.72
     } else {
         0.42

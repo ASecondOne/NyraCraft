@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -171,28 +172,190 @@ fn parse_seed_mode(seed_text: &str) -> (u32, WorldMode) {
     (hash_seed_text(seed_text), WorldMode::Normal)
 }
 
-pub fn resolve_launch_seed() -> (u32, WorldMode, String) {
-    let cli_seed = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
-    let seed_text = if cli_seed.trim().is_empty() {
-        println!("Enter seed (number/text), FLAT, GRID, or blank for random:");
-        print!("seed> ");
-        let _ = io::stdout().flush();
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_ok() {
-            input
-        } else {
-            String::new()
-        }
-    } else {
-        cli_seed
-    };
+fn world_mode_name(mode: WorldMode) -> &'static str {
+    match mode {
+        WorldMode::Normal => "NORMAL",
+        WorldMode::Flat => "FLAT",
+        WorldMode::Grid => "GRID",
+    }
+}
 
-    let seed_text = seed_text.trim();
+fn parse_world_mode_name(name: &str) -> Option<WorldMode> {
+    if name.eq_ignore_ascii_case("NORMAL") {
+        return Some(WorldMode::Normal);
+    }
+    if name.eq_ignore_ascii_case("FLAT") {
+        return Some(WorldMode::Flat);
+    }
+    if name.eq_ignore_ascii_case("GRID") {
+        return Some(WorldMode::Grid);
+    }
+    None
+}
+
+fn read_prompt_line(prompt: &str) -> String {
+    print!("{prompt}");
+    let _ = io::stdout().flush();
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_ok() {
+        input.trim().to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn create_new_world_selection() -> (u32, WorldMode, String) {
+    println!("Enter seed (number/text), FLAT, GRID, or blank for random:");
+    let seed_text = read_prompt_line("seed> ");
     if seed_text.is_empty() {
         let seed: u32 = rand::random();
         return (seed, WorldMode::Normal, "<random>".to_string());
     }
+    let (seed, mode) = parse_seed_mode(&seed_text);
+    (seed, mode, seed_text)
+}
 
-    let (seed, mode) = parse_seed_mode(seed_text);
-    (seed, mode, seed_text.to_string())
+#[derive(Deserialize)]
+struct SaveMetaSummary {
+    world_id: u64,
+    seed: u32,
+    mode: String,
+}
+
+#[derive(Clone)]
+struct SavedWorldEntry {
+    dir_name: String,
+    world_id: u64,
+    seed: u32,
+    mode: WorldMode,
+    modified: Option<SystemTime>,
+}
+
+fn discover_saved_worlds() -> Vec<SavedWorldEntry> {
+    let mut worlds = Vec::new();
+    let save_root = Path::new("save");
+    let Ok(entries) = fs::read_dir(save_root) else {
+        return worlds;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        if !dir_name.starts_with("world_") {
+            continue;
+        }
+        let dir_path = entry.path();
+        let meta_path = dir_path.join("meta.json");
+        let Ok(meta_raw) = fs::read_to_string(&meta_path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<SaveMetaSummary>(&meta_raw) else {
+            continue;
+        };
+        let Some(mode) = parse_world_mode_name(&meta.mode) else {
+            continue;
+        };
+        let modified = fs::metadata(&meta_path).and_then(|m| m.modified()).ok();
+        worlds.push(SavedWorldEntry {
+            dir_name,
+            world_id: meta.world_id,
+            seed: meta.seed,
+            mode,
+            modified,
+        });
+    }
+    worlds.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.dir_name.cmp(&b.dir_name))
+    });
+    worlds
+}
+
+fn choose_saved_world(worlds: &[SavedWorldEntry]) -> Option<(u32, WorldMode, String)> {
+    if worlds.is_empty() {
+        println!("No saved worlds found yet.");
+        return None;
+    }
+    println!("Saved Worlds:");
+    for (index, world) in worlds.iter().enumerate() {
+        println!(
+            "  {}) {} | mode={} | seed={} | world_id={:016x}",
+            index + 1,
+            world.dir_name,
+            world_mode_name(world.mode),
+            world.seed,
+            world.world_id
+        );
+    }
+    println!("Type a number to load, or B to go back.");
+    loop {
+        let raw = read_prompt_line("load> ");
+        if raw.eq_ignore_ascii_case("b") {
+            return None;
+        }
+        if let Ok(index) = raw.parse::<usize>()
+            && (1..=worlds.len()).contains(&index)
+        {
+            let world = &worlds[index - 1];
+            return Some((
+                world.seed,
+                world.mode,
+                format!(
+                    "load:{}:{}",
+                    world.dir_name,
+                    world_mode_name(world.mode).to_ascii_lowercase()
+                ),
+            ));
+        }
+        println!("Invalid selection. Enter a world number or B.");
+    }
+}
+
+pub fn resolve_launch_seed() -> (u32, WorldMode, String) {
+    let cli_seed = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    if !cli_seed.trim().is_empty() {
+        let seed_text = cli_seed.trim();
+        let (seed, mode) = parse_seed_mode(seed_text);
+        return (seed, mode, seed_text.to_string());
+    }
+
+    loop {
+        println!();
+        println!("=== NyraCraft Main Menu ===");
+        let saved_worlds = discover_saved_worlds();
+        if saved_worlds.is_empty() {
+            println!("1) Create New World");
+            println!("2) Quit");
+            match read_prompt_line("menu> ").as_str() {
+                "1" => return create_new_world_selection(),
+                "2" => std::process::exit(0),
+                _ => {
+                    println!("Invalid menu option.");
+                    continue;
+                }
+            }
+        } else {
+            println!("1) Load Saved World");
+            println!("2) Create New World");
+            println!("3) Quit");
+            match read_prompt_line("menu> ").as_str() {
+                "1" => {
+                    if let Some(choice) = choose_saved_world(&saved_worlds) {
+                        return choice;
+                    }
+                }
+                "2" => return create_new_world_selection(),
+                "3" => std::process::exit(0),
+                _ => {
+                    println!("Invalid menu option.");
+                    continue;
+                }
+            }
+        }
+    }
 }

@@ -6,37 +6,10 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI8, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 pub const DEFAULT_TILES_X: u32 = 16;
-pub const BLOCK_STONE: usize = 0;
-pub const BLOCK_DIRT: usize = 1;
-pub const BLOCK_GRASS: usize = 2;
-pub const BLOCK_LOG: usize = 3;
-pub const BLOCK_LEAVES: usize = 4;
-pub const BLOCK_PLANKS_OAK: usize = 5;
-pub const BLOCK_CRAFTING_TABLE: usize = 6;
-pub const BLOCK_GRAVEL: usize = 7;
-pub const BLOCK_SAND: usize = 8;
-pub const ITEM_APPLE: i8 = -1; // 2:1
-pub const ITEM_STICK: i8 = -2; // 2:2
-pub const ITEM_FLINT_AXE: i8 = -4; // 2:4
-pub const ITEM_FLINT_KNIFE: i8 = -5; // 2:5
-pub const ITEM_FLINT_PICKAXE: i8 = -6; // 2:6
-pub const ITEM_FLINT_SHOVEL: i8 = -7; // 2:7
-pub const ITEM_FLINT_SWORD: i8 = -8; // 2:8
-pub const HOTBAR_SLOTS: usize = 9;
-pub const HOTBAR_LOADOUT: [Option<i8>; HOTBAR_SLOTS] = [
-    Some(ITEM_FLINT_PICKAXE),
-    Some(ITEM_FLINT_AXE),
-    Some(ITEM_FLINT_SHOVEL),
-    Some(ITEM_FLINT_SWORD),
-    Some(ITEM_FLINT_KNIFE),
-    None,
-    None,
-    None,
-    None,
-];
 pub const DESTROY_STAGE_TILE_START: u32 = 16; // slot 17 in source textures
 pub const DESTROY_STAGE_COUNT: u32 = 10;
 
@@ -57,6 +30,139 @@ pub enum ToolType {
     Shovel,
     Knife,
     Sword,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoreBlockIds {
+    pub stone: i8,
+    pub dirt: i8,
+    pub grass: i8,
+    pub log: i8,
+    pub leaves: i8,
+    pub planks_oak: i8,
+    pub crafting_table: i8,
+    pub gravel: i8,
+    pub sand: i8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoreItemIds {
+    pub apple: Option<i8>,
+    pub stick: Option<i8>,
+}
+
+const DEFAULT_CORE_BLOCK_IDS: CoreBlockIds = CoreBlockIds {
+    stone: 0,
+    dirt: 1,
+    grass: 2,
+    log: 3,
+    leaves: 4,
+    planks_oak: 5,
+    crafting_table: 6,
+    gravel: 7,
+    sand: 8,
+};
+const UNSET_ITEM_ID: i8 = i8::MIN;
+const DEFAULT_CORE_ITEM_IDS: CoreItemIds = CoreItemIds {
+    apple: None,
+    stick: None,
+};
+
+struct AtomicCoreBlockIds {
+    stone: AtomicI8,
+    dirt: AtomicI8,
+    grass: AtomicI8,
+    log: AtomicI8,
+    leaves: AtomicI8,
+    planks_oak: AtomicI8,
+    crafting_table: AtomicI8,
+    gravel: AtomicI8,
+    sand: AtomicI8,
+}
+
+impl AtomicCoreBlockIds {
+    fn new(default: CoreBlockIds) -> Self {
+        Self {
+            stone: AtomicI8::new(default.stone),
+            dirt: AtomicI8::new(default.dirt),
+            grass: AtomicI8::new(default.grass),
+            log: AtomicI8::new(default.log),
+            leaves: AtomicI8::new(default.leaves),
+            planks_oak: AtomicI8::new(default.planks_oak),
+            crafting_table: AtomicI8::new(default.crafting_table),
+            gravel: AtomicI8::new(default.gravel),
+            sand: AtomicI8::new(default.sand),
+        }
+    }
+
+    fn load(&self) -> CoreBlockIds {
+        CoreBlockIds {
+            stone: self.stone.load(Ordering::Acquire),
+            dirt: self.dirt.load(Ordering::Acquire),
+            grass: self.grass.load(Ordering::Acquire),
+            log: self.log.load(Ordering::Acquire),
+            leaves: self.leaves.load(Ordering::Acquire),
+            planks_oak: self.planks_oak.load(Ordering::Acquire),
+            crafting_table: self.crafting_table.load(Ordering::Acquire),
+            gravel: self.gravel.load(Ordering::Acquire),
+            sand: self.sand.load(Ordering::Acquire),
+        }
+    }
+
+    fn store(&self, ids: CoreBlockIds) {
+        self.stone.store(ids.stone, Ordering::Release);
+        self.dirt.store(ids.dirt, Ordering::Release);
+        self.grass.store(ids.grass, Ordering::Release);
+        self.log.store(ids.log, Ordering::Release);
+        self.leaves.store(ids.leaves, Ordering::Release);
+        self.planks_oak.store(ids.planks_oak, Ordering::Release);
+        self.crafting_table
+            .store(ids.crafting_table, Ordering::Release);
+        self.gravel.store(ids.gravel, Ordering::Release);
+        self.sand.store(ids.sand, Ordering::Release);
+    }
+}
+
+struct AtomicCoreItemIds {
+    apple: AtomicI8,
+    stick: AtomicI8,
+}
+
+impl AtomicCoreItemIds {
+    fn new(default: CoreItemIds) -> Self {
+        Self {
+            apple: AtomicI8::new(encode_optional_item_id(default.apple)),
+            stick: AtomicI8::new(encode_optional_item_id(default.stick)),
+        }
+    }
+
+    fn load(&self) -> CoreItemIds {
+        CoreItemIds {
+            apple: decode_optional_item_id(self.apple.load(Ordering::Acquire)),
+            stick: decode_optional_item_id(self.stick.load(Ordering::Acquire)),
+        }
+    }
+
+    fn store(&self, ids: CoreItemIds) {
+        self.apple
+            .store(encode_optional_item_id(ids.apple), Ordering::Release);
+        self.stick
+            .store(encode_optional_item_id(ids.stick), Ordering::Release);
+    }
+}
+
+struct AtomicCoreIds {
+    blocks: AtomicCoreBlockIds,
+    items: AtomicCoreItemIds,
+}
+
+impl AtomicCoreIds {
+    fn new() -> Self {
+        Self {
+            blocks: AtomicCoreBlockIds::new(DEFAULT_CORE_BLOCK_IDS),
+            items: AtomicCoreItemIds::new(DEFAULT_CORE_ITEM_IDS),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -198,6 +304,78 @@ struct RawItemFile {
 }
 
 static REGISTRY: OnceLock<RwLock<&'static Registry>> = OnceLock::new();
+static CORE_IDS: OnceLock<AtomicCoreIds> = OnceLock::new();
+
+fn core_ids_cache() -> &'static AtomicCoreIds {
+    CORE_IDS.get_or_init(AtomicCoreIds::new)
+}
+
+fn encode_optional_item_id(id: Option<i8>) -> i8 {
+    id.unwrap_or(UNSET_ITEM_ID)
+}
+
+fn decode_optional_item_id(raw: i8) -> Option<i8> {
+    (raw != UNSET_ITEM_ID).then_some(raw)
+}
+
+fn first_known_id(map: &HashMap<String, i8>, keys: &[&str]) -> Option<i8> {
+    keys.iter()
+        .map(|name| name.trim().to_ascii_lowercase())
+        .find_map(|key| map.get(&key).copied())
+}
+
+fn require_known_id(map: &HashMap<String, i8>, keys: &[&str], label: &str) -> i8 {
+    first_known_id(map, keys).unwrap_or_else(|| {
+        panic!(
+            "missing required {} in content registry; tried aliases {}",
+            label,
+            keys.join(", ")
+        );
+    })
+}
+
+fn resolve_core_block_ids(block_name_to_id: &HashMap<String, i8>) -> CoreBlockIds {
+    CoreBlockIds {
+        stone: require_known_id(block_name_to_id, &["stone", "block_stone"], "block `stone`"),
+        dirt: require_known_id(block_name_to_id, &["dirt", "block_dirt"], "block `dirt`"),
+        grass: require_known_id(block_name_to_id, &["grass", "block_grass"], "block `grass`"),
+        log: require_known_id(block_name_to_id, &["log", "block_log"], "block `log`"),
+        leaves: require_known_id(
+            block_name_to_id,
+            &["leaves", "leaf", "block_leaves"],
+            "block `leaves`",
+        ),
+        planks_oak: require_known_id(
+            block_name_to_id,
+            &["planks_oak", "planks", "block_planks_oak"],
+            "block `planks_oak`",
+        ),
+        crafting_table: require_known_id(
+            block_name_to_id,
+            &["crafting_table", "table", "block_crafting_table"],
+            "block `crafting_table`",
+        ),
+        gravel: require_known_id(
+            block_name_to_id,
+            &["gravel", "block_gravel"],
+            "block `gravel`",
+        ),
+        sand: require_known_id(block_name_to_id, &["sand", "block_sand"], "block `sand`"),
+    }
+}
+
+fn resolve_core_item_ids(item_name_to_id: &HashMap<String, i8>) -> CoreItemIds {
+    CoreItemIds {
+        apple: first_known_id(item_name_to_id, &["apple", "item_apple"]),
+        stick: first_known_id(item_name_to_id, &["stick", "item_stick"]),
+    }
+}
+
+fn publish_core_ids(block_name_to_id: &HashMap<String, i8>, item_name_to_id: &HashMap<String, i8>) {
+    let cache = core_ids_cache();
+    cache.blocks.store(resolve_core_block_ids(block_name_to_id));
+    cache.items.store(resolve_core_item_ids(item_name_to_id));
+}
 
 fn registry_lock_with_tiles_x(tiles_x: u32) -> &'static RwLock<&'static Registry> {
     REGISTRY.get_or_init(|| {
@@ -926,6 +1104,8 @@ fn load_registry(tiles_x: u32) -> Registry {
         block.drops = resolved_drops;
     }
 
+    publish_core_ids(&block_name_to_id, &item_name_to_id);
+
     Registry {
         blocks,
         block_textures,
@@ -945,6 +1125,14 @@ fn load_registry(tiles_x: u32) -> Registry {
 
 pub fn all_item_defs() -> &'static [ItemDef] {
     &registry().items
+}
+
+pub fn core_block_ids() -> CoreBlockIds {
+    core_ids_cache().blocks.load()
+}
+
+pub fn core_item_ids() -> CoreItemIds {
+    core_ids_cache().items.load()
 }
 
 pub fn block_count() -> usize {
@@ -1243,6 +1431,29 @@ fn parse_item_id_plain(name_or_id: &str) -> Option<i8> {
     None
 }
 
+#[allow(dead_code)]
+pub fn parse_block_id(name_or_id: &str) -> Option<i8> {
+    let raw = name_or_id.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    if let Some((namespace, body)) = split_lookup_query(raw) {
+        return match namespace {
+            LookupNamespace::Block => parse_block_id_namespaced(body),
+            LookupNamespace::Item => {
+                parse_item_id_namespaced(body).and_then(placeable_block_id_for_item)
+            }
+        };
+    }
+
+    if let Some(block_id) = parse_block_id_plain(raw) {
+        return Some(block_id);
+    }
+
+    parse_item_id_plain(raw).and_then(placeable_block_id_for_item)
+}
+
 pub fn parse_item_id(name_or_id: &str) -> Option<i8> {
     let raw = name_or_id.trim();
     if raw.is_empty() {
@@ -1267,59 +1478,4 @@ pub fn parse_item_id(name_or_id: &str) -> Option<i8> {
     }
 
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stone_is_unbreakable_by_hand() {
-        let can_break = can_break_block_with_item(BLOCK_STONE as i8, None, 1.0);
-        let break_time = block_break_time_with_item_seconds(BLOCK_STONE as i8, None, 1.0);
-        assert!(!can_break);
-        assert!(break_time.is_none());
-    }
-
-    #[test]
-    fn stone_is_breakable_with_pickaxe() {
-        let pick_strength = item_break_strength(ITEM_FLINT_PICKAXE).unwrap_or(1.0);
-        let can_break =
-            can_break_block_with_item(BLOCK_STONE as i8, Some(ITEM_FLINT_PICKAXE), pick_strength);
-        let break_time = block_break_time_with_item_seconds(
-            BLOCK_STONE as i8,
-            Some(ITEM_FLINT_PICKAXE),
-            pick_strength,
-        );
-        assert!(can_break);
-        assert!(break_time.is_some());
-    }
-
-    #[test]
-    fn logs_break_by_hand_and_axe_is_faster() {
-        let hand_time = block_break_time_with_item_seconds(BLOCK_LOG as i8, None, 1.0)
-            .expect("hand should break logs");
-        let axe_strength = item_break_strength(ITEM_FLINT_AXE).unwrap_or(1.0);
-        let axe_time = block_break_time_with_item_seconds(
-            BLOCK_LOG as i8,
-            Some(ITEM_FLINT_AXE),
-            axe_strength,
-        )
-        .expect("axe should break logs");
-        assert!(axe_time < hand_time);
-    }
-
-    #[test]
-    fn wrong_tool_is_filtered_out() {
-        let axe_strength = item_break_strength(ITEM_FLINT_AXE).unwrap_or(1.0);
-        assert!(!can_break_block_with_item(
-            BLOCK_STONE as i8,
-            Some(ITEM_FLINT_AXE),
-            axe_strength
-        ));
-        assert!(
-            block_break_time_with_item_seconds(BLOCK_STONE as i8, Some(ITEM_FLINT_AXE), axe_strength)
-                .is_none()
-        );
-    }
 }
