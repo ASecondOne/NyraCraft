@@ -1527,6 +1527,12 @@ fn track_apply_outcome(stats: &mut ApplyDebugStats, outcome: ApplyWorkerOutcome)
     }
 }
 
+fn worker_result_epoch(result: &WorkerResult) -> u64 {
+    match result {
+        WorkerResult::Raw { epoch, .. } | WorkerResult::Packed { epoch, .. } => *epoch,
+    }
+}
+
 fn apply_worker_result(
     gpu: &mut Gpu,
     result: WorkerResult,
