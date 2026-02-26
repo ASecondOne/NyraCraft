@@ -10,7 +10,7 @@ const KEYBIND_LINES: [&str; 17] = [
     "Pause menu: Escape (return to game / quit)",
     "Sneak edge-guard: C prevents walking off ledges",
     "Mouse Left: Break block | Mouse Right: Place block / use crafting table",
-    "Mine blocks: Hold Left Mouse (block hardness enabled)",
+    "Mine blocks: Hold Left Mouse | Multi-break neighbors: hold C while mining",
     "Hotbar: 1-9 select slot | Mouse Wheel cycles slots",
     "Drop held item: Q",
     "Inventory: E to toggle, shift-click quick move, right-drag split stacks",

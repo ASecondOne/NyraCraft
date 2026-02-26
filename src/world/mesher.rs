@@ -3,7 +3,7 @@ use glam::{IVec3, Vec3};
 use crate::render::block::BlockTexture;
 use crate::render::mesh::ChunkVertex;
 use crate::world::CHUNK_SIZE;
-use crate::world::blocks::{BLOCK_LEAVES, BLOCK_LOG};
+use crate::world::blocks::core_block_ids;
 use crate::world::lightengine::compute_face_light;
 use crate::world::worldgen::WorldGen;
 
@@ -55,6 +55,13 @@ where
     } as usize;
     let mut vertices = Vec::with_capacity(est_faces * 4);
     let mut indices = Vec::with_capacity(est_faces * 6);
+    let core_ids = core_block_ids();
+    let tree_log_idx = usize::try_from(core_ids.log)
+        .ok()
+        .filter(|&idx| idx < blocks.len());
+    let tree_leaves_idx = usize::try_from(core_ids.leaves)
+        .ok()
+        .filter(|&idx| idx < blocks.len());
 
     let use_texture = if mode == MeshMode::SurfaceOnly { 0 } else { 1 };
     let use_sky_shading = use_sky_shading && mode == MeshMode::Full && step == 1;
@@ -642,9 +649,11 @@ where
             let height = height_cache
                 .height_at_world(wx, wz)
                 .unwrap_or_else(|| worldgen.height_at(wx, wz));
-            if let Some(tree) = worldgen.tree_at(wx, wz, height) {
-                let log_block = &blocks[BLOCK_LOG];
-                let leaves_block = &blocks[BLOCK_LEAVES];
+            if let Some(tree) = worldgen.tree_at(wx, wz, height)
+                && let (Some(log_idx), Some(leaves_idx)) = (tree_log_idx, tree_leaves_idx)
+            {
+                let log_block = &blocks[log_idx];
+                let leaves_block = &blocks[leaves_idx];
                 let trunk_end = tree.base_y + tree.trunk_h;
                 let top = trunk_end;
                 let r = tree.leaf_r;
@@ -652,7 +661,7 @@ where
                 while ty < trunk_end {
                     if ty >= chunk_min_y && ty <= chunk_max_y {
                         let wy = ty;
-                        if block_at(wx, wy, wz) != BLOCK_LOG as i8 {
+                        if block_at(wx, wy, wz) != core_ids.log {
                             ty += 1;
                             continue;
                         }
@@ -788,7 +797,7 @@ where
                                         dx += 1;
                                         continue;
                                     }
-                                    if block_at(lx, ly, lz) != BLOCK_LEAVES as i8 {
+                                    if block_at(lx, ly, lz) != core_ids.leaves {
                                         dx += 1;
                                         continue;
                                     }
@@ -952,10 +961,10 @@ fn ao_axis_samples(min: i32, span: i32, high: bool) -> (i32, i32) {
 }
 
 #[inline]
-fn ao_occlusion_weight(block_id: i8) -> f32 {
+fn ao_occlusion_weight(block_id: i8, leaves_id: i8) -> f32 {
     if block_id < 0 {
         0.0
-    } else if block_id == BLOCK_LEAVES as i8 {
+    } else if block_id == leaves_id {
         0.35
     } else {
         1.0
@@ -985,28 +994,29 @@ fn compute_face_corner_ao<F>(
 where
     F: Fn(i32, i32, i32) -> i8,
 {
+    let leaves_id = core_block_ids().leaves;
     let sample_yz = |x: i32, high_y: bool, high_z: bool| {
         let (y_base, y_side) = ao_axis_samples(wy, sy, high_y);
         let (z_base, z_side) = ao_axis_samples(wz, sz, high_z);
-        let side_y = ao_occlusion_weight(block_at(x, y_side, z_base));
-        let side_z = ao_occlusion_weight(block_at(x, y_base, z_side));
-        let corner = ao_occlusion_weight(block_at(x, y_side, z_side));
+        let side_y = ao_occlusion_weight(block_at(x, y_side, z_base), leaves_id);
+        let side_z = ao_occlusion_weight(block_at(x, y_base, z_side), leaves_id);
+        let corner = ao_occlusion_weight(block_at(x, y_side, z_side), leaves_id);
         ao_corner_factor(side_y, side_z, corner)
     };
     let sample_xz = |y: i32, high_x: bool, high_z: bool| {
         let (x_base, x_side) = ao_axis_samples(wx, sx, high_x);
         let (z_base, z_side) = ao_axis_samples(wz, sz, high_z);
-        let side_x = ao_occlusion_weight(block_at(x_side, y, z_base));
-        let side_z = ao_occlusion_weight(block_at(x_base, y, z_side));
-        let corner = ao_occlusion_weight(block_at(x_side, y, z_side));
+        let side_x = ao_occlusion_weight(block_at(x_side, y, z_base), leaves_id);
+        let side_z = ao_occlusion_weight(block_at(x_base, y, z_side), leaves_id);
+        let corner = ao_occlusion_weight(block_at(x_side, y, z_side), leaves_id);
         ao_corner_factor(side_x, side_z, corner)
     };
     let sample_xy = |z: i32, high_x: bool, high_y: bool| {
         let (x_base, x_side) = ao_axis_samples(wx, sx, high_x);
         let (y_base, y_side) = ao_axis_samples(wy, sy, high_y);
-        let side_x = ao_occlusion_weight(block_at(x_side, y_base, z));
-        let side_y = ao_occlusion_weight(block_at(x_base, y_side, z));
-        let corner = ao_occlusion_weight(block_at(x_side, y_side, z));
+        let side_x = ao_occlusion_weight(block_at(x_side, y_base, z), leaves_id);
+        let side_y = ao_occlusion_weight(block_at(x_base, y_side, z), leaves_id);
+        let corner = ao_occlusion_weight(block_at(x_side, y_side, z), leaves_id);
         ao_corner_factor(side_x, side_y, corner)
     };
 

@@ -4,4 +4,5 @@ pub mod controls;
 pub mod dropped_items;
 pub mod logger;
 pub mod menu;
+pub mod save;
 pub mod streaming;

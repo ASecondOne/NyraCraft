@@ -2,10 +2,12 @@ use crate::player::crafting::{
     craft_once, craft_output_preview, craft_slot_in_side, normalize_craft_side,
 };
 use crate::world::blocks::{
-    HOTBAR_LOADOUT, HOTBAR_SLOTS, item_break_strength, item_max_durability, item_max_stack_size,
-    placeable_block_id_for_item,
+    item_break_strength, item_max_durability, item_max_stack_size, placeable_block_id_for_item,
 };
+use serde::{Deserialize, Serialize};
 
+pub const HOTBAR_SLOTS: usize = 9;
+const HOTBAR_LOADOUT: [Option<i8>; HOTBAR_SLOTS] = [None; HOTBAR_SLOTS];
 pub const INVENTORY_ROWS: usize = 4;
 pub const INVENTORY_COLS: usize = HOTBAR_SLOTS;
 pub const INVENTORY_STORAGE_SLOTS: usize = INVENTORY_ROWS * INVENTORY_COLS;
@@ -16,7 +18,7 @@ fn item_stack_limit(item_id: i8) -> u8 {
     item_max_stack_size(item_id).clamp(1, MAX_STACK_SIZE)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemStack {
     pub block_id: i8,
     pub count: u8,
@@ -85,6 +87,15 @@ pub struct InventoryState {
     pub hotbar: [Option<ItemStack>; HOTBAR_SLOTS],
     pub storage: [Option<ItemStack>; INVENTORY_STORAGE_SLOTS],
     pub craft_input: [Option<ItemStack>; CRAFT_GRID_SLOTS],
+    pub dragged_item: Option<ItemStack>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InventorySnapshot {
+    pub craft_grid_side: u8,
+    pub hotbar: Vec<Option<ItemStack>>,
+    pub storage: Vec<Option<ItemStack>>,
+    pub craft_input: Vec<Option<ItemStack>>,
     pub dragged_item: Option<ItemStack>,
 }
 
@@ -293,6 +304,45 @@ impl InventoryState {
     pub fn close(&mut self) {
         self.open = false;
         self.stow_dragged_item();
+    }
+
+    pub fn snapshot(&self) -> InventorySnapshot {
+        InventorySnapshot {
+            craft_grid_side: self.craft_grid_side() as u8,
+            hotbar: self.hotbar.to_vec(),
+            storage: self.storage.to_vec(),
+            craft_input: self.craft_input.to_vec(),
+            dragged_item: self.dragged_item,
+        }
+    }
+
+    pub fn apply_snapshot(&mut self, snapshot: &InventorySnapshot) {
+        self.open = false;
+        self.craft_mode = if snapshot.craft_grid_side as usize >= CRAFT_GRID_SIDE {
+            CraftGridMode::Table3x3
+        } else {
+            CraftGridMode::Player2x2
+        };
+
+        self.hotbar.fill(None);
+        self.storage.fill(None);
+        self.craft_input.fill(None);
+
+        for (slot, item) in self.hotbar.iter_mut().zip(snapshot.hotbar.iter().copied()) {
+            *slot = normalize_item_stack(item);
+        }
+        for (slot, item) in self.storage.iter_mut().zip(snapshot.storage.iter().copied()) {
+            *slot = normalize_item_stack(item);
+        }
+        for (slot, item) in self
+            .craft_input
+            .iter_mut()
+            .zip(snapshot.craft_input.iter().copied())
+        {
+            *slot = normalize_item_stack(item);
+        }
+        self.dragged_item = normalize_item_stack(snapshot.dragged_item);
+        self.stow_craft_slots_outside_active_grid();
     }
 
     pub fn craft_output_preview(&self) -> Option<ItemStack> {

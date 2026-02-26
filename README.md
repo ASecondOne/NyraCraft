@@ -64,6 +64,7 @@ Current test set: 5 tests (worldgen + block/tool logic).
 - `C`: sneak (and descend in fly mode)
 - `Mouse`: look
 - `Left Mouse`: mine (hold for hardness-based breaking)
+- `Shift + Left Mouse`: multi-break up to 12 matching nearby blocks (3x3x3 neighborhood)
 - `Right Mouse`: place block / use crafting table
 - `E`: inventory
 - `1..9` / mouse wheel: hotbar select
@@ -299,7 +300,7 @@ Notable current defaults:
 - base render radius: `512` (dynamic with altitude)
 - base draw radius: `192`
 - LOD near/mid radii: `16 / 32` chunks
-- mesh memory cap: `12288 MB`
+- mesh memory cap: `4096 MB`
 
 ## Texture Atlas Workflow
 

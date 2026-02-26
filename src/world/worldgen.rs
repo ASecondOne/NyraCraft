@@ -1,8 +1,5 @@
 use crate::world::CHUNK_SIZE;
-use crate::world::blocks::{
-    BLOCK_DIRT, BLOCK_GRASS, BLOCK_GRAVEL, BLOCK_LEAVES, BLOCK_LOG, BLOCK_SAND, BLOCK_STONE,
-    block_count,
-};
+use crate::world::blocks::{block_count, core_block_ids};
 use noise::{NoiseFn, Perlin};
 
 pub const WORLD_SIZE_CHUNKS: i32 = 1000;
@@ -304,6 +301,7 @@ impl WorldGen {
     }
 
     pub fn block_id_at(&self, x: i32, y: i32, z: i32, height: i32) -> i8 {
+        let ids = core_block_ids();
         if !self.in_world_bounds(x, z) {
             return -1;
         }
@@ -313,25 +311,25 @@ impl WorldGen {
                     -1
                 } else {
                     let mut block_id = if y < height - 3 {
-                        BLOCK_STONE as i8
+                        ids.stone
                     } else {
                         match self.surface_biome_at(x, z, height) {
                             SurfaceBiome::Temperate => {
                                 if y == height {
-                                    BLOCK_GRASS as i8
+                                    ids.grass
                                 } else {
-                                    BLOCK_DIRT as i8
+                                    ids.dirt
                                 }
                             }
-                            SurfaceBiome::GravelDesert => BLOCK_GRAVEL as i8,
-                            SurfaceBiome::SandDesert => BLOCK_SAND as i8,
+                            SurfaceBiome::GravelDesert => ids.gravel,
+                            SurfaceBiome::SandDesert => ids.sand,
                         }
                     };
                     if self.should_carve_cave_at(x, y, z, height) {
                         block_id = -1;
                     }
                     if y == height && block_id < 0 && self.tree_at(x, z, height).is_some() {
-                        return BLOCK_GRASS as i8;
+                        return ids.grass;
                     }
                     block_id
                 }
@@ -340,11 +338,11 @@ impl WorldGen {
                 if y > height {
                     -1
                 } else if y == height {
-                    BLOCK_GRASS as i8
+                    ids.grass
                 } else if y >= height - 2 {
-                    BLOCK_DIRT as i8
+                    ids.dirt
                 } else {
-                    BLOCK_STONE as i8
+                    ids.stone
                 }
             }
         }
@@ -393,6 +391,7 @@ impl WorldGen {
     }
 
     pub fn block_id_full_at(&self, x: i32, y: i32, z: i32) -> i8 {
+        let ids = core_block_ids();
         if !self.in_world_bounds(x, z) {
             return -1;
         }
@@ -421,7 +420,7 @@ impl WorldGen {
 
                 let trunk_end = tree.base_y + tree.trunk_h;
                 if x == tx && z == tz && y >= tree.base_y && y < trunk_end {
-                    return BLOCK_LOG as i8;
+                    return ids.log;
                 }
 
                 let dy = y - trunk_end;
@@ -435,7 +434,7 @@ impl WorldGen {
                     if dx == 0 && dz == 0 && y >= tree.base_y && y < trunk_end {
                         continue;
                     }
-                    return BLOCK_LEAVES as i8;
+                    return ids.leaves;
                 }
             }
         }
