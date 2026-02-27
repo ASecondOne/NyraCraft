@@ -478,6 +478,13 @@ impl WorldGen {
         {
             return tall_grass_id;
         }
+        if y == height + 1
+            && self.block_id_at(x, y - 1, z, height) == ids.grass
+            && should_spawn_tall_grass(self.seed, x, z)
+            && let Some(tall_grass_id) = tall_grass_block_id()
+        {
+            return tall_grass_id;
+        }
         -1
     }
 }
