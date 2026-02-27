@@ -543,7 +543,7 @@ fn request_chunk_remesh_with_priority(queue: &SharedRequestQueue, coord: IVec3, 
         coord,
         1,
         MeshMode::Full,
-        true,
+        false,
         RequestClass::Edit,
         priority,
     );
