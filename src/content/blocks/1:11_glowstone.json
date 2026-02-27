@@ -1,0 +1,12 @@
+{
+  "id": "1:11",
+  "register_name": "block_glowstone",
+  "aliases": ["glowstone", "glow"],
+  "hardness": 1.8,
+  "required_tool": "pickaxe",
+  "texture_slot_1based": 27,
+  "rotations": [3, 3, 0, 0, 0, 0],
+  "transparent_mode": [0, 0, 0, 0, 0, 0],
+  "icon_texture_slot_1based": 27,
+  "light_emission": 15
+}

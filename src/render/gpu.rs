@@ -10,13 +10,16 @@ use crate::render::atlas::TextureAtlas;
 use crate::render::mesh::{ChunkVertex, PackedFarVertex};
 use crate::render::texture::{
     AtlasTexture, create_dummy_texture, load_atlas_texture, load_grass_colormap_texture,
+    load_player_skin_texture,
 };
 use crate::world::blocks::{
-    DESTROY_STAGE_COUNT, DESTROY_STAGE_TILE_START, block_count, block_texture_by_id,
+    DESTROY_STAGE_COUNT, DESTROY_STAGE_TILE_START, block_count, block_light_emission,
+    block_texture_by_id,
     core_block_ids, core_item_ids, item_icon_tile_index, item_max_durability, item_name_by_id,
-    placeable_block_id_for_item,
+    parse_block_id, placeable_block_id_for_item,
 };
 use bytemuck::{Pod, Zeroable};
+use font8x8::{BASIC_FONTS, UnicodeFonts};
 use glam::{IVec3, Mat3, Mat4, Vec3};
 use self_cell::self_cell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -141,10 +144,15 @@ const HOTBAR_SLOT_COUNT: usize = HOTBAR_SLOTS;
 const UI_ATLAS_ITEM: f32 = 0.0;
 const UI_ATLAS_BLOCK: f32 = 1.0;
 const SUN_TRANSPARENT_MODE: u32 = 15;
-const DAY_CYCLE_SECONDS: f32 = 48.0 * 60.0; // 2 min per in-game hour, 48 min full day.
+pub const DAY_CYCLE_SECONDS: f32 = 48.0 * 60.0; // 2 min per in-game hour, 48 min full day.
 const MAX_POINT_LIGHTS: usize = 12;
 const POINT_LIGHT_CULL_DISTANCE: f32 = 84.0;
 const POINT_LIGHT_DROPPED_SAMPLE_CAP: usize = 192;
+const UI_TEXT_PIXEL_SCALE: f32 = 0.62;
+const UI_TEXT_GLYPH_WIDTH: usize = 8;
+const UI_TEXT_GLYPH_HEIGHT: usize = 8;
+const UI_TEXT_GLYPH_SPACING: f32 = 1.0;
+const UI_TEXT_LINE_GAP: f32 = 1.0;
 
 #[derive(Clone, Copy)]
 struct DayCycleState {
@@ -206,19 +214,47 @@ fn point_light_tint(block_id: i8) -> Vec3 {
     tint.max(Vec3::splat(0.22)).min(Vec3::splat(1.0))
 }
 
+fn tall_grass_colormap_tile() -> u32 {
+    parse_block_id("tall_grass")
+        .or_else(|| parse_block_id("tallgrass"))
+        .and_then(block_texture_by_id)
+        .map(|texture| texture.tiles[2])
+        .unwrap_or(31)
+}
+
+fn item_light_emission(item_id: i8) -> Option<(i8, f32)> {
+    let block_id = placeable_block_id_for_item(item_id)?;
+    let emission = block_light_emission(block_id);
+    (emission > 0.0).then_some((block_id, emission))
+}
+
+fn normalize_light_emission(emission: f32) -> f32 {
+    (emission / 15.0).clamp(0.0, 1.0)
+}
+
 fn build_culled_point_lights(
     camera: &Camera,
+    held_light_origin: Vec3,
+    held_light_forward: Vec3,
     day_cycle: DayCycleState,
     dropped_items: &[DroppedItemRender],
     break_overlay: Option<(IVec3, u32)>,
+    held_item_id: Option<i8>,
+    world_emissive_lights: &[WorldEmissiveLight],
 ) -> PointLightCullResult {
     let camera_forward = if camera.forward.length_squared() > 1.0e-8 {
         camera.forward.normalize()
     } else {
         Vec3::new(0.0, 0.0, -1.0)
     };
+    let held_forward = if held_light_forward.length_squared() > 1.0e-8 {
+        held_light_forward.normalize()
+    } else {
+        camera_forward
+    };
     let night_factor = (1.0 - day_cycle.daylight).clamp(0.0, 1.0);
-    let mut candidates: Vec<PointLight> = Vec::with_capacity(POINT_LIGHT_DROPPED_SAMPLE_CAP + 3);
+    let mut candidates: Vec<PointLight> =
+        Vec::with_capacity(POINT_LIGHT_DROPPED_SAMPLE_CAP + world_emissive_lights.len() + 4);
 
     if let Some((coord, _stage)) = break_overlay {
         candidates.push(PointLight {
@@ -233,15 +269,42 @@ fn build_culled_point_lights(
         });
     }
 
-    if night_factor > 0.2 {
-        for item in dropped_items.iter().take(POINT_LIGHT_DROPPED_SAMPLE_CAP) {
-            candidates.push(PointLight {
-                position: item.position + Vec3::new(0.0, 0.12, 0.0),
-                radius: 3.2 + 3.2 * night_factor,
-                color: point_light_tint(item.block_id),
-                intensity: 0.06 + 0.28 * night_factor,
-            });
+    for item in dropped_items.iter().take(POINT_LIGHT_DROPPED_SAMPLE_CAP) {
+        let emissive_factor = item_light_emission(item.block_id)
+            .map(|(_, emission)| normalize_light_emission(emission))
+            .unwrap_or(0.0);
+        if night_factor <= 0.2 && emissive_factor <= 0.0 {
+            continue;
         }
+        candidates.push(PointLight {
+            position: item.position + Vec3::new(0.0, 0.12, 0.0),
+            radius: 3.2 + 3.2 * night_factor + 6.0 * emissive_factor,
+            color: point_light_tint(item.block_id),
+            intensity: 0.06 + 0.28 * night_factor + 0.85 * emissive_factor,
+        });
+    }
+
+    if let Some((block_id, emission)) = held_item_id.and_then(item_light_emission) {
+        let emissive_factor = normalize_light_emission(emission);
+        candidates.push(PointLight {
+            position: held_light_origin + held_forward * 0.42 + Vec3::new(0.0, -0.18, 0.0),
+            radius: 3.0 + 11.0 * emissive_factor,
+            color: point_light_tint(block_id),
+            intensity: 0.25 + 1.75 * emissive_factor,
+        });
+    }
+
+    for light in world_emissive_lights {
+        let emissive_factor = normalize_light_emission(light.emission);
+        if emissive_factor <= 0.0 {
+            continue;
+        }
+        candidates.push(PointLight {
+            position: light.position,
+            radius: 6.0 + 18.0 * emissive_factor,
+            color: point_light_tint(light.block_id),
+            intensity: 1.1 + 4.0 * emissive_factor,
+        });
     }
 
     let mut scored: Vec<(f32, PointLight)> = Vec::with_capacity(candidates.len());
@@ -304,7 +367,9 @@ struct GpuInner<'a> {
     ui_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
     uniform_buffer: wgpu::Buffer,
+    player_uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    player_bind_group: wgpu::BindGroup,
     adapter_summary: String,
     tiles_x: u32,
     tile_uv_size: [f32; 2],
@@ -323,6 +388,7 @@ struct GpuInner<'a> {
     ui_item_tiles_x: u32,
     ui_item_tile_uv_size: [f32; 2],
     dropped_mesh: DynamicMeshBuffer,
+    player_mesh: DynamicMeshBuffer,
     break_overlay_mesh: DynamicMeshBuffer,
     sun_mesh: DynamicMeshBuffer,
     staged_indices: Vec<u32>,
@@ -372,6 +438,13 @@ pub struct DroppedItemRender {
     pub block_id: i8,
     pub spin_y: f32,
     pub tilt_z: f32,
+}
+
+#[derive(Clone, Copy)]
+pub struct WorldEmissiveLight {
+    pub position: Vec3,
+    pub block_id: i8,
+    pub emission: f32,
 }
 
 impl Gpu {
@@ -532,7 +605,7 @@ impl Gpu {
                 ],
                 flags0: [style.use_texture as u32, tiles_x, 0, 0],
                 flags1: [0, 2, 3, 6],
-                colormap_misc: [0.72, 0.0, 0.0, 0.0],
+                colormap_misc: [0.72, 0.0, tall_grass_colormap_tile() as f32, 0.0],
                 item_misc: [
                     ui_item_tile_uv_size[0],
                     ui_item_tile_uv_size[1],
@@ -550,6 +623,19 @@ impl Gpu {
                 contents: bytemuck::bytes_of(&uniform),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
+            let player_uniform = SceneUniform {
+                tile_misc: [1.0, 1.0, crate::world::CHUNK_SIZE as f32, 0.0],
+                flags0: [1, 1, 0, 0],
+                flags1: [0, 0, 0, 0],
+                colormap_misc: [0.0, 1.0, 0.0, 0.0],
+                ..uniform
+            };
+            let player_uniform_buffer =
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("player_uniform_buffer"),
+                    contents: bytemuck::bytes_of(&player_uniform),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                });
 
             let bind_group_layout =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -647,6 +733,49 @@ impl Gpu {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: wgpu::BindingResource::Sampler(&atlas_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&grass_colormap.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&grass_colormap.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&ui_item_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::Sampler(&ui_item_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(&sun_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::Sampler(&sun_sampler),
+                    },
+                ],
+            });
+            let player_skin = load_player_skin_texture(&device, &queue);
+            let player_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("player_bind_group"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: player_uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&player_skin.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&player_skin.sampler),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
@@ -928,7 +1057,9 @@ impl Gpu {
                 ui_bind_group,
                 depth_view,
                 uniform_buffer,
+                player_uniform_buffer,
                 bind_group,
+                player_bind_group,
                 adapter_summary,
                 tiles_x,
                 tile_uv_size,
@@ -947,6 +1078,7 @@ impl Gpu {
                 ui_item_tiles_x,
                 ui_item_tile_uv_size,
                 dropped_mesh: DynamicMeshBuffer::default(),
+                player_mesh: DynamicMeshBuffer::default(),
                 break_overlay_mesh: DynamicMeshBuffer::default(),
                 sun_mesh: DynamicMeshBuffer::default(),
                 staged_indices: Vec::new(),
@@ -1059,6 +1191,49 @@ impl Gpu {
                     },
                 ],
             });
+            let player_skin = load_player_skin_texture(&gpu.device, &gpu.queue);
+            gpu.player_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("player_bind_group_reload"),
+                layout: &scene_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: gpu.player_uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&player_skin.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&player_skin.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&grass_colormap.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&grass_colormap.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&ui_item_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::Sampler(&ui_item_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(&sun_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::Sampler(&sun_sampler),
+                    },
+                ],
+            });
 
             let ui_bind_group_layout = gpu.ui_pipeline.get_bind_group_layout(0);
             gpu.ui_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1094,6 +1269,10 @@ impl Gpu {
     pub fn render(
         &mut self,
         camera: &Camera,
+        player_position: Vec3,
+        player_forward: Vec3,
+        player_height: f32,
+        draw_player_model: bool,
         elapsed_seconds: f32,
         draw_world: bool,
         debug_faces: bool,
@@ -1119,6 +1298,7 @@ impl Gpu {
         chat_input: &str,
         chat_lines: &[String],
         dropped_items: &[DroppedItemRender],
+        world_emissive_lights: &[WorldEmissiveLight],
         pause_menu_open: bool,
         pause_menu_cursor: Option<(f32, f32)>,
     ) {
@@ -1128,8 +1308,23 @@ impl Gpu {
             let day_cycle = sample_day_cycle(elapsed_seconds);
             let sun_dir = sun_direction(day_cycle.day_progress, day_cycle.sun_height);
             let sun_strength = day_cycle.daylight.clamp(0.0, 1.0);
-            let culled_lights =
-                build_culled_point_lights(camera, day_cycle, dropped_items, break_overlay);
+            let held_item_id = hotbar_slots
+                .get(selected_hotbar_slot as usize)
+                .copied()
+                .flatten()
+                .and_then(|stack| (stack.count > 0).then_some(stack.block_id));
+            let held_light_origin =
+                player_position + Vec3::new(0.0, player_height * 0.86, 0.0);
+            let culled_lights = build_culled_point_lights(
+                camera,
+                held_light_origin,
+                player_forward,
+                day_cycle,
+                dropped_items,
+                break_overlay,
+                held_item_id,
+                world_emissive_lights,
+            );
 
             let uniform = SceneUniform {
                 mvp: mvp.to_cols_array_2d(),
@@ -1147,7 +1342,30 @@ impl Gpu {
                     0,
                 ],
                 flags1: [0, 2, 3, 6],
-                colormap_misc: [0.72, day_cycle.daylight, 0.0, 0.0],
+                colormap_misc: [
+                    0.72,
+                    day_cycle.daylight,
+                    tall_grass_colormap_tile() as f32,
+                    0.0,
+                ],
+                item_misc: [
+                    gpu.ui_item_tile_uv_size[0],
+                    gpu.ui_item_tile_uv_size[1],
+                    gpu.ui_item_tiles_x as f32,
+                    0.0,
+                ],
+                light_misc: [culled_lights.count, 0, 0, 0],
+                sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, sun_strength],
+                point_light_pos_radius: culled_lights.pos_radius,
+                point_light_color_intensity: culled_lights.color_intensity,
+            };
+            let player_uniform = SceneUniform {
+                mvp: mvp.to_cols_array_2d(),
+                camera_pos: [camera.position.x, camera.position.y, camera.position.z, 0.0],
+                tile_misc: [1.0, 1.0, crate::world::CHUNK_SIZE as f32, 0.0],
+                flags0: [1, 1, debug_faces as u32, 0],
+                flags1: [0, 0, 0, 0],
+                colormap_misc: [0.0, day_cycle.daylight, 0.0, 0.0],
                 item_misc: [
                     gpu.ui_item_tile_uv_size[0],
                     gpu.ui_item_tile_uv_size[1],
@@ -1162,6 +1380,11 @@ impl Gpu {
 
             gpu.queue
                 .write_buffer(&gpu.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+            gpu.queue.write_buffer(
+                &gpu.player_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&player_uniform),
+            );
 
             let frame = match gpu.surface.get_current_texture() {
                 Ok(frame) => frame,
@@ -1277,8 +1500,24 @@ impl Gpu {
                     "sun_vertex_buffer",
                     "sun_index_buffer",
                 );
+                if draw_player_model {
+                    let (player_vertices, player_indices) =
+                        build_player_mesh(player_position, player_forward, player_height);
+                    upload_dynamic_chunk_mesh(
+                        &gpu.device,
+                        &gpu.queue,
+                        &mut gpu.player_mesh,
+                        &player_vertices,
+                        &player_indices,
+                        "player_vertex_buffer",
+                        "player_index_buffer",
+                    );
+                } else {
+                    gpu.player_mesh.index_count = 0;
+                }
             } else {
                 gpu.dropped_mesh.index_count = 0;
+                gpu.player_mesh.index_count = 0;
                 gpu.break_overlay_mesh.index_count = 0;
                 gpu.sun_mesh.index_count = 0;
             }
@@ -1397,6 +1636,18 @@ impl Gpu {
                         rpass.set_pipeline(&gpu.line_pipeline);
                         rpass.set_vertex_buffer(0, gpu.selection_buffer.slice(..));
                         rpass.draw(0..gpu.selection_count, 0..1);
+                    }
+                    if gpu.player_mesh.index_count > 0
+                        && let (Some(vertex_buffer), Some(index_buffer)) = (
+                            gpu.player_mesh.vertex_buffer.as_ref(),
+                            gpu.player_mesh.index_buffer.as_ref(),
+                        )
+                    {
+                        rpass.set_pipeline(&gpu.render_pipeline);
+                        rpass.set_bind_group(0, &gpu.player_bind_group, &[]);
+                        rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                        rpass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        rpass.draw_indexed(0..gpu.player_mesh.index_count, 0, 0..1);
                     }
                 }
 
@@ -2073,6 +2324,479 @@ fn upload_dynamic_chunk_mesh(
     }
 }
 
+#[derive(Clone, Copy)]
+struct SkinRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+#[derive(Clone, Copy)]
+struct PlayerPartTransform {
+    origin: Vec3,
+    right: Vec3,
+    up: Vec3,
+    forward: Vec3,
+}
+
+fn player_part_to_world(transform: &PlayerPartTransform, p: Vec3, scale: f32) -> [f32; 3] {
+    (transform.origin
+        + transform.right * (p.x * scale)
+        + transform.up * (p.y * scale)
+        + transform.forward * (p.z * scale))
+        .to_array()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_player_face_uv(
+    vertices: &mut Vec<ChunkVertex>,
+    indices: &mut Vec<u32>,
+    face: u32,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    p3: [f32; 3],
+    uv: SkinRect,
+    color: [f32; 4],
+) {
+    let inset_px = 0.001f32;
+    let u0 = (uv.x + inset_px) / 64.0;
+    let v0 = (uv.y + inset_px) / 64.0;
+    let u1 = (uv.x + uv.w - inset_px) / 64.0;
+    let v1 = (uv.y + uv.h - inset_px) / 64.0;
+
+    let base = vertices.len() as u32;
+    vertices.push(ChunkVertex {
+        position: p0,
+        uv: [u0, v1],
+        tile: 0,
+        face,
+        rotation: 0,
+        use_texture: 1,
+        transparent_mode: 1,
+        color,
+    });
+    vertices.push(ChunkVertex {
+        position: p1,
+        uv: [u1, v1],
+        tile: 0,
+        face,
+        rotation: 0,
+        use_texture: 1,
+        transparent_mode: 1,
+        color,
+    });
+    vertices.push(ChunkVertex {
+        position: p2,
+        uv: [u1, v0],
+        tile: 0,
+        face,
+        rotation: 0,
+        use_texture: 1,
+        transparent_mode: 1,
+        color,
+    });
+    vertices.push(ChunkVertex {
+        position: p3,
+        uv: [u0, v0],
+        tile: 0,
+        face,
+        rotation: 0,
+        use_texture: 1,
+        transparent_mode: 1,
+        color,
+    });
+    // Player part transform uses a mirrored basis relative to chunk meshes; reverse
+    // triangle winding so backface culling keeps the outside faces visible.
+    indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_player_box<F>(
+    vertices: &mut Vec<ChunkVertex>,
+    indices: &mut Vec<u32>,
+    to_world: &F,
+    min_x: f32,
+    min_y: f32,
+    min_z: f32,
+    max_x: f32,
+    max_y: f32,
+    max_z: f32,
+    uv_right: SkinRect,
+    uv_left: SkinRect,
+    uv_top: SkinRect,
+    uv_bottom: SkinRect,
+    uv_front: SkinRect,
+    uv_back: SkinRect,
+    color: [f32; 4],
+) where
+    F: Fn(Vec3) -> [f32; 3],
+{
+    let p000 = to_world(Vec3::new(min_x, min_y, min_z));
+    let p001 = to_world(Vec3::new(min_x, min_y, max_z));
+    let p010 = to_world(Vec3::new(min_x, max_y, min_z));
+    let p011 = to_world(Vec3::new(min_x, max_y, max_z));
+    let p100 = to_world(Vec3::new(max_x, min_y, min_z));
+    let p101 = to_world(Vec3::new(max_x, min_y, max_z));
+    let p110 = to_world(Vec3::new(max_x, max_y, min_z));
+    let p111 = to_world(Vec3::new(max_x, max_y, max_z));
+
+    emit_player_face_uv(
+        vertices, indices, 0, p100, p110, p111, p101, uv_right, color,
+    );
+    emit_player_face_uv(
+        vertices, indices, 1, p001, p011, p010, p000, uv_left, color,
+    );
+    emit_player_face_uv(
+        vertices, indices, 2, p010, p011, p111, p110, uv_top, color,
+    );
+    emit_player_face_uv(
+        vertices, indices, 3, p001, p000, p100, p101, uv_bottom, color,
+    );
+    emit_player_face_uv(
+        vertices, indices, 4, p001, p101, p111, p011, uv_front, color,
+    );
+    emit_player_face_uv(
+        vertices, indices, 5, p100, p000, p010, p110, uv_back, color,
+    );
+}
+
+fn build_player_mesh(
+    player_position: Vec3,
+    player_forward: Vec3,
+    player_height: f32,
+) -> (Vec<ChunkVertex>, Vec<u32>) {
+    let mut vertices = Vec::with_capacity(24 * 6);
+    let mut indices = Vec::with_capacity(36 * 6);
+    let scale = (player_height.max(0.5) / 32.0).clamp(0.02, 0.24);
+    let mut look_forward = player_forward.normalize_or_zero();
+    if look_forward.length_squared() <= 1.0e-6 {
+        look_forward = Vec3::new(0.0, 0.0, -1.0);
+    }
+    let mut body_forward = Vec3::new(look_forward.x, 0.0, look_forward.z);
+    if body_forward.length_squared() <= 1.0e-6 {
+        body_forward = Vec3::new(0.0, 0.0, -1.0);
+    } else {
+        body_forward = body_forward.normalize();
+    }
+    let mut body_right = body_forward.cross(Vec3::Y).normalize_or_zero();
+    if body_right.length_squared() <= 1.0e-6 {
+        body_right = Vec3::X;
+    }
+    let body_up = Vec3::Y;
+    let head_pitch = look_forward.y.asin().clamp(-1.35, 1.35);
+    let (head_sin, head_cos) = head_pitch.sin_cos();
+    let head_forward = (body_forward * head_cos + body_up * head_sin).normalize_or_zero();
+    let head_up = (body_up * head_cos - body_forward * head_sin).normalize_or_zero();
+    let body_transform = PlayerPartTransform {
+        origin: player_position,
+        right: body_right,
+        up: body_up,
+        forward: body_forward,
+    };
+    let head_transform = PlayerPartTransform {
+        origin: player_position + body_up * (24.0 * scale),
+        right: body_right,
+        up: head_up,
+        forward: head_forward,
+    };
+    let body_to_world = |p: Vec3| -> [f32; 3] { player_part_to_world(&body_transform, p, scale) };
+    let head_to_world = |p: Vec3| -> [f32; 3] { player_part_to_world(&head_transform, p, scale) };
+    let color = [1.0, 1.0, 1.0, 1.0];
+
+    emit_player_box(
+        &mut vertices,
+        &mut indices,
+        &head_to_world,
+        -4.0,
+        0.0,
+        -4.0,
+        4.0,
+        8.0,
+        4.0,
+        SkinRect {
+            x: 0.0,
+            y: 8.0,
+            w: 8.0,
+            h: 8.0,
+        },
+        SkinRect {
+            x: 16.0,
+            y: 8.0,
+            w: 8.0,
+            h: 8.0,
+        },
+        SkinRect {
+            x: 8.0,
+            y: 0.0,
+            w: 8.0,
+            h: 8.0,
+        },
+        SkinRect {
+            x: 16.0,
+            y: 0.0,
+            w: 8.0,
+            h: 8.0,
+        },
+        SkinRect {
+            x: 8.0,
+            y: 8.0,
+            w: 8.0,
+            h: 8.0,
+        },
+        SkinRect {
+            x: 24.0,
+            y: 8.0,
+            w: 8.0,
+            h: 8.0,
+        },
+        color,
+    );
+    emit_player_box(
+        &mut vertices,
+        &mut indices,
+        &body_to_world,
+        -4.0,
+        12.0,
+        -2.0,
+        4.0,
+        24.0,
+        2.0,
+        SkinRect {
+            x: 16.0,
+            y: 20.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 28.0,
+            y: 20.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 20.0,
+            y: 16.0,
+            w: 8.0,
+            h: 4.0,
+        },
+        SkinRect {
+            x: 28.0,
+            y: 16.0,
+            w: 8.0,
+            h: 4.0,
+        },
+        SkinRect {
+            x: 20.0,
+            y: 20.0,
+            w: 8.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 32.0,
+            y: 20.0,
+            w: 8.0,
+            h: 12.0,
+        },
+        color,
+    );
+    emit_player_box(
+        &mut vertices,
+        &mut indices,
+        &body_to_world,
+        -8.0,
+        12.0,
+        -2.0,
+        -4.0,
+        24.0,
+        2.0,
+        SkinRect {
+            x: 32.0,
+            y: 52.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 40.0,
+            y: 52.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 36.0,
+            y: 48.0,
+            w: 4.0,
+            h: 4.0,
+        },
+        SkinRect {
+            x: 40.0,
+            y: 48.0,
+            w: 4.0,
+            h: 4.0,
+        },
+        SkinRect {
+            x: 36.0,
+            y: 52.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 44.0,
+            y: 52.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        color,
+    );
+    emit_player_box(
+        &mut vertices,
+        &mut indices,
+        &body_to_world,
+        4.0,
+        12.0,
+        -2.0,
+        8.0,
+        24.0,
+        2.0,
+        SkinRect {
+            x: 40.0,
+            y: 20.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 48.0,
+            y: 20.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 44.0,
+            y: 16.0,
+            w: 4.0,
+            h: 4.0,
+        },
+        SkinRect {
+            x: 48.0,
+            y: 16.0,
+            w: 4.0,
+            h: 4.0,
+        },
+        SkinRect {
+            x: 44.0,
+            y: 20.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 52.0,
+            y: 20.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        color,
+    );
+    emit_player_box(
+        &mut vertices,
+        &mut indices,
+        &body_to_world,
+        -4.0,
+        0.0,
+        -2.0,
+        0.0,
+        12.0,
+        2.0,
+        SkinRect {
+            x: 16.0,
+            y: 52.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 24.0,
+            y: 52.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 20.0,
+            y: 48.0,
+            w: 4.0,
+            h: 4.0,
+        },
+        SkinRect {
+            x: 24.0,
+            y: 48.0,
+            w: 4.0,
+            h: 4.0,
+        },
+        SkinRect {
+            x: 20.0,
+            y: 52.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 28.0,
+            y: 52.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        color,
+    );
+    emit_player_box(
+        &mut vertices,
+        &mut indices,
+        &body_to_world,
+        0.0,
+        0.0,
+        -2.0,
+        4.0,
+        12.0,
+        2.0,
+        SkinRect {
+            x: 0.0,
+            y: 20.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 8.0,
+            y: 20.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 4.0,
+            y: 16.0,
+            w: 4.0,
+            h: 4.0,
+        },
+        SkinRect {
+            x: 8.0,
+            y: 16.0,
+            w: 4.0,
+            h: 4.0,
+        },
+        SkinRect {
+            x: 4.0,
+            y: 20.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        SkinRect {
+            x: 12.0,
+            y: 20.0,
+            w: 4.0,
+            h: 12.0,
+        },
+        color,
+    );
+
+    (vertices, indices)
+}
+
 fn ensure_ui_vertex_capacity(gpu: &mut GpuInner, required_vertices: usize) {
     if required_vertices <= gpu.ui_vertex_capacity {
         return;
@@ -2224,12 +2948,12 @@ fn build_inventory_ui_vertices(
         let raw_name = item_name_by_id(selected_stack.block_id);
         let item_name = raw_name.replace('_', " ");
         let pixel = (layout.slot * 0.072).clamp(1.2, 2.8);
-        let max_chars = (((width_f * 0.82) / (pixel * 4.0)).floor() as usize).max(1);
+        let max_chars = (((width_f * 0.82) / text_char_advance(pixel)).floor() as usize).max(1);
         let text = clipped_text(&item_name, max_chars);
-        let text_w = text_width_3x5(&text, pixel);
+        let text_w = text_width_pixel(&text, pixel);
         let text_x = (width_f - text_w) * 0.5;
-        let text_y = (layout.hotbar_y - pixel * 7.0).max(4.0);
-        push_text_3x5_shadow(
+        let text_y = (layout.hotbar_y - text_line_height(pixel) - text_render_pixel(pixel)).max(4.0);
+        push_text_pixel_shadow(
             &mut vertices,
             width_f,
             height_f,
@@ -2448,7 +3172,7 @@ fn push_chat_overlay(
     let width_f = width as f32;
     let height_f = height as f32;
     let pixel = (width_f.min(height_f) * 0.0032).clamp(1.5, 2.8);
-    let line_h = pixel * 6.0;
+    let line_h = text_line_height(pixel);
     let panel_w = (width_f * 0.50).clamp(260.0, 620.0);
     let panel_x = (width_f * 0.018).clamp(8.0, 20.0);
     let panel_bottom_margin = (height_f * 0.16).clamp(78.0, 132.0);
@@ -2484,12 +3208,12 @@ fn push_chat_overlay(
         [0.80, 0.86, 0.92, 0.28],
     );
 
-    let max_chars = (((panel_w - pad * 2.0) / (pixel * 4.0)).floor() as usize).max(1);
+    let max_chars = (((panel_w - pad * 2.0) / text_char_advance(pixel)).floor() as usize).max(1);
     let start_index = chat_lines.len().saturating_sub(shown_count);
     for (row, line) in chat_lines[start_index..].iter().enumerate() {
         let visible = clipped_text(line, max_chars);
         let y = panel_y + pad + row as f32 * line_h;
-        push_text_3x5_shadow(
+        push_text_pixel_shadow(
             out,
             width_f,
             height_f,
@@ -2519,7 +3243,7 @@ fn push_chat_overlay(
             input_visible.push(' ');
         }
         let input_text = format!("> {input_visible}_");
-        push_text_3x5_shadow(
+        push_text_pixel_shadow(
             out,
             width_f,
             height_f,
@@ -2546,7 +3270,7 @@ fn push_stats_overlay(
     let width_f = width as f32;
     let height_f = height as f32;
     let pixel = (width_f.min(height_f) * 0.0029).clamp(1.3, 2.2);
-    let line_h = pixel * 6.0;
+    let line_h = text_line_height(pixel);
     let panel_x = 8.0;
     let panel_y = 8.0;
     let panel_w = (width_f * 0.62).clamp(300.0, 900.0);
@@ -2579,10 +3303,10 @@ fn push_stats_overlay(
         [0.76, 0.87, 0.96, 0.30],
     );
 
-    let max_chars = (((panel_w - pad * 2.0) / (pixel * 4.0)).floor() as usize).max(1);
+    let max_chars = (((panel_w - pad * 2.0) / text_char_advance(pixel)).floor() as usize).max(1);
     for (idx, line) in lines.iter().take(shown_count).enumerate() {
         let text = clipped_text(line, max_chars);
-        push_text_3x5_shadow(
+        push_text_pixel_shadow(
             out,
             width_f,
             height_f,
@@ -2609,9 +3333,9 @@ fn push_keybind_overlay(
     let width_f = width as f32;
     let height_f = height as f32;
     let pixel = (width_f.min(height_f) * 0.0030).clamp(1.4, 2.4);
-    let line_h = pixel * 6.0;
+    let line_h = text_line_height(pixel);
     let panel_w = (width_f * 0.76).clamp(360.0, 1040.0);
-    let panel_h = (lines.len() as f32 * line_h + pixel * 6.0).clamp(120.0, height_f * 0.88);
+    let panel_h = (lines.len() as f32 * line_h + text_line_height(pixel)).clamp(120.0, height_f * 0.88);
     let panel_x = (width_f - panel_w) * 0.5;
     let panel_y = (height_f - panel_h) * 0.16;
     let pad = (pixel * 2.5).clamp(4.0, 9.0);
@@ -2637,7 +3361,7 @@ fn push_keybind_overlay(
         [0.84, 0.91, 0.98, 0.35],
     );
 
-    let max_chars = (((panel_w - pad * 2.0) / (pixel * 4.0)).floor() as usize).max(1);
+    let max_chars = (((panel_w - pad * 2.0) / text_char_advance(pixel)).floor() as usize).max(1);
     let max_lines = (((panel_h - pad * 2.0) / line_h).floor() as usize).max(1);
     for (idx, line) in lines.iter().take(max_lines).enumerate() {
         let text = clipped_text(line, max_chars);
@@ -2646,7 +3370,7 @@ fn push_keybind_overlay(
         } else {
             [0.94, 0.95, 0.98, 0.97]
         };
-        push_text_3x5_shadow(
+        push_text_pixel_shadow(
             out,
             width_f,
             height_f,
@@ -2742,10 +3466,10 @@ fn push_pause_menu_overlay(
     );
 
     let title = "paused";
-    let title_w = text_width_3x5(title, pixel * 1.45);
+    let title_w = text_width_pixel(title, pixel * 1.45);
     let title_x = layout.panel.x + (layout.panel.w - title_w) * 0.5;
     let title_y = layout.panel.y + (layout.panel.h * 0.17).max(14.0);
-    push_text_3x5_shadow(
+    push_text_pixel_shadow(
         out,
         width_f,
         height_f,
@@ -2852,10 +3576,10 @@ fn push_pause_menu_button(
     } else {
         (pixel * 0.92).clamp(1.2, 2.3)
     };
-    let text_w = text_width_3x5(text, text_pixel);
+    let text_w = text_width_pixel(text, text_pixel);
     let text_x = x + (w - text_w) * 0.5;
-    let text_y = y + (h - text_pixel * 5.0) * 0.5;
-    push_text_3x5_shadow(
+    let text_y = y + (h - text_glyph_height(text_pixel)) * 0.5;
+    push_text_pixel_shadow(
         out,
         width,
         height,
@@ -3047,10 +3771,10 @@ fn push_stack_count_text(
     }
     let count_text = count.to_string();
     let pixel = (rect.w * 0.06).clamp(1.0, 2.4);
-    let text_w = text_width_3x5(&count_text, pixel);
+    let text_w = text_width_pixel(&count_text, pixel);
     let text_x = rect.x + rect.w - text_w - pixel * 1.3;
-    let text_y = rect.y + rect.h - pixel * 6.0;
-    push_text_3x5_shadow(
+    let text_y = rect.y + rect.h - text_line_height(pixel);
+    push_text_pixel_shadow(
         out,
         width,
         height,
@@ -3499,16 +4223,46 @@ fn push_ui_rect(
     out.extend_from_slice(&[v0, v1, v2, v0, v2, v3]);
 }
 
-fn text_width_3x5(text: &str, pixel: f32) -> f32 {
-    let count = text.chars().count() as f32;
-    if count <= 0.0 {
-        return 0.0;
-    }
-    // 3 px glyph width + 1 px spacing.
-    count * (pixel * 3.0) + (count - 1.0) * pixel
+fn text_render_pixel(pixel: f32) -> f32 {
+    (pixel * UI_TEXT_PIXEL_SCALE).max(1.0).round()
 }
 
-fn push_text_3x5_shadow(
+fn text_char_advance(pixel: f32) -> f32 {
+    let render_pixel = text_render_pixel(pixel);
+    render_pixel * (UI_TEXT_GLYPH_WIDTH as f32 + UI_TEXT_GLYPH_SPACING)
+}
+
+fn text_line_height(pixel: f32) -> f32 {
+    let render_pixel = text_render_pixel(pixel);
+    render_pixel * (UI_TEXT_GLYPH_HEIGHT as f32 + UI_TEXT_LINE_GAP)
+}
+
+fn text_glyph_height(pixel: f32) -> f32 {
+    text_render_pixel(pixel) * UI_TEXT_GLYPH_HEIGHT as f32
+}
+
+fn text_width_pixel(text: &str, pixel: f32) -> f32 {
+    let mut widest_line_chars = 0usize;
+    let mut line_chars = 0usize;
+    for ch in text.chars() {
+        if ch == '\n' {
+            widest_line_chars = widest_line_chars.max(line_chars);
+            line_chars = 0;
+            continue;
+        }
+        line_chars += 1;
+    }
+    widest_line_chars = widest_line_chars.max(line_chars);
+    if widest_line_chars == 0 {
+        return 0.0;
+    }
+    let render_pixel = text_render_pixel(pixel);
+    let glyph_w = render_pixel * UI_TEXT_GLYPH_WIDTH as f32;
+    let spacing = render_pixel * UI_TEXT_GLYPH_SPACING;
+    widest_line_chars as f32 * glyph_w + (widest_line_chars as f32 - 1.0) * spacing
+}
+
+fn push_text_pixel_shadow(
     out: &mut Vec<UiVertex>,
     width: f32,
     height: f32,
@@ -3521,8 +4275,8 @@ fn push_text_3x5_shadow(
     if text.is_empty() || pixel <= 0.0 {
         return;
     }
-    let shadow_offset = pixel.max(1.0);
-    push_text_3x5(
+    let shadow_offset = text_render_pixel(pixel);
+    push_text_pixel(
         out,
         width,
         height,
@@ -3532,15 +4286,15 @@ fn push_text_3x5_shadow(
         text,
         [0.0, 0.0, 0.0, color[3] * 0.75],
     );
-    push_text_3x5(out, width, height, x, y, pixel, text, color);
+    push_text_pixel(out, width, height, x, y, pixel, text, color);
 }
 
-fn push_text_3x5(
+fn push_text_pixel(
     out: &mut Vec<UiVertex>,
     width: f32,
     height: f32,
-    mut x: f32,
-    mut y: f32,
+    x: f32,
+    y: f32,
     pixel: f32,
     text: &str,
     color: [f32; 4],
@@ -3548,103 +4302,46 @@ fn push_text_3x5(
     if text.is_empty() || pixel <= 0.0 {
         return;
     }
-    let line_start_x = x;
+    let render_pixel = text_render_pixel(pixel);
+    let glyph_advance = render_pixel * (UI_TEXT_GLYPH_WIDTH as f32 + UI_TEXT_GLYPH_SPACING);
+    let glyph_line_height = render_pixel * (UI_TEXT_GLYPH_HEIGHT as f32 + UI_TEXT_LINE_GAP);
+    let mut cursor_x = x.round();
+    let mut cursor_y = y.round();
+    let line_start_x = cursor_x;
     for ch in text.chars() {
         if ch == '\n' {
-            y += pixel * 6.0;
-            x = line_start_x;
+            cursor_y += glyph_line_height;
+            cursor_x = line_start_x;
             continue;
         }
-        let glyph = glyph_3x5(ch).unwrap_or([0b111, 0b101, 0b111, 0b101, 0b101]);
+        let glyph = glyph_8x8(ch);
         for (row, bits) in glyph.iter().copied().enumerate() {
-            for col in 0..3 {
-                if (bits & (1 << (2 - col))) == 0 {
+            for col in 0..UI_TEXT_GLYPH_WIDTH {
+                if (bits & (1u8 << col)) == 0 {
                     continue;
                 }
                 push_ui_rect(
                     out,
                     width,
                     height,
-                    x + col as f32 * pixel,
-                    y + row as f32 * pixel,
-                    pixel,
-                    pixel,
+                    cursor_x + col as f32 * render_pixel,
+                    cursor_y + row as f32 * render_pixel,
+                    render_pixel,
+                    render_pixel,
                     color,
                 );
             }
         }
-        x += pixel * 4.0;
+        cursor_x += glyph_advance;
     }
 }
 
-fn glyph_3x5(ch: char) -> Option<[u8; 5]> {
-    match ch.to_ascii_lowercase() {
-        '0' => Some([0b111, 0b101, 0b101, 0b101, 0b111]),
-        '1' => Some([0b010, 0b110, 0b010, 0b010, 0b111]),
-        '2' => Some([0b111, 0b001, 0b111, 0b100, 0b111]),
-        '3' => Some([0b111, 0b001, 0b111, 0b001, 0b111]),
-        '4' => Some([0b101, 0b101, 0b111, 0b001, 0b001]),
-        '5' => Some([0b111, 0b100, 0b111, 0b001, 0b111]),
-        '6' => Some([0b111, 0b100, 0b111, 0b101, 0b111]),
-        '7' => Some([0b111, 0b001, 0b010, 0b010, 0b010]),
-        '8' => Some([0b111, 0b101, 0b111, 0b101, 0b111]),
-        '9' => Some([0b111, 0b101, 0b111, 0b001, 0b111]),
-        'a' => Some([0b111, 0b001, 0b111, 0b101, 0b111]),
-        'b' => Some([0b110, 0b101, 0b110, 0b101, 0b110]),
-        'c' => Some([0b111, 0b100, 0b100, 0b100, 0b111]),
-        'd' => Some([0b110, 0b101, 0b101, 0b101, 0b110]),
-        'e' => Some([0b111, 0b100, 0b110, 0b100, 0b111]),
-        'f' => Some([0b111, 0b100, 0b110, 0b100, 0b100]),
-        'g' => Some([0b111, 0b100, 0b101, 0b101, 0b111]),
-        'h' => Some([0b101, 0b101, 0b111, 0b101, 0b101]),
-        'i' => Some([0b111, 0b010, 0b010, 0b010, 0b111]),
-        'j' => Some([0b001, 0b001, 0b001, 0b101, 0b111]),
-        'k' => Some([0b101, 0b101, 0b110, 0b101, 0b101]),
-        'l' => Some([0b100, 0b100, 0b100, 0b100, 0b111]),
-        'm' => Some([0b101, 0b111, 0b111, 0b101, 0b101]),
-        'n' => Some([0b110, 0b101, 0b101, 0b101, 0b101]),
-        'o' => Some([0b111, 0b101, 0b101, 0b101, 0b111]),
-        'p' => Some([0b111, 0b101, 0b111, 0b100, 0b100]),
-        'q' => Some([0b111, 0b101, 0b101, 0b111, 0b001]),
-        'r' => Some([0b110, 0b101, 0b110, 0b101, 0b101]),
-        's' => Some([0b111, 0b100, 0b111, 0b001, 0b111]),
-        't' => Some([0b111, 0b010, 0b010, 0b010, 0b010]),
-        'u' => Some([0b101, 0b101, 0b101, 0b101, 0b111]),
-        'v' => Some([0b101, 0b101, 0b101, 0b101, 0b010]),
-        'w' => Some([0b101, 0b101, 0b111, 0b111, 0b101]),
-        'x' => Some([0b101, 0b101, 0b010, 0b101, 0b101]),
-        'y' => Some([0b101, 0b101, 0b111, 0b001, 0b111]),
-        'z' => Some([0b111, 0b001, 0b010, 0b100, 0b111]),
-        '.' => Some([0b000, 0b000, 0b000, 0b000, 0b010]),
-        ',' => Some([0b000, 0b000, 0b000, 0b010, 0b100]),
-        ':' => Some([0b000, 0b010, 0b000, 0b010, 0b000]),
-        ';' => Some([0b000, 0b010, 0b000, 0b010, 0b100]),
-        '!' => Some([0b010, 0b010, 0b010, 0b000, 0b010]),
-        '?' => Some([0b111, 0b001, 0b011, 0b000, 0b010]),
-        '\'' => Some([0b010, 0b010, 0b000, 0b000, 0b000]),
-        '"' => Some([0b101, 0b101, 0b000, 0b000, 0b000]),
-        '/' => Some([0b001, 0b001, 0b010, 0b100, 0b100]),
-        '\\' => Some([0b100, 0b100, 0b010, 0b001, 0b001]),
-        '-' => Some([0b000, 0b000, 0b111, 0b000, 0b000]),
-        '+' => Some([0b000, 0b010, 0b111, 0b010, 0b000]),
-        '=' => Some([0b000, 0b111, 0b000, 0b111, 0b000]),
-        '_' => Some([0b000, 0b000, 0b000, 0b000, 0b111]),
-        '(' => Some([0b001, 0b010, 0b010, 0b010, 0b001]),
-        ')' => Some([0b100, 0b010, 0b010, 0b010, 0b100]),
-        '[' => Some([0b011, 0b010, 0b010, 0b010, 0b011]),
-        ']' => Some([0b110, 0b010, 0b010, 0b010, 0b110]),
-        '<' => Some([0b001, 0b010, 0b100, 0b010, 0b001]),
-        '>' => Some([0b100, 0b010, 0b001, 0b010, 0b100]),
-        '*' => Some([0b000, 0b101, 0b010, 0b101, 0b000]),
-        '#' => Some([0b101, 0b111, 0b101, 0b111, 0b101]),
-        '%' => Some([0b101, 0b001, 0b010, 0b100, 0b101]),
-        '|' => Some([0b010, 0b010, 0b010, 0b010, 0b010]),
-        '^' => Some([0b010, 0b101, 0b000, 0b000, 0b000]),
-        '~' => Some([0b000, 0b010, 0b101, 0b000, 0b000]),
-        '@' => Some([0b111, 0b101, 0b111, 0b100, 0b111]),
-        ' ' => Some([0b000, 0b000, 0b000, 0b000, 0b000]),
-        _ => None,
-    }
+fn glyph_8x8(ch: char) -> [u8; 8] {
+    BASIC_FONTS
+        .get(ch)
+        .or_else(|| BASIC_FONTS.get(ch.to_ascii_uppercase()))
+        .or_else(|| BASIC_FONTS.get(ch.to_ascii_lowercase()))
+        .unwrap_or_else(|| BASIC_FONTS.get('?').unwrap_or([0; 8]))
 }
 
 fn push_block_icon(

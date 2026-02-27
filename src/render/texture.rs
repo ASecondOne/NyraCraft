@@ -172,6 +172,42 @@ pub fn load_grass_colormap_texture(device: &wgpu::Device, queue: &wgpu::Queue) -
     )
 }
 
+pub fn load_player_skin_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> SampledTexture {
+    let candidate_paths = [
+        PathBuf::from("src/texturing/steve.png"),
+        PathBuf::from("src/texturing/player_skin.png"),
+    ];
+    for path in candidate_paths {
+        if !path.exists() {
+            continue;
+        }
+        match image::open(&path) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                return create_texture_from_rgba(
+                    device,
+                    queue,
+                    "player_skin_texture",
+                    &rgba,
+                    wgpu::FilterMode::Nearest,
+                );
+            }
+            Err(e) => {
+                eprintln!("failed to open player skin {}: {e}", path.display());
+            }
+        }
+    }
+
+    let fallback = image::RgbaImage::from_pixel(64, 64, image::Rgba([206, 163, 132, 255]));
+    create_texture_from_rgba(
+        device,
+        queue,
+        "player_skin_fallback",
+        &fallback,
+        wgpu::FilterMode::Nearest,
+    )
+}
+
 pub fn create_dummy_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> AtlasTexture {
     let fallback = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]));
     let sampled = create_texture_from_rgba(

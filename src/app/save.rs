@@ -48,6 +48,7 @@ pub struct LoadedRuntimeState {
     pub warnings: Vec<String>,
 }
 
+#[derive(Clone)]
 pub struct SaveIo {
     root_dir: PathBuf,
     meta: SaveMeta,
@@ -55,7 +56,8 @@ pub struct SaveIo {
 
 impl SaveIo {
     pub fn new(world_gen: &WorldGen) -> Self {
-        let root_dir = PathBuf::from(SAVE_ROOT_DIR).join(format!("world_{:016x}", world_gen.world_id));
+        let root_dir =
+            PathBuf::from(SAVE_ROOT_DIR).join(format!("world_{:016x}", world_gen.world_id));
         let meta = SaveMeta {
             format_version: SAVE_FORMAT_VERSION,
             world_id: world_gen.world_id,
@@ -91,7 +93,9 @@ impl SaveIo {
                 }
             }
             Ok(None) => {}
-            Err(err) => out.warnings.push(format!("failed to load meta.json: {err}")),
+            Err(err) => out
+                .warnings
+                .push(format!("failed to load meta.json: {err}")),
         }
 
         match read_json_optional::<SavedPlayerState>(&self.path(PLAYER_FILE)) {

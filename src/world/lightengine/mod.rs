@@ -1,4 +1,4 @@
-use crate::world::blocks::core_block_ids;
+use crate::world::blocks::{block_is_collidable, core_block_ids};
 
 pub fn compute_face_light<F>(
     face: u32,
@@ -21,18 +21,18 @@ where
         _ => 0.62f32, // sides
     };
     if !use_sky_shading {
-        // Fallback shading for non-sky passes (lower contrast, but not over-bright).
-        return (0.02f32 + base * 0.45f32).clamp(0.01f32, 0.55f32);
+        // Fallback shading for low-detail passes where full sky probing is skipped.
+        return (0.015f32 + base * 0.34f32).clamp(0.01f32, 0.42f32);
     }
     let (cx, cy, cz) = face_center_sample(face, wx, wy, wz, sx, sy, sz);
     let mut sky = sample_sky_visibility_fast(face, cx, cy, cz, leaves_id, block_at);
     if face == 3 {
         // Bottom faces receive less direct sky lighting.
-        sky *= 0.74;
+        sky *= 0.66;
     }
-    // Square visibility so enclosed spaces drop off harder.
-    let sky_curve = 0.28f32 * sky + 0.72f32 * sky * sky;
-    let ambient = 0.004f32 + 0.022f32 * sky;
+    // Bias toward darker low-visibility results so caves stop looking washed out.
+    let sky_curve = 0.18f32 * sky + 0.82f32 * sky * sky;
+    let ambient = 0.003f32 + 0.018f32 * sky;
     (ambient + base * sky_curve).clamp(0.0f32, 1.0f32)
 }
 
@@ -77,16 +77,26 @@ where
     let bz = z.floor() as i32;
     let by = y.floor() as i32;
 
-    let above0 = sun_visibility_mul(block_at(bx, by, bz), leaves_id);
-    let above1 = sun_visibility_mul(block_at(bx, by + 1, bz), leaves_id);
-    let above2 = sun_visibility_mul(block_at(bx, by + 2, bz), leaves_id);
-    let above3 = if face == 2 {
-        sun_visibility_mul(block_at(bx, by + 4, bz), leaves_id)
-    } else {
-        1.0
-    };
+    // Near-probe: catches immediate ceilings and overhangs around the current face.
+    let mut visibility = 1.0f32;
+    visibility *= sun_visibility_mul_near(block_at(bx, by, bz), leaves_id);
+    visibility *= sun_visibility_mul_near(block_at(bx, by + 1, bz), leaves_id);
+    visibility *= sun_visibility_mul_near(block_at(bx, by + 2, bz), leaves_id);
+    if visibility <= 0.01 {
+        return 0.0;
+    }
 
-    let mut visibility = above0 * above1 * above2 * above3;
+    // Far-probe: adaptive vertical sampling to detect cave roofs deeper above the face.
+    const SKY_FAR_PROBE_OFFSETS: [i32; 6] = [4, 7, 11, 16, 24, 36];
+    for dy in SKY_FAR_PROBE_OFFSETS {
+        visibility *= sun_visibility_mul_far(block_at(bx, by + dy, bz), leaves_id);
+        if visibility <= 0.01 {
+            return 0.0;
+        }
+    }
+    if face == 2 {
+        visibility *= sun_visibility_mul_far(block_at(bx, by + 52, bz), leaves_id);
+    }
 
     let ring_ids_near = [
         block_at(bx + 1, by, bz),
@@ -94,61 +104,97 @@ where
         block_at(bx, by, bz + 1),
         block_at(bx, by, bz - 1),
     ];
-    let ring_ids_far = [
+    let ring_ids_above = [
         block_at(bx + 1, by + 1, bz),
         block_at(bx - 1, by + 1, bz),
         block_at(bx, by + 1, bz + 1),
         block_at(bx, by + 1, bz - 1),
     ];
+
+    // Local overhang penalty around the light shaft.
     let mut roof_cover = 0.0f32;
     for id in ring_ids_near {
-        roof_cover += if id < 0 {
-            0.0
-        } else if id == leaves_id {
-            0.06
-        } else {
-            0.12
-        };
+        roof_cover += local_cover_weight(id, leaves_id, 0.05, 0.16);
     }
-    for id in ring_ids_far {
-        roof_cover += if id < 0 {
-            0.0
-        } else if id == leaves_id {
-            0.04
-        } else {
-            0.08
-        };
+    for id in ring_ids_above {
+        roof_cover += local_cover_weight(id, leaves_id, 0.03, 0.10);
     }
     visibility *= (1.0 - roof_cover).clamp(0.02, 1.0);
 
-    let side_y = y.floor() as i32;
-    let side_ids = [
-        block_at(bx + 1, side_y, bz),
-        block_at(bx - 1, side_y, bz),
-        block_at(bx, side_y, bz + 1),
-        block_at(bx, side_y, bz - 1),
-    ];
+    // Tunnel enclosure penalty to suppress bright side walls deep in caves.
     let mut enclosure = 0.0f32;
-    for id in side_ids {
-        enclosure += if id < 0 {
-            0.0
-        } else if id == leaves_id {
-            0.07
-        } else {
-            0.15
-        };
+    for id in ring_ids_near {
+        enclosure += local_cover_weight(id, leaves_id, 0.04, 0.12);
     }
-    visibility *= (1.0 - enclosure).clamp(0.02, 1.0);
+    let enclosure_scale = match face {
+        2 => 0.35, // top
+        3 => 0.95, // bottom
+        _ => 0.75, // sides
+    };
+    if enclosure > 0.0 {
+        visibility *= (1.0 - enclosure * enclosure_scale).clamp(0.03, 1.0);
+    }
 
     visibility.clamp(0.0, 1.0)
 }
 
-fn sun_visibility_mul(id: i8, leaves_id: i8) -> f32 {
+#[inline]
+fn local_cover_weight(id: i8, leaves_id: i8, leaves_weight: f32, solid_weight: f32) -> f32 {
+    if id < 0 {
+        0.0
+    } else if !block_is_collidable(id) {
+        0.0
+    } else if id == leaves_id {
+        leaves_weight
+    } else {
+        solid_weight
+    }
+}
+
+#[inline]
+fn sun_visibility_mul_near(id: i8, leaves_id: i8) -> f32 {
     if id < 0 {
         1.0
+    } else if !block_is_collidable(id) {
+        1.0
     } else if id == leaves_id {
-        0.72
+        0.80
     } else {
-        0.42
+        0.14
+    }
+}
+
+#[inline]
+fn sun_visibility_mul_far(id: i8, leaves_id: i8) -> f32 {
+    if id < 0 {
+        1.0
+    } else if !block_is_collidable(id) {
+        1.0
+    } else if id == leaves_id {
+        0.90
+    } else {
+        0.46
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_face_light;
+
+    #[test]
+    fn open_sky_is_brighter_than_cave_roof() {
+        let open = |_: i32, _: i32, _: i32| -> i8 { -1 };
+        let roofed = |_: i32, y: i32, _: i32| -> i8 { if y >= 8 { 0 } else { -1 } };
+        let open_light = compute_face_light(2, 0, 0, 0, 1, 1, 1, true, &open);
+        let roofed_light = compute_face_light(2, 0, 0, 0, 1, 1, 1, true, &roofed);
+        assert!(open_light > roofed_light);
+        assert!(roofed_light < 0.12);
+    }
+
+    #[test]
+    fn near_ceiling_darkens_side_faces() {
+        let near_roof = |_: i32, y: i32, _: i32| -> i8 { if y >= 2 { 0 } else { -1 } };
+        let side_light = compute_face_light(0, 0, 0, 0, 1, 1, 1, true, &near_roof);
+        assert!(side_light < 0.07);
     }
 }

@@ -52,7 +52,14 @@ pub fn push_chat_line(console: &mut CommandConsoleState, line: &str) {
     }
 }
 
-fn execute_chat_line(raw_line: &str, inventory: &mut InventoryState) -> Option<String> {
+fn execute_chat_line<F>(
+    raw_line: &str,
+    inventory: &mut InventoryState,
+    command_handler: &mut F,
+) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let mut line = sanitize_console_input(raw_line);
     line = line.trim().to_string();
     if line.is_empty() {
@@ -60,7 +67,7 @@ fn execute_chat_line(raw_line: &str, inventory: &mut InventoryState) -> Option<S
     }
     truncate_to_char_limit(&mut line, MAX_CHAT_LINE_CHARS);
     if line.starts_with('/') {
-        let feedback = execute_console_command(&line, inventory);
+        let feedback = execute_console_command_with_handler(&line, inventory, command_handler);
         let command = line.trim_start_matches('/').trim();
         log_info(format!("command /{} -> {}", command, feedback));
         Some(format!("/{command} -> {feedback}"))
@@ -99,16 +106,20 @@ pub fn close_command_console(
     }
 }
 
-pub fn execute_and_close_command_console(
+pub fn execute_and_close_command_console<F>(
     console: &mut CommandConsoleState,
     inventory: &mut InventoryState,
     inventory_open: bool,
     window: &Window,
     mouse_enabled: &mut bool,
     last_cursor_pos: &mut Option<(f64, f64)>,
-) -> bool {
+    mut command_handler: F,
+) -> bool
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let mut submitted = false;
-    if let Some(message) = execute_chat_line(&console.input, inventory) {
+    if let Some(message) = execute_chat_line(&console.input, inventory, &mut command_handler) {
         push_chat_line(console, &message);
         submitted = true;
     }
@@ -122,7 +133,23 @@ pub fn execute_and_close_command_console(
     submitted
 }
 
+#[allow(dead_code)]
 pub fn execute_console_command(raw: &str, inventory: &mut InventoryState) -> String {
+    fn no_external_command(_: &str) -> Option<String> {
+        None
+    }
+    let mut no_handler = no_external_command;
+    execute_console_command_with_handler(raw, inventory, &mut no_handler)
+}
+
+fn execute_console_command_with_handler<F>(
+    raw: &str,
+    inventory: &mut InventoryState,
+    command_handler: &mut F,
+) -> String
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let line = raw.trim().trim_start_matches('/');
     if line.is_empty() {
         return "empty command".to_string();
@@ -132,8 +159,7 @@ pub fn execute_console_command(raw: &str, inventory: &mut InventoryState) -> Str
     let command = parts.next().unwrap_or_default().to_ascii_lowercase();
     match command.as_str() {
         "help" => {
-            "commands: give <item> [count], items | ids: 1:<block_id> (block), 2:<item_id> (item)"
-                .to_string()
+            "commands: give <item> [count], items, time set <day|night|morning|none>, tp <x> <y> <z> | ids: 1:<block_id> (block), 2:<item_id> (item), tp supports ~ relative coords".to_string()
         }
         "items" => all_item_defs()
             .iter()
@@ -175,6 +201,7 @@ pub fn execute_console_command(raw: &str, inventory: &mut InventoryState) -> Str
                 format!("gave {} x{}", item_name_by_id(item_id), added)
             }
         }
-        _ => format!("unknown command `{command}` (try `help`)"),
+        _ => command_handler(line)
+            .unwrap_or_else(|| format!("unknown command `{command}` (try `help`)")),
     }
 }

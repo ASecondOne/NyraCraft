@@ -1,4 +1,4 @@
-use crate::render::BlockTexture;
+use crate::render::block::{BlockTexture, RENDER_SHAPE_CROSS, RENDER_SHAPE_CUBE};
 use rand::Rng;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -196,6 +196,8 @@ struct BlockDef {
     aliases: Vec<String>,
     hardness: f32,
     required_tool: Option<ToolType>,
+    light_emission: f32,
+    collidable: bool,
     texture: BlockTexture,
     item_id: i8,
     item_atlas_slot_1based: Option<u32>,
@@ -208,6 +210,8 @@ struct Registry {
     block_textures: Vec<BlockTexture>,
     block_hardness: Vec<f32>,
     block_required_tools: Vec<Option<ToolType>>,
+    block_light_emission: Vec<f32>,
+    block_collidable: Vec<bool>,
     block_index: Vec<BlockIndexEntry>,
     block_name_to_id: HashMap<String, i8>,
     items: Vec<ItemDef>,
@@ -258,6 +262,12 @@ struct RawBlockFile {
     #[serde(default, alias = "preferred_tool", alias = "tool_type")]
     required_tool: Option<String>,
     #[serde(default)]
+    light_emission: Option<f32>,
+    #[serde(default)]
+    collidable: Option<bool>,
+    #[serde(default)]
+    render_shape: Option<String>,
+    #[serde(default)]
     texture_slot_1based: Option<u32>,
     #[serde(default)]
     textures_slot_1based: Option<[u32; 6]>,
@@ -275,6 +285,8 @@ struct RawBlockFile {
     drop_item: Option<RawIdValue>,
     #[serde(default)]
     drop_items: Vec<RawDropEntry>,
+    #[serde(default)]
+    drop_nothing: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,6 +436,8 @@ fn missing_block_texture() -> BlockTexture {
         tiles: [MISSING_TILE_INDEX; 6],
         rotations: [0; 6],
         transparent_mode: [0; 6],
+        light_emission: 0.0,
+        render_shape: RENDER_SHAPE_CUBE,
     }
 }
 
@@ -493,6 +507,22 @@ fn parse_tool_type(raw: &str) -> Option<ToolType> {
         "knife" => Some(ToolType::Knife),
         "sword" => Some(ToolType::Sword),
         _ => None,
+    }
+}
+
+fn parse_render_shape(raw: Option<&str>) -> u8 {
+    let Some(shape) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return RENDER_SHAPE_CUBE;
+    };
+    match shape.to_ascii_lowercase().as_str() {
+        "cube" | "block" => RENDER_SHAPE_CUBE,
+        "cross" | "x" | "x_cross" | "crossed" | "crossed_quads" | "plant" => {
+            RENDER_SHAPE_CROSS
+        }
+        _ => {
+            eprintln!("unknown render_shape `{shape}`, defaulting to cube");
+            RENDER_SHAPE_CUBE
+        }
     }
 }
 
@@ -817,7 +847,7 @@ fn load_registry(tiles_x: u32) -> Registry {
         .unwrap_or(0);
 
     let mut blocks: Vec<Option<BlockDef>> = vec![None; max_block_id + 1];
-    let mut pending_block_drops: Vec<Option<(Option<RawIdValue>, Vec<RawDropEntry>)>> =
+    let mut pending_block_drops: Vec<Option<(Option<RawIdValue>, Vec<RawDropEntry>, bool)>> =
         vec![None; max_block_id + 1];
     let mut used_block_item_ids = HashSet::<i8>::new();
     let mut block_namespace_to_id = HashMap::<u32, i8>::new();
@@ -830,10 +860,19 @@ fn load_registry(tiles_x: u32) -> Registry {
             continue;
         };
 
+        let light_emission = raw
+            .light_emission
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 64.0);
+        let collidable = raw.collidable.unwrap_or(true);
+        let render_shape = parse_render_shape(raw.render_shape.as_deref());
         let texture = BlockTexture {
             tiles: build_face_tiles(&raw, max_block_tiles),
             rotations: raw.rotations.unwrap_or([0; 6]),
             transparent_mode: raw.transparent_mode.unwrap_or([0; 6]),
+            light_emission,
+            render_shape,
         };
         let icon_slot = raw
             .icon_texture_slot_1based
@@ -870,6 +909,7 @@ fn load_registry(tiles_x: u32) -> Registry {
         used_block_item_ids.insert(item_id);
         let pending_drop_item = raw.drop_item;
         let pending_drop_items = raw.drop_items;
+        let pending_drop_nothing = raw.drop_nothing.unwrap_or(false);
 
         let block = BlockDef {
             id: runtime_block_id,
@@ -877,6 +917,8 @@ fn load_registry(tiles_x: u32) -> Registry {
             aliases: raw.aliases,
             hardness: raw.hardness.unwrap_or(1.0),
             required_tool,
+            light_emission,
+            collidable,
             texture,
             item_id,
             item_atlas_slot_1based,
@@ -896,7 +938,8 @@ fn load_registry(tiles_x: u32) -> Registry {
                 block_namespace_to_id.insert(local, block_id_i8);
             }
         }
-        pending_block_drops[block_id] = Some((pending_drop_item, pending_drop_items));
+        pending_block_drops[block_id] =
+            Some((pending_drop_item, pending_drop_items, pending_drop_nothing));
         blocks[block_id] = Some(block);
     }
 
@@ -913,6 +956,8 @@ fn load_registry(tiles_x: u32) -> Registry {
     let mut block_textures = vec![missing_block_texture(); blocks.len()];
     let mut block_hardness = vec![1.0; blocks.len()];
     let mut block_required_tools = vec![None; blocks.len()];
+    let mut block_light_emission = vec![0.0; blocks.len()];
+    let mut block_collidable = vec![true; blocks.len()];
     let mut block_index = Vec::new();
     let mut block_name_to_id = HashMap::new();
     for (idx, block_opt) in blocks.iter().enumerate() {
@@ -922,6 +967,8 @@ fn load_registry(tiles_x: u32) -> Registry {
         block_textures[idx] = block.texture;
         block_hardness[idx] = block.hardness.max(0.05);
         block_required_tools[idx] = block.required_tool;
+        block_light_emission[idx] = block.light_emission.max(0.0);
+        block_collidable[idx] = block.collidable;
         if let Ok(block_id_i8) = i8::try_from(block.id) {
             insert_name_aliases(
                 &mut block_name_to_id,
@@ -1044,10 +1091,12 @@ fn load_registry(tiles_x: u32) -> Registry {
         };
 
         let mut resolved_drops = Vec::<DropEntry>::new();
-        if let Some((drop_item, drop_items)) = pending_block_drops
+        let mut drop_nothing = false;
+        if let Some((drop_item, drop_items, pending_drop_nothing)) = pending_block_drops
             .get_mut(block_idx)
             .and_then(Option::take)
         {
+            drop_nothing = pending_drop_nothing;
             if let Some(raw_item) = drop_item {
                 if let Some(item_id) = resolve_drop_item_id(
                     &raw_item,
@@ -1092,7 +1141,7 @@ fn load_registry(tiles_x: u32) -> Registry {
             }
         }
 
-        if resolved_drops.is_empty() {
+        if resolved_drops.is_empty() && !drop_nothing {
             // Default behavior if no JSON drop is provided.
             resolved_drops.push(DropEntry {
                 item_id: block.item_id,
@@ -1111,6 +1160,8 @@ fn load_registry(tiles_x: u32) -> Registry {
         block_textures,
         block_hardness,
         block_required_tools,
+        block_light_emission,
+        block_collidable,
         block_index,
         block_name_to_id,
         items,
@@ -1278,6 +1329,28 @@ pub fn block_required_tool(id: i8) -> Option<ToolType> {
         .get(id as usize)
         .copied()
         .flatten()
+}
+
+pub fn block_light_emission(id: i8) -> f32 {
+    if id < 0 {
+        return 0.0;
+    }
+    registry()
+        .block_light_emission
+        .get(id as usize)
+        .copied()
+        .unwrap_or(0.0)
+}
+
+pub fn block_is_collidable(id: i8) -> bool {
+    if id < 0 {
+        return false;
+    }
+    registry()
+        .block_collidable
+        .get(id as usize)
+        .copied()
+        .unwrap_or(true)
 }
 
 pub fn block_break_time_seconds(id: i8) -> f32 {

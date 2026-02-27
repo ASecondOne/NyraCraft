@@ -38,31 +38,33 @@ use app::menu::{PauseMenuButton, hit_test_pause_menu_button};
 use app::save::{SaveIo, SavedPlayerState};
 use app::streaming::{
     ApplyDebugStats, CacheMeshView, CacheWriteMsg, DebugPerfSnapshot, EditedChunkRanges,
-    PackedMeshData,
-    SharedRequestQueue, WorkerResult, apply_stream_results, block_id_full_cached,
+    PackedMeshData, SharedRequestQueue, WorkerResult, apply_stream_results, block_id_full_cached,
     build_stats_lines, chunk_coord_from_pos, is_solid_cached, mesh_cache_dir, new_request_queue,
     pick_block, pop_request, request_queue_stats, should_pack_far_lod, stream_tick,
     try_load_cached_mesh, write_cached_mesh,
 };
 use player::crafting::reload_recipes;
-use player::inventory::{HOTBAR_SLOTS, InventorySlotRef, InventoryState, hit_test_slot};
+use player::inventory::{
+    HOTBAR_SLOTS, InventorySlotRef, InventorySnapshot, InventoryState, hit_test_slot,
+};
 use player::{
-    Camera, EditedBlockEntry, EditedBlocks, LeafDecayQueue, PlayerConfig, PlayerInput,
-    PlayerState, restore_loaded_edit_metadata,
-    block_id_with_edits, break_blocks_batch, handle_block_mouse_input, leaf_decay_stats,
-    new_edited_blocks, new_leaf_decay_queue, tick_leaf_decay, update_player,
+    Camera, CameraViewMode, EditedBlockEntry, EditedBlocks, LeafDecayQueue, PlayerConfig,
+    PlayerInput, PlayerState, block_id_with_edits, break_blocks_batch, handle_block_mouse_input,
+    leaf_decay_stats, new_edited_blocks, new_leaf_decay_queue, restore_loaded_edit_metadata,
+    tick_leaf_decay, update_player,
 };
 use render::Gpu;
-use render::gpu::reload_cpu_item_atlas_cache;
+use render::block::BlockTexture;
+use render::gpu::{DAY_CYCLE_SECONDS, WorldEmissiveLight, reload_cpu_item_atlas_cache};
 use render::mesh::pack_far_vertices;
 use render::{CubeStyle, TextureAtlas};
 use world::CHUNK_SIZE;
 use world::blocks::{
-    DEFAULT_TILES_X, block_break_stage, block_break_time_with_item_seconds, build_block_index,
-    core_block_ids, default_blocks, reload_registry,
+    DEFAULT_TILES_X, block_break_stage, block_break_time_with_item_seconds, block_is_collidable,
+    block_light_emission, build_block_index, core_block_ids, default_blocks, reload_registry,
 };
 use world::mesher::generate_chunk_mesh;
-use world::worldgen::{TreeSpec, WorldGen};
+use world::worldgen::{TreeSpec, WORLD_HALF_SIZE_BLOCKS, WorldGen};
 
 type CoordKey = (i32, i32, i32);
 type DirtyChunks = Arc<Mutex<HashMap<CoordKey, i64>>>;
@@ -71,6 +73,10 @@ const HAND_BREAK_STRENGTH: f32 = 1.0;
 const CHAT_HIDE_DELAY: Duration = Duration::from_secs(10);
 const MULTI_BREAK_MAX_BLOCKS: usize = 12;
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(2);
+const EMISSIVE_SCAN_RADIUS_BLOCKS: i32 = 8;
+const EMISSIVE_SCAN_MAX_SOURCES: usize = 16;
+const EMISSIVE_SCAN_INTERVAL: Duration = Duration::from_millis(120);
+const EMISSIVE_SCAN_MOVE_THRESHOLD_SQ: f32 = 1.25 * 1.25;
 
 fn ema_ms(previous: f32, sample_ms: f32) -> f32 {
     if previous <= 0.001 {
@@ -143,6 +149,67 @@ fn summarize_lod_map(map: &HashMap<(i32, i32, i32), i32>) -> LodLogSummary {
     out
 }
 
+fn collect_world_emissive_lights(
+    edited_blocks: &EditedBlocks,
+    center: Vec3,
+    radius_blocks: i32,
+    max_sources: usize,
+) -> Vec<WorldEmissiveLight> {
+    let radius = radius_blocks.max(1);
+    let cx = center.x.floor() as i32;
+    let cy = center.y.floor() as i32;
+    let cz = center.z.floor() as i32;
+    let r2 = (radius * radius) as f32;
+    let store = edited_blocks.read().unwrap();
+    if !store.has_any_edits() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(f32, WorldEmissiveLight)> = Vec::new();
+
+    let mut y = cy - radius;
+    while y <= cy + radius {
+        let mut z = cz - radius;
+        while z <= cz + radius {
+            let mut x = cx - radius;
+            while x <= cx + radius {
+                let dx = x as f32 + 0.5 - center.x;
+                let dy = y as f32 + 0.5 - center.y;
+                let dz = z as f32 + 0.5 - center.z;
+                let dist2 = dx * dx + dy * dy + dz * dz;
+                if dist2 <= r2 {
+                    if let Some(block_id) = store.get(x, y, z)
+                        && block_id >= 0
+                    {
+                        let emission = block_light_emission(block_id);
+                        if emission > 0.0 {
+                            let score = (emission * emission) / (dist2 + 1.0);
+                            scored.push((
+                                score,
+                                WorldEmissiveLight {
+                                    position: Vec3::new(
+                                        x as f32 + 0.5,
+                                        y as f32 + 0.5,
+                                        z as f32 + 0.5,
+                                    ),
+                                    block_id,
+                                    emission,
+                                },
+                            ));
+                        }
+                    }
+                }
+                x += 1;
+            }
+            z += 1;
+        }
+        y += 1;
+    }
+
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    scored.truncate(max_sources.max(1));
+    scored.into_iter().map(|(_, light)| light).collect()
+}
+
 fn collect_break_targets(
     world_gen: &WorldGen,
     edited_blocks: &EditedBlocks,
@@ -192,6 +259,209 @@ fn collect_break_targets(
     out
 }
 
+fn set_time_of_day(time_offset_seconds: &mut f32, start_time: Instant, target_progress: f32) {
+    let cycle = DAY_CYCLE_SECONDS.max(1.0);
+    let target_seconds = target_progress.rem_euclid(1.0) * cycle;
+    let current_seconds =
+        (start_time.elapsed().as_secs_f32() + *time_offset_seconds).rem_euclid(cycle);
+    *time_offset_seconds += target_seconds - current_seconds;
+}
+
+fn parse_teleport_coordinate(token: &str, base: f32) -> Result<f32, String> {
+    if token == "~" {
+        return Ok(base);
+    }
+    if let Some(rest) = token.strip_prefix('~') {
+        if rest.is_empty() {
+            return Ok(base);
+        }
+        let Ok(offset) = rest.parse::<f32>() else {
+            return Err(format!("invalid relative coordinate `{token}`"));
+        };
+        return Ok(base + offset);
+    }
+    token
+        .parse::<f32>()
+        .map_err(|_| format!("invalid coordinate `{token}`"))
+}
+
+fn camera_point_blocked<F>(position: Vec3, is_solid: &F) -> bool
+where
+    F: Fn(i32, i32, i32) -> bool,
+{
+    const OFFSETS: [Vec3; 7] = [
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.22, 0.0, 0.0),
+        Vec3::new(-0.22, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 0.22),
+        Vec3::new(0.0, 0.0, -0.22),
+        Vec3::new(0.0, 0.2, 0.0),
+        Vec3::new(0.0, -0.2, 0.0),
+    ];
+    OFFSETS.iter().copied().any(|offset| {
+        let sample = position + offset;
+        is_solid(
+            sample.x.floor() as i32,
+            sample.y.floor() as i32,
+            sample.z.floor() as i32,
+        )
+    })
+}
+
+fn clip_camera_to_world<F>(anchor: Vec3, desired: Vec3, is_solid: &F) -> Vec3
+where
+    F: Fn(i32, i32, i32) -> bool,
+{
+    let delta = desired - anchor;
+    let dist = delta.length();
+    if dist <= 1.0e-4 {
+        return anchor;
+    }
+    let steps = ((dist / 0.14).ceil() as i32).clamp(1, 96);
+    let mut last_clear = anchor;
+    for i in 1..=steps {
+        let t = i as f32 / steps as f32;
+        let sample = anchor + delta * t;
+        if camera_point_blocked(sample, is_solid) {
+            return last_clear;
+        }
+        last_clear = sample;
+    }
+    desired
+}
+
+fn build_render_camera<F>(
+    base_camera: &Camera,
+    player_position: Vec3,
+    eye_height: f32,
+    view_mode: CameraViewMode,
+    is_solid: &F,
+) -> Camera
+where
+    F: Fn(i32, i32, i32) -> bool,
+{
+    if view_mode == CameraViewMode::FirstPerson {
+        return Camera {
+            position: base_camera.position,
+            forward: base_camera.forward,
+            up: Vec3::Y,
+        };
+    }
+    let anchor = player_position + Vec3::new(0.0, eye_height, 0.0);
+    let mut orbit_forward = base_camera.forward.normalize_or_zero();
+    if orbit_forward.length_squared() <= 1.0e-6 {
+        orbit_forward = Vec3::new(0.0, 0.0, -1.0);
+    }
+    let desired = match view_mode {
+        CameraViewMode::ThirdPersonBack => anchor - orbit_forward * 3.3,
+        CameraViewMode::ThirdPersonFront => anchor + orbit_forward * 3.0,
+        CameraViewMode::FirstPerson => anchor,
+    };
+    let camera_position =
+        clip_camera_to_world(anchor + Vec3::new(0.0, 0.1, 0.0), desired, is_solid);
+    let look_target = anchor + orbit_forward * 0.22;
+    let mut look_forward = (look_target - camera_position).normalize_or_zero();
+    if look_forward.length_squared() <= 1.0e-8 {
+        look_forward = base_camera.forward;
+    }
+    Camera {
+        position: camera_position,
+        forward: look_forward,
+        up: Vec3::Y,
+    }
+}
+
+fn execute_runtime_console_command(
+    raw: &str,
+    player: &mut PlayerState,
+    camera: &mut Camera,
+    player_config: &PlayerConfig,
+    world_gen: &WorldGen,
+    time_offset_seconds: &mut f32,
+    start_time: Instant,
+) -> Option<String> {
+    let line = raw.trim().trim_start_matches('/');
+    if line.is_empty() {
+        return None;
+    }
+
+    let mut parts = line.split_whitespace();
+    let command = parts.next()?.to_ascii_lowercase();
+    match command.as_str() {
+        "time" => {
+            let Some(subcommand) = parts.next() else {
+                return Some("usage: time set <day|night|morning|none>".to_string());
+            };
+            if !subcommand.eq_ignore_ascii_case("set") {
+                return Some("usage: time set <day|night|morning|none>".to_string());
+            }
+            let Some(value) = parts.next() else {
+                return Some("usage: time set <day|night|morning|none>".to_string());
+            };
+            if parts.next().is_some() {
+                return Some("usage: time set <day|night|morning|none>".to_string());
+            }
+            let (target_progress, label) = match value.to_ascii_lowercase().as_str() {
+                "day" | "none" | "noon" => (0.0, "day"),
+                "morning" => (0.21, "morning"),
+                "night" => (0.5, "night"),
+                _ => {
+                    return Some(format!(
+                        "unknown time `{value}` (use day, night, morning, none)"
+                    ));
+                }
+            };
+            set_time_of_day(time_offset_seconds, start_time, target_progress);
+            Some(format!("time set to {label}"))
+        }
+        "tp" | "teleport" => {
+            let Some(x_raw) = parts.next() else {
+                return Some("usage: tp <x> <y> <z> (supports ~ and ~offset)".to_string());
+            };
+            let Some(y_raw) = parts.next() else {
+                return Some("usage: tp <x> <y> <z> (supports ~ and ~offset)".to_string());
+            };
+            let Some(z_raw) = parts.next() else {
+                return Some("usage: tp <x> <y> <z> (supports ~ and ~offset)".to_string());
+            };
+            if parts.next().is_some() {
+                return Some("usage: tp <x> <y> <z> (supports ~ and ~offset)".to_string());
+            }
+
+            let base = player.position;
+            let Ok(x) = parse_teleport_coordinate(x_raw, base.x) else {
+                return Some(format!("invalid x `{x_raw}`"));
+            };
+            let Ok(y) = parse_teleport_coordinate(y_raw, base.y) else {
+                return Some(format!("invalid y `{y_raw}`"));
+            };
+            let Ok(z) = parse_teleport_coordinate(z_raw, base.z) else {
+                return Some(format!("invalid z `{z_raw}`"));
+            };
+            if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                return Some("coordinates must be finite numbers".to_string());
+            }
+
+            let xi = x.floor() as i32;
+            let zi = z.floor() as i32;
+            if !world_gen.in_world_bounds(xi, zi) {
+                let max = WORLD_HALF_SIZE_BLOCKS - 1;
+                return Some(format!(
+                    "target out of bounds (x/z must stay within +/-{max})"
+                ));
+            }
+
+            player.position = Vec3::new(x, y, z);
+            player.velocity = Vec3::ZERO;
+            player.grounded = false;
+            camera.position = player.position + Vec3::new(0.0, player_config.eye_height, 0.0);
+
+            Some(format!("teleported to {:.1} {:.1} {:.1}", x, y, z))
+        }
+        _ => None,
+    }
+}
+
 fn current_saved_player_state(
     player: &PlayerState,
     camera: &Camera,
@@ -209,8 +479,7 @@ fn current_saved_player_state(
     }
 }
 
-fn save_runtime_state(
-    save_io: &SaveIo,
+fn collect_runtime_save_payload(
     player: &PlayerState,
     camera: &Camera,
     selected_hotbar_slot: u8,
@@ -218,18 +487,52 @@ fn save_runtime_state(
     inventory: &InventoryState,
     edited_blocks: &EditedBlocks,
     include_edits: bool,
-) -> std::io::Result<usize> {
+) -> (
+    SavedPlayerState,
+    InventorySnapshot,
+    Option<Vec<EditedBlockEntry>>,
+) {
     let player_state = current_saved_player_state(player, camera, selected_hotbar_slot, fly_mode);
+    let inventory_snapshot = inventory.snapshot();
+    let edited_entries = include_edits.then(|| edited_blocks.read().unwrap().snapshot_entries());
+    (player_state, inventory_snapshot, edited_entries)
+}
+
+fn persist_runtime_state(
+    save_io: &SaveIo,
+    player_state: &SavedPlayerState,
+    inventory_snapshot: &InventorySnapshot,
+    edited_entries: Option<&[EditedBlockEntry]>,
+) -> std::io::Result<usize> {
     save_io.save_player(&player_state)?;
-    save_io.save_inventory(&inventory.snapshot())?;
-    if include_edits {
-        let edits = edited_blocks.read().unwrap().snapshot_entries();
+    save_io.save_inventory(inventory_snapshot)?;
+    if let Some(edits) = edited_entries {
         let count = edits.len();
-        save_io.save_edited_blocks(&edits)?;
+        save_io.save_edited_blocks(edits)?;
         Ok(count)
     } else {
         Ok(0)
     }
+}
+
+enum SaveWorkerMsg {
+    Autosave {
+        player: SavedPlayerState,
+        inventory: InventorySnapshot,
+        edits: Option<Vec<EditedBlockEntry>>,
+    },
+    FinalFlush {
+        player: SavedPlayerState,
+        inventory: InventorySnapshot,
+        edits: Vec<EditedBlockEntry>,
+        done_tx: mpsc::Sender<std::io::Result<usize>>,
+    },
+    Shutdown,
+}
+
+struct SaveWorkerResult {
+    include_edits: bool,
+    result: std::io::Result<usize>,
 }
 
 fn main() {
@@ -262,7 +565,8 @@ fn main() {
     };
 
     let tiles_x = DEFAULT_TILES_X;
-    let runtime_blocks = Arc::new(RwLock::new(default_blocks(tiles_x)));
+    let runtime_blocks: Arc<RwLock<Arc<[BlockTexture]>>> =
+        Arc::new(RwLock::new(Arc::from(default_blocks(tiles_x))));
     let mut core_ids = core_block_ids();
     let content_reload_epoch = Arc::new(AtomicU64::new(1));
     let block_index = build_block_index(tiles_x);
@@ -334,6 +638,7 @@ fn main() {
     let mut last_update = Instant::now();
     let mut last_stats_print = Instant::now();
     let start_time = Instant::now();
+    let mut time_of_day_offset_seconds = 0.0f32;
     let mut fps_frames: u32 = 0;
     let mut fps_last = Instant::now();
     let mut fps_value: u32 = 0;
@@ -346,6 +651,57 @@ fn main() {
         "main(loop/input/player/render): tid={:?}",
         thread::current().id()
     )];
+    let (tx_save_msg, rx_save_msg) = mpsc::channel::<SaveWorkerMsg>();
+    let (tx_save_result, rx_save_result) = mpsc::channel::<SaveWorkerResult>();
+    {
+        let save_io_worker = save_io.clone();
+        let tx_save_result_worker = tx_save_result;
+        let tx_thread_report_save = tx_thread_report.clone();
+        let _ = thread::Builder::new()
+            .name("nyra-save-writer".to_string())
+            .spawn(move || {
+                let _ = tx_thread_report_save.send(format!(
+                    "save_writer(io/json): tid={:?}",
+                    thread::current().id()
+                ));
+                while let Ok(msg) = rx_save_msg.recv() {
+                    match msg {
+                        SaveWorkerMsg::Autosave {
+                            player,
+                            inventory,
+                            edits,
+                        } => {
+                            let include_edits = edits.is_some();
+                            let result = persist_runtime_state(
+                                &save_io_worker,
+                                &player,
+                                &inventory,
+                                edits.as_deref(),
+                            );
+                            let _ = tx_save_result_worker.send(SaveWorkerResult {
+                                include_edits,
+                                result,
+                            });
+                        }
+                        SaveWorkerMsg::FinalFlush {
+                            player,
+                            inventory,
+                            edits,
+                            done_tx,
+                        } => {
+                            let result = persist_runtime_state(
+                                &save_io_worker,
+                                &player,
+                                &inventory,
+                                Some(&edits),
+                            );
+                            let _ = done_tx.send(result);
+                        }
+                        SaveWorkerMsg::Shutdown => break,
+                    }
+                }
+            });
+    }
 
     let spawn_height = (world_gen.highest_solid_y_at(0, 0) + 4).max(4);
     let mut player = PlayerState {
@@ -397,6 +753,7 @@ fn main() {
     let mut pause_render = false;
     let mut debug_ui = false;
     let mut fly_mode = false;
+    let mut camera_view_mode = CameraViewMode::FirstPerson;
     let mut force_reload = false;
     let mut selected_hotbar_slot: u8 = 0;
     let mut inventory = InventoryState::new();
@@ -434,6 +791,10 @@ fn main() {
     let mut chat_visible_until = Instant::now();
     let mut last_runtime_log = Instant::now();
     let mut last_autosave = Instant::now();
+    let mut last_emissive_scan = Instant::now() - EMISSIVE_SCAN_INTERVAL;
+    let mut last_emissive_scan_pos = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut world_emissive_lights: Vec<WorldEmissiveLight> = Vec::new();
+    let mut autosave_in_flight = false;
     let mut edits_save_dirty = false;
     let mut ui_cursor_pos: Option<(f32, f32)> = None;
     let mut f1_down = false;
@@ -457,7 +818,7 @@ fn main() {
                 return true;
             }
             if let Some(id) = edited_blocks.read().unwrap().get(x, y, z) {
-                return id >= 0;
+                return block_is_collidable(id);
             }
             is_solid_cached(&worldgen, &height_cache, &tree_cache, x, y, z)
         }
@@ -506,8 +867,12 @@ fn main() {
     let blocks_gen = Arc::clone(&runtime_blocks);
     let gen_thread = world_gen.clone();
     let worker_count = std::thread::available_parallelism()
-        // Keep several cores free for render/input/OS and avoid startup/load saturation.
-        .map(|n| (n.get() / 2).clamp(1, 6))
+        // Keep 1-2 cores free for render/input/OS, but use more CPU for mesh generation throughput.
+        .map(|n| {
+            let cores = n.get();
+            let reserve = if cores >= 8 { 2 } else { 1 };
+            cores.saturating_sub(reserve).clamp(1, 12)
+        })
         .unwrap_or(1);
     log_info(format!("startup: worker threads = {worker_count}"));
     for worker_idx in 0..worker_count {
@@ -581,8 +946,10 @@ fn main() {
                         None
                     };
 
-                    let height_cache = RefCell::new(HashMap::<(i32, i32), i32>::new());
-                    let tree_cache = RefCell::new(HashMap::<(i32, i32), Option<TreeSpec>>::new());
+                    let height_cache =
+                        RefCell::new(HashMap::<(i32, i32), i32>::with_capacity(1024));
+                    let tree_cache =
+                        RefCell::new(HashMap::<(i32, i32), Option<TreeSpec>>::with_capacity(1024));
                     let block_at = |x: i32, y: i32, z: i32| -> i8 {
                         overrides.get(&(x, y, z)).copied().unwrap_or_else(|| {
                             block_id_full_cached(&gen_thread, &height_cache, &tree_cache, x, y, z)
@@ -590,11 +957,11 @@ fn main() {
                     };
                     let blocks_for_task = {
                         let guard = blocks_gen.read().unwrap();
-                        guard.clone()
+                        Arc::clone(&guard)
                     };
                     let mesh = generate_chunk_mesh(
                         coord,
-                        &blocks_for_task,
+                        blocks_for_task.as_ref(),
                         &gen_thread,
                         &block_at,
                         edit_range,
@@ -696,8 +1063,15 @@ fn main() {
     let mut adaptive_max_apply_per_tick: usize = 12;
     let mut adaptive_max_rebuilds_per_tick: usize = 2;
     let mut adaptive_draw_radius_cap = base_draw_radius;
-    let mut last_camera_pos = camera.position;
-    let mut last_camera_forward = camera.forward;
+    let initial_render_camera = build_render_camera(
+        &camera,
+        player.position,
+        player_config.eye_height,
+        camera_view_mode,
+        &is_solid,
+    );
+    let mut last_camera_pos = initial_render_camera.position;
+    let mut last_camera_forward = initial_render_camera.forward;
     let mut last_visibility_refresh = Instant::now();
 
     let _ = event_loop.run(move |event, elwt| match event {
@@ -709,6 +1083,24 @@ fn main() {
                     log_info(format!("thread-report: {report}"));
                     thread_reports.push(report);
                     thread_reports.sort();
+                }
+            }
+            while let Ok(done) = rx_save_result.try_recv() {
+                autosave_in_flight = false;
+                match done.result {
+                    Ok(saved_edit_count) => {
+                        if done.include_edits {
+                            log_info(format!(
+                                "save: autosaved {} edited blocks to {}",
+                                saved_edit_count,
+                                save_io.save_dir().display()
+                            ));
+                            edits_save_dirty = false;
+                        }
+                    }
+                    Err(err) => {
+                        log_warn(format!("save: autosave failed: {err}"));
+                    }
                 }
             }
 
@@ -837,20 +1229,28 @@ fn main() {
                     );
                     stream_ms_accum += stream_phase_start.elapsed().as_secs_f32() * 1000.0;
                     stream_calls += 1;
-                    let camera_changed = (camera.position - last_camera_pos).length_squared() > 0.16
-                        || camera.forward.dot(last_camera_forward) < 0.9992;
+                    let visibility_camera = build_render_camera(
+                        &camera,
+                        player.position,
+                        player_config.eye_height,
+                        camera_view_mode,
+                        &is_solid,
+                    );
+                    let camera_changed =
+                        (visibility_camera.position - last_camera_pos).length_squared() > 0.16
+                            || visibility_camera.forward.dot(last_camera_forward) < 0.9992;
                     let visibility_refresh_due =
                         last_visibility_refresh.elapsed() >= Duration::from_millis(66);
                     if visibility_refresh_due
                         && (camera_changed || !requested.is_empty() || pregen_active)
                     {
                         let visibility_phase_start = Instant::now();
-                        gpu.update_visible(&camera, draw_radius);
+                        gpu.update_visible(&visibility_camera, draw_radius);
                         visibility_ms_accum +=
                             visibility_phase_start.elapsed().as_secs_f32() * 1000.0;
                         visibility_calls += 1;
-                        last_camera_pos = camera.position;
-                        last_camera_forward = camera.forward;
+                        last_camera_pos = visibility_camera.position;
+                        last_camera_forward = visibility_camera.forward;
                         last_visibility_refresh = Instant::now();
                     }
                     looked_hit = pick_block(camera.position, camera.forward, 8.0, |x, y, z| {
@@ -1097,7 +1497,10 @@ fn main() {
                         &gpu_label,
                         current_chunk,
                         player.position,
-                        start_time.elapsed(),
+                        Duration::from_secs_f32(
+                            (start_time.elapsed().as_secs_f32() + time_of_day_offset_seconds)
+                                .max(0.0),
+                        ),
                         pause_stream,
                         pause_render,
                         base_render_radius,
@@ -1235,31 +1638,30 @@ fn main() {
                 }
 
                 if last_autosave.elapsed() >= AUTOSAVE_INTERVAL {
-                    match save_runtime_state(
-                        &save_io,
-                        &player,
-                        &camera,
-                        selected_hotbar_slot,
-                        fly_mode,
-                        &inventory,
-                        &edited_blocks,
-                        edits_save_dirty,
-                    ) {
-                        Ok(saved_edit_count) => {
-                            if edits_save_dirty {
-                                log_info(format!(
-                                    "save: autosaved {} edited blocks to {}",
-                                    saved_edit_count,
-                                    save_io.save_dir().display()
-                                ));
-                                edits_save_dirty = false;
+                    if !autosave_in_flight {
+                        let (player_state, inventory_snapshot, edits) = collect_runtime_save_payload(
+                            &player,
+                            &camera,
+                            selected_hotbar_slot,
+                            fly_mode,
+                            &inventory,
+                            &edited_blocks,
+                            edits_save_dirty,
+                        );
+                        match tx_save_msg.send(SaveWorkerMsg::Autosave {
+                            player: player_state,
+                            inventory: inventory_snapshot,
+                            edits,
+                        }) {
+                            Ok(()) => {
+                                autosave_in_flight = true;
+                                last_autosave = Instant::now();
+                            }
+                            Err(err) => {
+                                log_warn(format!("save: autosave enqueue failed: {err}"));
                             }
                         }
-                        Err(err) => {
-                            log_warn(format!("save: autosave failed: {err}"));
-                        }
                     }
-                    last_autosave = Instant::now();
                 }
 
                 if !pause_render || pause_menu_open {
@@ -1304,9 +1706,29 @@ fn main() {
                 let render_radius = (base_render_radius + height_chunks * 2).min(max_render_radius);
                 let draw_radius_base = (base_draw_radius + height_chunks).min(render_radius);
                 let draw_radius = draw_radius_base.min(adaptive_draw_radius_cap.max(16));
-                let render_time = start_time.elapsed().as_secs_f32();
+                let render_time = start_time.elapsed().as_secs_f32() + time_of_day_offset_seconds;
+                let render_camera = build_render_camera(
+                    &camera,
+                    player.position,
+                    player_config.eye_height,
+                    camera_view_mode,
+                    &is_solid,
+                );
                 let dropped_render_items =
                     build_dropped_item_render_data(&dropped_items, render_time);
+                let emissive_refresh_due = last_emissive_scan.elapsed() >= EMISSIVE_SCAN_INTERVAL
+                    || (render_camera.position - last_emissive_scan_pos).length_squared()
+                        >= EMISSIVE_SCAN_MOVE_THRESHOLD_SQ;
+                if emissive_refresh_due {
+                    world_emissive_lights = collect_world_emissive_lights(
+                        &edited_blocks,
+                        render_camera.position,
+                        EMISSIVE_SCAN_RADIUS_BLOCKS,
+                        EMISSIVE_SCAN_MAX_SOURCES,
+                    );
+                    last_emissive_scan = Instant::now();
+                    last_emissive_scan_pos = render_camera.position;
+                }
                 let chat_recently_visible = Instant::now() < chat_visible_until;
                 let stats_overlay_visible = debug_ui || pregen_active;
                 let draw_world = !pause_menu_open && !pregen_active;
@@ -1317,7 +1739,11 @@ fn main() {
                 });
                 let render_phase_start = Instant::now();
                 gpu.render(
-                    &camera,
+                    &render_camera,
+                    player.position,
+                    camera.forward,
+                    player_config.height,
+                    camera_view_mode.shows_player_model() && draw_world,
                     render_time,
                     draw_world,
                     debug_faces,
@@ -1343,6 +1769,7 @@ fn main() {
                     &command_console.input,
                     &command_console.chat_lines,
                     &dropped_render_items,
+                    &world_emissive_lights,
                     pause_menu_open,
                     ui_cursor_pos,
                 );
@@ -1368,6 +1795,17 @@ fn main() {
                         gpu.window(),
                         &mut mouse_enabled,
                         &mut last_cursor_pos,
+                        |line| {
+                            execute_runtime_console_command(
+                                line,
+                                &mut player,
+                                &mut camera,
+                                &player_config,
+                                &world_gen,
+                                &mut time_of_day_offset_seconds,
+                                start_time,
+                            )
+                        },
                     ) {
                         chat_visible_until = Instant::now() + CHAT_HIDE_DELAY;
                     }
@@ -1399,6 +1837,17 @@ fn main() {
                             gpu.window(),
                             &mut mouse_enabled,
                             &mut last_cursor_pos,
+                            |line| {
+                                execute_runtime_console_command(
+                                    line,
+                                    &mut player,
+                                    &mut camera,
+                                    &player_config,
+                                    &world_gen,
+                                    &mut time_of_day_offset_seconds,
+                                    start_time,
+                                )
+                            },
                         ) {
                             chat_visible_until = Instant::now() + CHAT_HIDE_DELAY;
                         }
@@ -1423,6 +1872,17 @@ fn main() {
                                 gpu.window(),
                                 &mut mouse_enabled,
                                 &mut last_cursor_pos,
+                                |line| {
+                                    execute_runtime_console_command(
+                                        line,
+                                        &mut player,
+                                        &mut camera,
+                                        &player_config,
+                                        &world_gen,
+                                        &mut time_of_day_offset_seconds,
+                                        start_time,
+                                    )
+                                },
                             ) {
                                 chat_visible_until = Instant::now() + CHAT_HIDE_DELAY;
                             }
@@ -1516,6 +1976,14 @@ fn main() {
                     "ui: stats overlay {} via F3",
                     if debug_ui { "enabled" } else { "disabled" }
                 ));
+                return;
+            }
+            if pressed && !event.repeat && key == KeyCode::F5 {
+                camera_view_mode = camera_view_mode.cycle();
+                last_visibility_refresh = Instant::now() - Duration::from_secs(1);
+                last_camera_pos = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+                last_camera_forward = Vec3::ZERO;
+                log_info(format!("camera: {} view", camera_view_mode.label()));
                 return;
             }
             if !inventory.open && is_console_open_shortcut(&event) {
@@ -1617,7 +2085,7 @@ fn main() {
                         reload_recipes();
                         {
                             let mut shared_blocks = runtime_blocks.write().unwrap();
-                            *shared_blocks = default_blocks(DEFAULT_TILES_X);
+                            *shared_blocks = Arc::from(default_blocks(DEFAULT_TILES_X));
                         }
                         gpu.reload_textures(Some(TextureAtlas {
                             path: "src/texturing/atlas_output/atls_blocks.png".to_string(),
@@ -2028,25 +2496,49 @@ fn main() {
             let size = gpu.window().inner_size();
             gpu.resize(size);
         }
-        Event::LoopExiting => match save_runtime_state(
-            &save_io,
-            &player,
-            &camera,
-            selected_hotbar_slot,
-            fly_mode,
-            &inventory,
-            &edited_blocks,
-            true,
-        ) {
-            Ok(saved_edit_count) => {
-                log_info(format!(
-                    "save: final flush complete (edited_blocks={saved_edit_count})"
-                ));
+        Event::LoopExiting => {
+            let (player_state, inventory_snapshot, edits) = collect_runtime_save_payload(
+                &player,
+                &camera,
+                selected_hotbar_slot,
+                fly_mode,
+                &inventory,
+                &edited_blocks,
+                true,
+            );
+            let edits = edits.unwrap_or_default();
+            let (done_tx, done_rx) = mpsc::channel::<std::io::Result<usize>>();
+            let flush_result = match tx_save_msg.send(SaveWorkerMsg::FinalFlush {
+                player: player_state,
+                inventory: inventory_snapshot.clone(),
+                edits: edits.clone(),
+                done_tx,
+            }) {
+                Ok(()) => done_rx.recv().unwrap_or_else(|err| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        format!("save worker dropped final flush response: {err}"),
+                    ))
+                }),
+                Err(err) => {
+                    log_warn(format!(
+                        "save: final flush enqueue failed ({err}), falling back to direct write"
+                    ));
+                    persist_runtime_state(&save_io, &player_state, &inventory_snapshot, Some(&edits))
+                }
+            };
+            match flush_result {
+                Ok(saved_edit_count) => {
+                    log_info(format!(
+                        "save: final flush complete (edited_blocks={saved_edit_count})"
+                    ));
+                }
+                Err(err) => {
+                    log_warn(format!("save: final flush failed: {err}"));
+                }
             }
-            Err(err) => {
-                log_warn(format!("save: final flush failed: {err}"));
-            }
-        },
+            let _ = tx_save_msg.send(SaveWorkerMsg::Shutdown);
+        }
         Event::WindowEvent {
             event: WindowEvent::CloseRequested,
             ..

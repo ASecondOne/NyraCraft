@@ -3,7 +3,7 @@ use winit::window::{CursorGrabMode, Window};
 
 use crate::player::{Camera, PlayerInput};
 
-const KEYBIND_LINES: [&str; 17] = [
+const KEYBIND_LINES: [&str; 18] = [
     "--- NyraCraft Keybinds ---",
     "Movement: W/A/S/D | Jump: Space",
     "Sprint: Shift | Sneak: C | Descend (fly): C",
@@ -17,6 +17,7 @@ const KEYBIND_LINES: [&str; 17] = [
     "Chat: / or T to open | Enter to send command/text",
     "F1: Toggle this keybind panel",
     "F3: Toggle debug stats panel",
+    "F5: Cycle camera view (1st / 3rd / front)",
     "F1 + F : Toggle face debug colors",
     "F1 + W : Toggle chunk wireframe",
     "F1 + P/V/R/M/X : Stream pause / render pause / hot reload / fly / fullscreen",

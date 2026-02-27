@@ -13,7 +13,7 @@ use crate::render::mesh::{ChunkVertex, PackedFarVertex};
 use crate::render::{Gpu, GpuStats};
 use crate::world::CHUNK_SIZE;
 use crate::world::blocks::{
-    block_break_time_with_item_seconds, block_hardness, block_name_by_id,
+    block_break_time_with_item_seconds, block_hardness, block_is_collidable, block_name_by_id,
     can_break_block_with_item, core_block_ids,
 };
 use crate::world::mesher::{MeshData, MeshMode};
@@ -287,7 +287,7 @@ pub fn is_solid_cached(
     if world_gen.mode == WorldMode::Normal && !world_gen.in_world_bounds(x, z) {
         return true;
     }
-    block_id_full_cached(world_gen, height_cache, tree_cache, x, y, z) >= 0
+    block_is_collidable(block_id_full_cached(world_gen, height_cache, tree_cache, x, y, z))
 }
 
 pub fn block_id_full_cached(
@@ -336,6 +336,10 @@ pub fn block_id_full_cached(
                 return ids.leaves;
             }
         }
+    }
+
+    if y == height + 1 {
+        return world_gen.block_id_full_at(x, y, z);
     }
 
     -1
@@ -1069,7 +1073,7 @@ fn submit_chunk_request(
     step: i32,
     mode: MeshMode,
     class: RequestClass,
-) {
+) -> i32 {
     let lod = pack_lod(mode, step);
     let priority = request_priority(player_pos, camera_forward_normalized, coord, lod);
     enqueue_request(
@@ -1081,7 +1085,15 @@ fn submit_chunk_request(
         class,
         priority,
     );
-    requested.insert(coord, lod);
+    let prev_lod = requested.insert(coord, lod);
+    let new_near = i32::from(lod_is_near(mode));
+    let prev_near = prev_lod
+        .map(|lod| {
+            let (prev_mode, _) = unpack_lod(lod);
+            i32::from(lod_is_near(prev_mode))
+        })
+        .unwrap_or(0);
+    new_near - prev_near
 }
 
 fn depth_for_dist(base_depth: i32, dist: i32) -> i32 {
@@ -1949,7 +1961,7 @@ pub fn stream_tick(
                 let lod = pregen_lod;
                 if needs_chunk_request(requested, loaded, coord, lod) {
                     let was_requested = requested.contains_key(&coord);
-                    submit_chunk_request(
+                    let _ = submit_chunk_request(
                         req_queue,
                         requested,
                         player_pos,
@@ -2014,7 +2026,7 @@ pub fn stream_tick(
                 let lod = full_lod;
                 let key = coord;
                 if needs_chunk_request(requested, loaded, key, lod) {
-                    submit_chunk_request(
+                    let near_delta = submit_chunk_request(
                         req_queue,
                         requested,
                         player_pos,
@@ -2024,7 +2036,7 @@ pub fn stream_tick(
                         mode,
                         RequestClass::Near,
                     );
-                    near_inflight_used = count_near_requested(requested);
+                    near_inflight_used = (near_inflight_used as i32 + near_delta).max(0) as usize;
                 }
                 true
             });
@@ -2067,7 +2079,7 @@ pub fn stream_tick(
                     let lod = full_lod;
                     let key = coord;
                     if needs_chunk_request(requested, loaded, key, lod) {
-                        submit_chunk_request(
+                        let near_delta = submit_chunk_request(
                             req_queue,
                             requested,
                             player_pos,
@@ -2077,7 +2089,8 @@ pub fn stream_tick(
                             mode,
                             RequestClass::Near,
                         );
-                        near_inflight_used = count_near_requested(requested);
+                        near_inflight_used =
+                            (near_inflight_used as i32 + near_delta).max(0) as usize;
                         count -= 1;
                     }
                     true
@@ -2128,7 +2141,7 @@ pub fn stream_tick(
                 let lod = full_lod;
                 let key = coord;
                 if needs_chunk_request(requested, loaded, key, lod) {
-                    submit_chunk_request(
+                    let near_delta = submit_chunk_request(
                         req_queue,
                         requested,
                         player_pos,
@@ -2138,7 +2151,7 @@ pub fn stream_tick(
                         mode,
                         RequestClass::Near,
                     );
-                    near_inflight_used = count_near_requested(requested);
+                    near_inflight_used = (near_inflight_used as i32 + near_delta).max(0) as usize;
                 }
                 true
             });
@@ -2220,7 +2233,7 @@ pub fn stream_tick(
                 } else {
                     RequestClass::Far
                 };
-                submit_chunk_request(
+                let near_delta = submit_chunk_request(
                     req_queue,
                     requested,
                     player_pos,
@@ -2230,7 +2243,7 @@ pub fn stream_tick(
                     mode,
                     class,
                 );
-                near_inflight_used = count_near_requested(requested);
+                near_inflight_used = (near_inflight_used as i32 + near_delta).max(0) as usize;
                 budget -= 1;
                 if requested.len() >= max_inflight {
                     return false;
