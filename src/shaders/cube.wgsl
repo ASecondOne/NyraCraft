@@ -176,7 +176,9 @@ fn point_light_add(normal: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
         }
         let dist = sqrt(max(dist_sq, 0.000001));
         let light_dir = to_light / dist;
-        let ndotl = max(dot(n, light_dir), 0.0);
+        let diffuse = max(dot(n, light_dir), 0.0);
+        // Keep a small omnidirectional floor so emissive blocks light nearby faces in caves.
+        let ndotl = 0.18 + 0.82 * diffuse;
         let edge = 1.0 - (dist / radius);
         let falloff = edge * edge;
         let c = uniforms.point_light_color_intensity[i];
@@ -260,6 +262,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     var color = input.color;
+    let vertex_tint = input.color.rgb;
+    var albedo_rgb = vec3<f32>(1.0, 1.0, 1.0);
     if (uniforms.flags0.z == 1u) {
         switch(input.face) {
             case 0u: { color = vec4<f32>(1.0, 0.2, 0.2, 1.0); }
@@ -306,6 +310,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let is_grass_top = input.face == 2u && input.tile == uniforms.flags1.y;
         let is_side_face = input.face == 0u || input.face == 1u || input.face == 4u || input.face == 5u;
         let is_grass_side = is_side_face && input.tile == uniforms.flags1.z;
+        let grass_plant_tile = u32(uniforms.colormap_misc.z + 0.5);
+        let is_grass_plant = input.tile == grass_plant_tile;
         if (!sample_item_atlas && is_grass_side) {
             let overlay_tile = uniforms.flags1.w;
             let overlay_x = overlay_tile % block_tiles_x;
@@ -317,7 +323,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             tex_a = max(tex_a, overlay.a);
         }
 
-        if (!sample_item_atlas && !sample_sun && (is_grass_top || is_grass_side)) {
+        if (!sample_item_atlas && !sample_sun && (is_grass_top || is_grass_side || is_grass_plant)) {
             let cm_uv = input.grass_cm_uv;
             let cm = textureSample(grass_colormap_texture, grass_colormap_sampler, cm_uv).rgb;
             // Keep texture identity while applying biome tint.
@@ -328,21 +334,26 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             if (tex_a < 0.05) {
                 discard;
             }
-            let tinted_rgb = tex_rgb * color.rgb;
+            let tinted_rgb = tex_rgb * vertex_tint;
             let tint_mix = clamp(tex_a, 0.0, 1.0);
             color = vec4<f32>(
                 mix(tex_rgb, tinted_rgb, tint_mix),
                 tex_a * color.a,
             );
+            albedo_rgb = tex_rgb;
         } else if (transparent_mode == 2u) {
             // RGB atlas fallback: treat near-white as transparent background.
             if (tex_rgb.r > 0.92 && tex_rgb.g > 0.92 && tex_rgb.b > 0.92) {
                 discard;
             }
-            color = vec4<f32>(tex_rgb * color.rgb, color.a);
+            color = vec4<f32>(tex_rgb * vertex_tint, color.a);
+            albedo_rgb = tex_rgb;
         } else {
             color = vec4<f32>(tex_rgb, tex_a) * color;
+            albedo_rgb = tex_rgb;
         }
+    } else {
+        albedo_rgb = vec3<f32>(1.0, 1.0, 1.0);
     }
     if (input.transparent_mode != sun_mode) {
         let normal = face_normal(input.face);
@@ -350,7 +361,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let sun_visibility = clamp(input.color.r * 1.25, 0.0, 1.0);
         let sun_boost = mix(1.0, 1.0 + sun_lambert * 0.22, uniforms.sun_dir.w * sun_visibility);
         var lit_rgb = color.rgb * day_factor * sun_boost;
-        lit_rgb += color.rgb * point_light_add(normal, input.world_pos);
+        lit_rgb += albedo_rgb * point_light_add(normal, input.world_pos);
         color = vec4<f32>(min(lit_rgb, vec3<f32>(1.0)), color.a);
     }
     return color;

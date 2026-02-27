@@ -1,0 +1,13 @@
+{
+  "id": "1:12",
+  "register_name": "block_tall_grass",
+  "aliases": ["tall_grass", "tallgrass", "grass_plant"],
+  "hardness": 0.05,
+  "collidable": false,
+  "render_shape": "cross",
+  "texture_slot_1based": 32,
+  "rotations": [0, 0, 0, 0, 0, 0],
+  "transparent_mode": [1, 1, 1, 1, 1, 1],
+  "icon_texture_slot_1based": 32,
+  "drop_nothing": true
+}

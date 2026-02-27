@@ -1,6 +1,7 @@
 use crate::world::CHUNK_SIZE;
-use crate::world::blocks::{block_count, core_block_ids};
+use crate::world::blocks::{block_count, core_block_ids, parse_block_id};
 use noise::{NoiseFn, Perlin};
+use std::sync::OnceLock;
 
 pub const WORLD_SIZE_CHUNKS: i32 = 1000;
 pub const WORLD_HALF_SIZE_CHUNKS: i32 = WORLD_SIZE_CHUNKS / 2;
@@ -16,6 +17,7 @@ const CAVE_MIN_Y: i32 = -96;
 const SURFACE_CAVE_DEPTH: i32 = 10;
 const TREE_MIN_SUPPORT_LAYERS: i32 = 3;
 const WORLDGEN_LAYOUT_VERSION: u64 = 3;
+const TALL_GRASS_SPAWN_CHANCE_PCT: u32 = 26;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SurfaceBiome {
@@ -438,8 +440,29 @@ impl WorldGen {
                 }
             }
         }
+        if y == height + 1
+            && self.block_id_at(x, y - 1, z, height) == ids.grass
+            && should_spawn_tall_grass(self.seed, x, z)
+            && let Some(tall_grass_id) = tall_grass_block_id()
+        {
+            return tall_grass_id;
+        }
         -1
     }
+}
+
+fn tall_grass_block_id() -> Option<i8> {
+    static TALL_GRASS_ID: OnceLock<Option<i8>> = OnceLock::new();
+    *TALL_GRASS_ID.get_or_init(|| {
+        parse_block_id("tall_grass")
+            .or_else(|| parse_block_id("tallgrass"))
+            .or_else(|| parse_block_id("block_tall_grass"))
+    })
+}
+
+fn should_spawn_tall_grass(seed: u32, x: i32, z: i32) -> bool {
+    let h = hash2(seed ^ 0x4F9D_3AB7, x, z);
+    h % 100 < TALL_GRASS_SPAWN_CHANCE_PCT
 }
 
 fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {

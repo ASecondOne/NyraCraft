@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use crate::player::inventory::{InventoryState, ItemStack};
 use crate::player::{EditedBlocks, block_id_with_edits};
 use crate::render::gpu::DroppedItemRender;
-use crate::world::blocks::{block_drop_rolls, item_max_stack_size};
+use crate::world::blocks::{block_drop_rolls, block_is_collidable, item_max_stack_size};
 use crate::world::worldgen::WorldGen;
 
 const DROPPED_ITEM_DESPAWN_SECS: f32 = 5.0 * 60.0;
@@ -58,7 +58,13 @@ fn drop_center_cell(position: Vec3) -> IVec3 {
 }
 
 fn is_solid(world_gen: &WorldGen, edited_blocks: &EditedBlocks, cell: IVec3) -> bool {
-    block_id_with_edits(world_gen, edited_blocks, cell.x, cell.y, cell.z) >= 0
+    block_is_collidable(block_id_with_edits(
+        world_gen,
+        edited_blocks,
+        cell.x,
+        cell.y,
+        cell.z,
+    ))
 }
 
 fn first_air_y(

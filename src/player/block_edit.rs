@@ -9,7 +9,7 @@ use crate::app::streaming::{
     request_chunk_remesh_now,
 };
 use crate::world::CHUNK_SIZE;
-use crate::world::blocks::core_block_ids;
+use crate::world::blocks::{core_block_ids, parse_block_id};
 use crate::world::worldgen::WorldGen;
 
 type CoordKey = (i32, i32, i32);
@@ -263,6 +263,7 @@ pub fn handle_block_mouse_input(
             let Some(place_block_id) = selected_place_block else {
                 return result;
             };
+            let tall_grass_id = parse_block_id("tall_grass");
             let place_id = block_id_with_edits(
                 world_gen,
                 edited_blocks,
@@ -274,6 +275,18 @@ pub fn handle_block_mouse_input(
                 && world_gen.in_world_bounds(place_block.x, place_block.z)
                 && !block_intersects_player(place_block, player_pos, player_height, player_radius)
             {
+                if tall_grass_id == Some(place_block_id) {
+                    let below_id = block_id_with_edits(
+                        world_gen,
+                        edited_blocks,
+                        place_block.x,
+                        place_block.y - 1,
+                        place_block.z,
+                    );
+                    if below_id != core_ids.grass {
+                        return result;
+                    }
+                }
                 edited_blocks.write().unwrap().set(
                     place_block.x,
                     place_block.y,
@@ -281,7 +294,14 @@ pub fn handle_block_mouse_input(
                     place_block_id,
                 );
                 mark_edited_chunk_range(edited_chunk_ranges, place_block);
-                invalidate_block_edit(dirty_chunks, request_queue, place_block, false, false);
+                invalidate_block_edit(
+                    dirty_chunks,
+                    request_queue,
+                    place_block,
+                    false,
+                    false,
+                    false,
+                );
                 result.placed.push((place_block, place_block_id));
                 if place_block_id == core_ids.leaves
                     && !leaf_has_log_connection(world_gen, edited_blocks, place_block)
@@ -293,7 +313,14 @@ pub fn handle_block_mouse_input(
                         -1,
                     );
                     mark_edited_chunk_range(edited_chunk_ranges, place_block);
-                    invalidate_block_edit(dirty_chunks, request_queue, place_block, false, false);
+                    invalidate_block_edit(
+                        dirty_chunks,
+                        request_queue,
+                        place_block,
+                        false,
+                        false,
+                        false,
+                    );
                     result.placed.pop();
                 }
             }
@@ -357,10 +384,24 @@ pub fn break_blocks_batch(
         }
     }
     if !non_tree_blocks.is_empty() {
-        invalidate_block_edits(dirty_chunks, request_queue, &non_tree_blocks, false, false);
+        invalidate_block_edits(
+            dirty_chunks,
+            request_queue,
+            &non_tree_blocks,
+            false,
+            false,
+            false,
+        );
     }
     if !tree_like_blocks.is_empty() {
-        invalidate_block_edits(dirty_chunks, request_queue, &tree_like_blocks, true, false);
+        invalidate_block_edits(
+            dirty_chunks,
+            request_queue,
+            &tree_like_blocks,
+            true,
+            false,
+            false,
+        );
         for block in tree_like_blocks {
             queue_leaf_decay_neighbors(world_gen, edited_blocks, leaf_decay_queue, block);
         }
@@ -417,7 +458,7 @@ pub fn tick_leaf_decay(
                 .unwrap()
                 .set(candidate.x, candidate.y, candidate.z, -1);
             mark_edited_chunk_range(edited_chunk_ranges, candidate);
-            invalidate_block_edit(dirty_chunks, request_queue, candidate, false, true);
+            invalidate_block_edit(dirty_chunks, request_queue, candidate, false, true, false);
             queue_leaf_decay_neighbors(world_gen, edited_blocks, leaf_decay_queue, candidate);
             Some(candidate)
         }
@@ -484,8 +525,16 @@ fn invalidate_block_edit(
     block: IVec3,
     tree_like: bool,
     decay: bool,
+    emissive: bool,
 ) {
-    invalidate_block_edits(dirty_chunks, request_queue, &[block], tree_like, decay);
+    invalidate_block_edits(
+        dirty_chunks,
+        request_queue,
+        &[block],
+        tree_like,
+        decay,
+        emissive,
+    );
 }
 
 fn invalidate_block_edits(
@@ -494,6 +543,7 @@ fn invalidate_block_edits(
     blocks: &[IVec3],
     tree_like: bool,
     decay: bool,
+    emissive: bool,
 ) {
     if blocks.is_empty() {
         return;
@@ -501,7 +551,7 @@ fn invalidate_block_edits(
 
     let mut unique = HashSet::new();
     for &block in blocks {
-        collect_affected_chunks(block, tree_like, &mut unique);
+        collect_affected_chunks(block, tree_like, emissive, &mut unique);
     }
 
     let mut dirty = dirty_chunks.lock().unwrap();
@@ -519,7 +569,12 @@ fn invalidate_block_edits(
     }
 }
 
-fn collect_affected_chunks(block: IVec3, tree_like: bool, affected: &mut HashSet<ChunkKey>) {
+fn collect_affected_chunks(
+    block: IVec3,
+    tree_like: bool,
+    emissive: bool,
+    affected: &mut HashSet<ChunkKey>,
+) {
     const TREE_XZ_MARGIN: i32 = 3;
 
     let coord = world_to_chunk_coord(block);
@@ -572,6 +627,17 @@ fn collect_affected_chunks(block: IVec3, tree_like: bool, affected: &mut HashSet
             for oz in &z_offsets {
                 let c = coord + IVec3::new(*ox, 0, *oz);
                 affected.insert((c.x, c.y, c.z));
+            }
+        }
+    }
+
+    if emissive {
+        for oy in -1..=1 {
+            for oz in -1..=1 {
+                for ox in -1..=1 {
+                    let c = coord + IVec3::new(ox, oy, oz);
+                    affected.insert((c.x, c.y, c.z));
+                }
             }
         }
     }

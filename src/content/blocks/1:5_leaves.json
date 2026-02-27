@@ -7,7 +7,7 @@
   "collidable": true,
   "texture_slot_1based": 8,
   "rotations": [0, 0, 0, 0, 0, 0],
-  "transparent_mode": [2, 2, 2, 2, 2, 2],
+  "transparent_mode": [1, 1, 1, 1, 1, 1],
   "icon_texture_slot_1based": 8,
   "drop_items": [
     { "item_id": "2:1", "chance": 0.05, "count": 1 },
