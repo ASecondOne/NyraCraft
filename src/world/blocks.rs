@@ -317,6 +317,7 @@ struct RawItemFile {
 
 static REGISTRY: OnceLock<RwLock<&'static Registry>> = OnceLock::new();
 static CORE_IDS: OnceLock<AtomicCoreIds> = OnceLock::new();
+static TALL_GRASS_SPECIAL_DROP_IDS: OnceLock<Option<(i8, i8)>> = OnceLock::new();
 
 fn core_ids_cache() -> &'static AtomicCoreIds {
     CORE_IDS.get_or_init(AtomicCoreIds::new)
@@ -1278,8 +1279,25 @@ pub fn block_name_by_id(id: i8) -> &'static str {
         .unwrap_or("unknown")
 }
 
-pub fn block_drop_rolls(id: i8) -> Vec<(i8, u8)> {
+fn tall_grass_special_drop_ids() -> Option<(i8, i8)> {
+    *TALL_GRASS_SPECIAL_DROP_IDS.get_or_init(|| {
+        let tall_grass = parse_block_id("tall_grass")?;
+        let plant_fiber = parse_item_id("plant_fiber")?;
+        Some((tall_grass, plant_fiber))
+    })
+}
+
+pub fn block_drop_rolls_with_item(id: i8, held_item_id: Option<i8>) -> Vec<(i8, u8)> {
     if id < 0 {
+        return Vec::new();
+    }
+    if let Some((tall_grass_id, plant_fiber_id)) = tall_grass_special_drop_ids()
+        && id == tall_grass_id
+    {
+        let held_tool = held_item_id.map(item_tool_type).unwrap_or(ToolType::Hand);
+        if held_tool == ToolType::Knife {
+            return vec![(plant_fiber_id, 1)];
+        }
         return Vec::new();
     }
     let reg = registry();
@@ -1307,6 +1325,10 @@ pub fn block_drop_rolls(id: i8) -> Vec<(i8, u8)> {
         }
     }
     out
+}
+
+pub fn block_drop_rolls(id: i8) -> Vec<(i8, u8)> {
+    block_drop_rolls_with_item(id, None)
 }
 
 pub fn block_hardness(id: i8) -> f32 {

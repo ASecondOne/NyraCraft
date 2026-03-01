@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use crate::player::inventory::{InventoryState, ItemStack};
 use crate::player::{EditedBlocks, block_id_with_edits};
 use crate::render::gpu::DroppedItemRender;
-use crate::world::blocks::{block_drop_rolls, block_is_collidable, item_max_stack_size};
+use crate::world::blocks::{
+    block_drop_rolls, block_drop_rolls_with_item, block_is_collidable, item_max_stack_size,
+};
 use crate::world::worldgen::WorldGen;
 
 const DROPPED_ITEM_DESPAWN_SECS: f32 = 5.0 * 60.0;
@@ -119,6 +121,17 @@ fn relocate_drop_away_from_obstacle(
 
 pub fn spawn_block_drop(dropped_items: &mut Vec<DroppedItem>, block: IVec3, block_id: i8) {
     for (item_id, count) in block_drop_rolls(block_id) {
+        spawn_item_drop(dropped_items, block, item_id, count, 1.0);
+    }
+}
+
+pub fn spawn_block_drop_with_item(
+    dropped_items: &mut Vec<DroppedItem>,
+    block: IVec3,
+    block_id: i8,
+    held_item_id: Option<i8>,
+) {
+    for (item_id, count) in block_drop_rolls_with_item(block_id, held_item_id) {
         spawn_item_drop(dropped_items, block, item_id, count, 1.0);
     }
 }

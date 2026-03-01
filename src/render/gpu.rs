@@ -389,6 +389,10 @@ struct GpuInner<'a> {
     ui_item_tile_uv_size: [f32; 2],
     dropped_mesh: DynamicMeshBuffer,
     player_mesh: DynamicMeshBuffer,
+    player_mesh_last_position: Vec3,
+    player_mesh_last_forward: Vec3,
+    player_mesh_last_height: f32,
+    player_mesh_last_include_head: bool,
     break_overlay_mesh: DynamicMeshBuffer,
     sun_mesh: DynamicMeshBuffer,
     staged_indices: Vec<u32>,
@@ -1079,6 +1083,10 @@ impl Gpu {
                 ui_item_tile_uv_size,
                 dropped_mesh: DynamicMeshBuffer::default(),
                 player_mesh: DynamicMeshBuffer::default(),
+                player_mesh_last_position: Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY),
+                player_mesh_last_forward: Vec3::ZERO,
+                player_mesh_last_height: -1.0,
+                player_mesh_last_include_head: true,
                 break_overlay_mesh: DynamicMeshBuffer::default(),
                 sun_mesh: DynamicMeshBuffer::default(),
                 staged_indices: Vec::new(),
@@ -1273,6 +1281,7 @@ impl Gpu {
         player_forward: Vec3,
         player_height: f32,
         draw_player_model: bool,
+        draw_player_head: bool,
         elapsed_seconds: f32,
         draw_world: bool,
         debug_faces: bool,
@@ -1303,7 +1312,16 @@ impl Gpu {
         pause_menu_cursor: Option<(f32, f32)>,
     ) {
         self.cell.with_dependent_mut(|_, gpu| {
-            apply_pending_uploads(gpu, 8);
+            let upload_budget = if gpu.pending_queue.len() > 96 {
+                24
+            } else if gpu.pending_queue.len() > 32 {
+                16
+            } else if gpu.pending_queue.len() > 8 {
+                12
+            } else {
+                8
+            };
+            apply_pending_uploads(gpu, upload_budget);
             let mvp = build_mvp(gpu.config.width, gpu.config.height, camera, draw_radius);
             let day_cycle = sample_day_cycle(elapsed_seconds);
             let sun_dir = sun_direction(day_cycle.day_progress, day_cycle.sun_height);
@@ -1501,17 +1519,33 @@ impl Gpu {
                     "sun_index_buffer",
                 );
                 if draw_player_model {
-                    let (player_vertices, player_indices) =
-                        build_player_mesh(player_position, player_forward, player_height);
-                    upload_dynamic_chunk_mesh(
-                        &gpu.device,
-                        &gpu.queue,
-                        &mut gpu.player_mesh,
-                        &player_vertices,
-                        &player_indices,
-                        "player_vertex_buffer",
-                        "player_index_buffer",
-                    );
+                    let forward = player_forward.normalize_or_zero();
+                    let pose_changed = gpu.player_mesh.index_count == 0
+                        || (player_position - gpu.player_mesh_last_position).length_squared() > 0.0009
+                        || forward.dot(gpu.player_mesh_last_forward) < 0.9993
+                        || (player_height - gpu.player_mesh_last_height).abs() > 0.01
+                        || draw_player_head != gpu.player_mesh_last_include_head;
+                    if pose_changed {
+                        let (player_vertices, player_indices) = build_player_mesh(
+                            player_position,
+                            player_forward,
+                            player_height,
+                            draw_player_head,
+                        );
+                        upload_dynamic_chunk_mesh(
+                            &gpu.device,
+                            &gpu.queue,
+                            &mut gpu.player_mesh,
+                            &player_vertices,
+                            &player_indices,
+                            "player_vertex_buffer",
+                            "player_index_buffer",
+                        );
+                        gpu.player_mesh_last_position = player_position;
+                        gpu.player_mesh_last_forward = forward;
+                        gpu.player_mesh_last_height = player_height;
+                        gpu.player_mesh_last_include_head = draw_player_head;
+                    }
                 } else {
                     gpu.player_mesh.index_count = 0;
                 }
@@ -1878,6 +1912,9 @@ impl Gpu {
 
     pub fn update_visible(&mut self, camera: &Camera, draw_radius: i32) {
         self.cell.with_dependent_mut(|_, gpu| {
+            const MAX_VISIBLE_SUPERS: usize = 2400;
+            const MAX_VISIBLE_INDICES_BUDGET: u64 = 2_400_000;
+            const MIN_VISIBLE_SUPERS: usize = 8;
             let draw_radius = draw_radius as f32 * crate::world::CHUNK_SIZE as f32;
             let draw_radius_sq = draw_radius * draw_radius;
             let horizon_cutoff = draw_radius * 0.35;
@@ -1906,6 +1943,41 @@ impl Gpu {
                     continue;
                 }
                 gpu.visible_supers.push(*coord);
+            }
+            if gpu.visible_supers.len() > MAX_VISIBLE_SUPERS {
+                let split = MAX_VISIBLE_SUPERS;
+                gpu.visible_supers.select_nth_unstable_by(split, |a, b| {
+                    let da = (gpu.super_chunks[a].center - camera.position).length_squared();
+                    let db = (gpu.super_chunks[b].center - camera.position).length_squared();
+                    da.total_cmp(&db)
+                });
+                gpu.visible_supers.truncate(split);
+            }
+
+            if gpu.visible_supers.len() > MIN_VISIBLE_SUPERS {
+                gpu.visible_supers.sort_unstable_by(|a, b| {
+                    let da = (gpu.super_chunks[a].center - camera.position).length_squared();
+                    let db = (gpu.super_chunks[b].center - camera.position).length_squared();
+                    da.total_cmp(&db)
+                });
+                let mut visible_index_sum = 0_u64;
+                let mut kept = 0_usize;
+                gpu.visible_supers.retain(|coord| {
+                    let indices = gpu
+                        .super_chunks
+                        .get(coord)
+                        .map(|chunk| chunk.raw_index_count as u64 + chunk.packed_index_count as u64)
+                        .unwrap_or(0);
+                    if kept < MIN_VISIBLE_SUPERS
+                        || visible_index_sum.saturating_add(indices) <= MAX_VISIBLE_INDICES_BUDGET
+                    {
+                        visible_index_sum = visible_index_sum.saturating_add(indices);
+                        kept += 1;
+                        true
+                    } else {
+                        false
+                    }
+                });
             }
         });
     }
@@ -2466,6 +2538,7 @@ fn build_player_mesh(
     player_position: Vec3,
     player_forward: Vec3,
     player_height: f32,
+    include_head: bool,
 ) -> (Vec<ChunkVertex>, Vec<u32>) {
     let mut vertices = Vec::with_capacity(24 * 6);
     let mut indices = Vec::with_capacity(36 * 6);
@@ -2489,14 +2562,20 @@ fn build_player_mesh(
     let (head_sin, head_cos) = head_pitch.sin_cos();
     let head_forward = (body_forward * head_cos + body_up * head_sin).normalize_or_zero();
     let head_up = (body_up * head_cos - body_forward * head_sin).normalize_or_zero();
+    let model_origin = if include_head {
+        player_position
+    } else {
+        // In first-person, lower the rendered body so camera sits at eyes, not neck/chest.
+        player_position - body_up * (3.2 * scale) + body_forward * (-1.4 * scale)
+    };
     let body_transform = PlayerPartTransform {
-        origin: player_position,
+        origin: model_origin,
         right: body_right,
         up: body_up,
         forward: body_forward,
     };
     let head_transform = PlayerPartTransform {
-        origin: player_position + body_up * (24.0 * scale),
+        origin: model_origin + body_up * (24.0 * scale),
         right: body_right,
         up: head_up,
         forward: head_forward,
@@ -2505,54 +2584,56 @@ fn build_player_mesh(
     let head_to_world = |p: Vec3| -> [f32; 3] { player_part_to_world(&head_transform, p, scale) };
     let color = [1.0, 1.0, 1.0, 1.0];
 
-    emit_player_box(
-        &mut vertices,
-        &mut indices,
-        &head_to_world,
-        -4.0,
-        0.0,
-        -4.0,
-        4.0,
-        8.0,
-        4.0,
-        SkinRect {
-            x: 0.0,
-            y: 8.0,
-            w: 8.0,
-            h: 8.0,
-        },
-        SkinRect {
-            x: 16.0,
-            y: 8.0,
-            w: 8.0,
-            h: 8.0,
-        },
-        SkinRect {
-            x: 8.0,
-            y: 0.0,
-            w: 8.0,
-            h: 8.0,
-        },
-        SkinRect {
-            x: 16.0,
-            y: 0.0,
-            w: 8.0,
-            h: 8.0,
-        },
-        SkinRect {
-            x: 8.0,
-            y: 8.0,
-            w: 8.0,
-            h: 8.0,
-        },
-        SkinRect {
-            x: 24.0,
-            y: 8.0,
-            w: 8.0,
-            h: 8.0,
-        },
-        color,
-    );
+    if include_head {
+        emit_player_box(
+            &mut vertices,
+            &mut indices,
+            &head_to_world,
+            -4.0,
+            0.0,
+            -4.0,
+            4.0,
+            8.0,
+            4.0,
+            SkinRect {
+                x: 0.0,
+                y: 8.0,
+                w: 8.0,
+                h: 8.0,
+            },
+            SkinRect {
+                x: 16.0,
+                y: 8.0,
+                w: 8.0,
+                h: 8.0,
+            },
+            SkinRect {
+                x: 8.0,
+                y: 0.0,
+                w: 8.0,
+                h: 8.0,
+            },
+            SkinRect {
+                x: 16.0,
+                y: 0.0,
+                w: 8.0,
+                h: 8.0,
+            },
+            SkinRect {
+                x: 8.0,
+                y: 8.0,
+                w: 8.0,
+                h: 8.0,
+            },
+            SkinRect {
+                x: 24.0,
+                y: 8.0,
+                w: 8.0,
+                h: 8.0,
+            },
+            color,
+        );
+    }
     emit_player_box(
         &mut vertices,
         &mut indices,

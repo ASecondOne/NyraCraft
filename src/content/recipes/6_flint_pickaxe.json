@@ -1,0 +1,11 @@
+{
+  "id": "recipe_flint_pickaxe",
+  "type": "shaped",
+  "output": { "item": "flint_pickaxe", "count": 1 },
+  "pattern": ["FPF", " S ", " S "],
+  "key": {
+    "P": "plant_fiber",
+    "F": "flint",
+    "S": "stick"
+  }
+}

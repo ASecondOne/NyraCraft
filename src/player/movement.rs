@@ -100,8 +100,13 @@ where
     let target_vel_x = move_dir.x * move_speed;
     let target_vel_z = move_dir.z * move_speed;
 
-    let accel_rate = 15.0;
-    let friction_rate = 20.0;
+    let mut accel_rate = config.acceleration.max(0.0);
+    let mut friction_rate = config.friction.max(0.0);
+    if !state.grounded && !input.fly_mode {
+        let air_control = config.air_control.clamp(0.0, 1.0);
+        accel_rate *= air_control;
+        friction_rate *= air_control;
+    }
 
     let lerp_x = if target_vel_x.abs() > state.velocity.x.abs() {
         accel_rate

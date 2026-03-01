@@ -1,0 +1,11 @@
+{
+  "id": "recipe_flint_axe",
+  "type": "shaped",
+  "output": { "item": "flint_axe", "count": 1 },
+  "pattern": [" PF", " SF", " S "],
+  "key": {
+    "P": "plant_fiber",
+    "F": "flint",
+    "S": "stick"
+  }
+}

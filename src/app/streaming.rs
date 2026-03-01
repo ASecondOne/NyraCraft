@@ -189,9 +189,9 @@ pub fn request_queue_stats(queue: &SharedRequestQueue) -> RequestQueueStats {
 
 const MESH_CACHE_MAGIC: &[u8; 4] = b"MSH3";
 const CACHE_ENCODING_PACKED_FAR: u8 = 1;
-const APPLY_RESULTS_TIME_BUDGET: Duration = Duration::from_millis(4);
-const APPLY_RESULTS_TIME_BUDGET_DIRTY: Duration = Duration::from_millis(8);
-const STREAM_REQUEST_TIME_BUDGET: Duration = Duration::from_millis(3);
+const APPLY_RESULTS_TIME_BUDGET: Duration = Duration::from_millis(5);
+const APPLY_RESULTS_TIME_BUDGET_DIRTY: Duration = Duration::from_millis(10);
+const STREAM_REQUEST_TIME_BUDGET: Duration = Duration::from_millis(4);
 const DEFERRED_RESULT_CAP: usize = 512;
 
 pub struct MeshCacheEntry {
@@ -708,6 +708,30 @@ pub fn pop_request(queue: &SharedRequestQueue) -> Option<RequestTask> {
     }
 }
 
+pub fn pop_edit_request(queue: &SharedRequestQueue) -> Option<RequestTask> {
+    let (lock, cvar) = &**queue;
+    let mut state = lock.lock().unwrap();
+    loop {
+        let (task_opt, closed) = {
+            let RequestQueueState {
+                edit_heap,
+                latest_task_by_chunk,
+                closed,
+                ..
+            } = &mut *state;
+            (pop_fresh_from_heap(edit_heap, latest_task_by_chunk), *closed)
+        };
+        if let Some(task) = task_opt {
+            state.near_pop_streak = 0;
+            return Some(task);
+        }
+        if closed {
+            return None;
+        }
+        state = cvar.wait(state).unwrap();
+    }
+}
+
 fn max_height_in_chunk(world_gen: &WorldGen, chunk_x: i32, chunk_z: i32) -> i32 {
     let half = CHUNK_SIZE / 2;
     let base_x = chunk_x * CHUNK_SIZE - half;
@@ -772,7 +796,9 @@ fn near_inflight_cap(max_inflight: usize) -> usize {
     if max_inflight <= 1 {
         return max_inflight;
     }
-    let reserve_for_lod = (max_inflight / 4)
+    // Reserve a larger fraction for mid/far LOD so full-detail near tasks
+    // cannot permanently saturate inflight and starve cheaper distance meshes.
+    let reserve_for_lod = (max_inflight * 2 / 5)
         .clamp(64, 512)
         .min(max_inflight.saturating_sub(1));
     max_inflight.saturating_sub(reserve_for_lod).max(1)
@@ -1536,12 +1562,6 @@ fn track_apply_outcome(stats: &mut ApplyDebugStats, outcome: ApplyWorkerOutcome)
             stats.skipped_dirty_rev += 1;
             false
         }
-    }
-}
-
-fn worker_result_epoch(result: &WorkerResult) -> u64 {
-    match result {
-        WorkerResult::Raw { epoch, .. } | WorkerResult::Packed { epoch, .. } => *epoch,
     }
 }
 

@@ -142,6 +142,20 @@ impl EditedBlockStore {
         out
     }
 
+    pub fn has_chunk_halo_overrides(&self, center: IVec3, halo: i32) -> bool {
+        for dz in -halo..=halo {
+            for dy in -halo..=halo {
+                for dx in -halo..=halo {
+                    let key = (center.x + dx, center.y + dy, center.z + dz);
+                    if self.by_chunk.contains_key(&key) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     pub fn chunk_override_y_range(&self, coord: IVec3) -> Option<(i32, i32)> {
         let chunk = self.by_chunk.get(&(coord.x, coord.y, coord.z))?;
         let mut min_y = i32::MAX;
@@ -609,23 +623,21 @@ fn collect_affected_chunks(
     }
 
     if tree_like {
-        let mut x_offsets = vec![0];
-        let mut z_offsets = vec![0];
-        if local.x < TREE_XZ_MARGIN {
-            x_offsets.push(-1);
-        }
-        if local.x >= CHUNK_SIZE - TREE_XZ_MARGIN {
-            x_offsets.push(1);
-        }
-        if local.z < TREE_XZ_MARGIN {
-            z_offsets.push(-1);
-        }
-        if local.z >= CHUNK_SIZE - TREE_XZ_MARGIN {
-            z_offsets.push(1);
-        }
-        for ox in &x_offsets {
-            for oz in &z_offsets {
-                let c = coord + IVec3::new(*ox, 0, *oz);
+        let x_min = if local.x < TREE_XZ_MARGIN { -1 } else { 0 };
+        let x_max = if local.x >= CHUNK_SIZE - TREE_XZ_MARGIN {
+            1
+        } else {
+            0
+        };
+        let z_min = if local.z < TREE_XZ_MARGIN { -1 } else { 0 };
+        let z_max = if local.z >= CHUNK_SIZE - TREE_XZ_MARGIN {
+            1
+        } else {
+            0
+        };
+        for ox in x_min..=x_max {
+            for oz in z_min..=z_max {
+                let c = coord + IVec3::new(ox, 0, oz);
                 affected.insert((c.x, c.y, c.z));
             }
         }
