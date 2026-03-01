@@ -3,6 +3,7 @@
   "register_name": "block_tall_grass",
   "aliases": ["tall_grass", "tallgrass", "grass_plant"],
   "hardness": 0.05,
+  "required_tool": "hand",
   "collidable": false,
   "render_shape": "cross",
   "texture_slot_1based": 32,

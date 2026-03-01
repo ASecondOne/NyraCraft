@@ -1420,9 +1420,10 @@ where
     let mut indices = Vec::with_capacity(area * 18);
 
     // +X faces (face 0), merge on Y/Z plane.
+    let mut mask: Vec<Option<FaceMergeKey>> = vec![None; area];
     let mut x = 0;
     while x < size {
-        let mut mask: Vec<Option<FaceMergeKey>> = vec![None; area];
+        mask.fill(None);
         let mut y = 0;
         while y < size {
             let mut z = 0;
@@ -1523,9 +1524,10 @@ where
     }
 
     // -X faces (face 1), merge on Y/Z plane.
+    let mut mask: Vec<Option<FaceMergeKey>> = vec![None; area];
     let mut x = 0;
     while x < size {
-        let mut mask: Vec<Option<FaceMergeKey>> = vec![None; area];
+        mask.fill(None);
         let mut y = 0;
         while y < size {
             let mut z = 0;
@@ -1626,9 +1628,10 @@ where
     }
 
     // +Y faces (face 2), merge on X/Z plane.
+    let mut mask: Vec<Option<FaceMergeKey>> = vec![None; area];
     let mut y = 0;
     while y < size {
-        let mut mask: Vec<Option<FaceMergeKey>> = vec![None; area];
+        mask.fill(None);
         let mut x = 0;
         while x < size {
             let mut z = 0;
@@ -1729,9 +1732,10 @@ where
     }
 
     // -Y faces (face 3), merge on X/Z plane.
+    let mut mask: Vec<Option<FaceMergeKey>> = vec![None; area];
     let mut y = 0;
     while y < size {
-        let mut mask: Vec<Option<FaceMergeKey>> = vec![None; area];
+        mask.fill(None);
         let mut x = 0;
         while x < size {
             let mut z = 0;
@@ -1832,9 +1836,10 @@ where
     }
 
     // +Z faces (face 4), merge on Y/X plane.
+    let mut mask: Vec<Option<FaceMergeKey>> = vec![None; area];
     let mut z = 0;
     while z < size {
-        let mut mask: Vec<Option<FaceMergeKey>> = vec![None; area];
+        mask.fill(None);
         let mut y = 0;
         while y < size {
             let mut x = 0;
@@ -1935,9 +1940,10 @@ where
     }
 
     // -Z faces (face 5), merge on Y/X plane.
+    let mut mask: Vec<Option<FaceMergeKey>> = vec![None; area];
     let mut z = 0;
     while z < size {
-        let mut mask: Vec<Option<FaceMergeKey>> = vec![None; area];
+        mask.fill(None);
         let mut y = 0;
         while y < size {
             let mut x = 0;

@@ -31,7 +31,7 @@ use app::controls::{
 };
 use app::dropped_items::{
     DroppedItem, build_dropped_item_render_data, nudge_items_from_placed_block, spawn_block_drop,
-    throw_hotbar_item, update_dropped_items,
+    spawn_block_drop_with_item, throw_hotbar_item, update_dropped_items,
 };
 use app::logger::{init_logger, install_panic_hook, log_info, log_warn};
 use app::menu::{PauseMenuButton, hit_test_pause_menu_button};
@@ -40,7 +40,7 @@ use app::streaming::{
     ApplyDebugStats, CacheMeshView, CacheWriteMsg, DebugPerfSnapshot, EditedChunkRanges,
     PackedMeshData, SharedRequestQueue, WorkerResult, apply_stream_results, block_id_full_cached,
     build_stats_lines, chunk_coord_from_pos, is_solid_cached, mesh_cache_dir, new_request_queue,
-    pick_block, pop_request, request_queue_stats, should_pack_far_lod, stream_tick,
+    pick_block, pop_edit_request, pop_request, request_queue_stats, should_pack_far_lod, stream_tick,
     try_load_cached_mesh, write_cached_mesh,
 };
 use player::crafting::reload_recipes;
@@ -367,6 +367,35 @@ where
     Camera {
         position: camera_position,
         forward: look_forward,
+        up: Vec3::Y,
+    }
+}
+
+fn horizontal_forward(forward: Vec3) -> Vec3 {
+    let flat = Vec3::new(forward.x, 0.0, forward.z);
+    if flat.length_squared() > 1.0e-6 {
+        flat.normalize()
+    } else {
+        Vec3::new(0.0, 0.0, -1.0)
+    }
+}
+
+fn build_visibility_camera(
+    base_camera: &Camera,
+    player_position: Vec3,
+    eye_height: f32,
+    view_mode: CameraViewMode,
+) -> Camera {
+    if view_mode == CameraViewMode::FirstPerson {
+        return Camera {
+            position: base_camera.position,
+            forward: base_camera.forward,
+            up: Vec3::Y,
+        };
+    }
+    Camera {
+        position: player_position + Vec3::new(0.0, eye_height, 0.0),
+        forward: horizontal_forward(base_camera.forward),
         up: Vec3::Y,
     }
 }
@@ -887,14 +916,20 @@ fn main() {
         let edited_chunk_ranges = Arc::clone(&edited_chunk_ranges);
         let dirty_chunks = Arc::clone(&dirty_chunks);
         let tx_thread_report_worker = tx_thread_report.clone();
+        let edit_only_worker = worker_idx == 0;
         let _ = thread::Builder::new()
             .name(format!("nyra-worker-{worker_idx}"))
             .spawn(move || {
                 let _ = tx_thread_report_worker.send(format!(
-                    "worker-{worker_idx}(mesh/gen/cache-read): tid={:?}",
+                    "worker-{worker_idx}(mesh/gen/cache-read{}): tid={:?}",
+                    if edit_only_worker { ",edit-priority" } else { "" },
                     thread::current().id()
                 ));
-                while let Some(task) = pop_request(&request_queue) {
+                while let Some(task) = if edit_only_worker {
+                    pop_edit_request(&request_queue)
+                } else {
+                    pop_request(&request_queue)
+                } {
                     let task_epoch = content_reload_epoch.load(Ordering::Acquire);
                     let coord = task.coord;
                     let step = task.step;
@@ -912,16 +947,18 @@ fn main() {
                         });
                     let (overrides, override_range) = {
                         let store = edited_blocks.read().unwrap();
-                        if store.has_any_edits() {
+                        if store.has_any_edits()
+                            && store.has_chunk_halo_overrides(coord, DIRTY_EDIT_CHUNK_HALO)
+                        {
                             (
-                                store.collect_chunk_halo(coord, DIRTY_EDIT_CHUNK_HALO),
+                                Some(store.collect_chunk_halo(coord, DIRTY_EDIT_CHUNK_HALO)),
                                 store.chunk_override_y_range(coord),
                             )
                         } else {
-                            (HashMap::new(), None)
+                            (None, None)
                         }
                     };
-                    let has_overrides = !overrides.is_empty();
+                    let has_overrides = overrides.is_some();
                     if should_pack_far_lod(mode, step)
                         && dirty_rev.is_none()
                         && !has_overrides
@@ -950,25 +987,48 @@ fn main() {
                         RefCell::new(HashMap::<(i32, i32), i32>::with_capacity(1024));
                     let tree_cache =
                         RefCell::new(HashMap::<(i32, i32), Option<TreeSpec>>::with_capacity(1024));
-                    let block_at = |x: i32, y: i32, z: i32| -> i8 {
-                        overrides.get(&(x, y, z)).copied().unwrap_or_else(|| {
-                            block_id_full_cached(&gen_thread, &height_cache, &tree_cache, x, y, z)
-                        })
-                    };
                     let blocks_for_task = {
                         let guard = blocks_gen.read().unwrap();
                         Arc::clone(&guard)
                     };
-                    let mesh = generate_chunk_mesh(
-                        coord,
-                        blocks_for_task.as_ref(),
-                        &gen_thread,
-                        &block_at,
-                        edit_range,
-                        step,
-                        mode,
-                        lighting_pass,
-                    );
+                    let mesh = if let Some(overrides) = overrides.as_ref() {
+                        let block_at = |x: i32, y: i32, z: i32| -> i8 {
+                            overrides.get(&(x, y, z)).copied().unwrap_or_else(|| {
+                                block_id_full_cached(
+                                    &gen_thread,
+                                    &height_cache,
+                                    &tree_cache,
+                                    x,
+                                    y,
+                                    z,
+                                )
+                            })
+                        };
+                        generate_chunk_mesh(
+                            coord,
+                            blocks_for_task.as_ref(),
+                            &gen_thread,
+                            &block_at,
+                            edit_range,
+                            step,
+                            mode,
+                            lighting_pass,
+                        )
+                    } else {
+                        let block_at = |x: i32, y: i32, z: i32| -> i8 {
+                            block_id_full_cached(&gen_thread, &height_cache, &tree_cache, x, y, z)
+                        };
+                        generate_chunk_mesh(
+                            coord,
+                            blocks_for_task.as_ref(),
+                            &gen_thread,
+                            &block_at,
+                            edit_range,
+                            step,
+                            mode,
+                            lighting_pass,
+                        )
+                    };
                     if should_pack_far_lod(mode, step) {
                         let packed_vertices = Arc::<[_]>::from(pack_far_vertices(&mesh.vertices));
                         let packed_indices = Arc::<[_]>::from(mesh.indices);
@@ -1008,17 +1068,17 @@ fn main() {
             });
     }
 
-    let base_render_radius = 384;
-    let max_render_radius = 768;
-    let base_draw_radius = 160;
-    let lod_near_radius = 16;
-    let lod_mid_radius = 32;
-    let request_budget = 56;
-    let max_inflight = 384usize;
-    let surface_depth_chunks = 4;
+    let base_render_radius = 288;
+    let max_render_radius = 576;
+    let base_draw_radius = 96;
+    let lod_near_radius = 8;
+    let lod_mid_radius = 16;
+    let request_budget = 48;
+    let max_inflight = 320usize;
+    let surface_depth_chunks = 3;
     let initial_burst_radius = 2;
-    let loaded_chunk_cap = 36000usize; // trim residency so render doesn't drown in far chunks
-    let mesh_memory_cap_mb = 3072usize; // 3 GB cap
+    let loaded_chunk_cap = 32000usize; // trim residency so render doesn't drown in far chunks
+    let mesh_memory_cap_mb = 2560usize; // 2.5 GB cap
     let mut current_chunk = chunk_coord_from_pos(player.position);
     let pregen_center_chunk = current_chunk;
     let requested_pregen_span_chunks = 1000;
@@ -1063,15 +1123,14 @@ fn main() {
     let mut adaptive_max_apply_per_tick: usize = 12;
     let mut adaptive_max_rebuilds_per_tick: usize = 2;
     let mut adaptive_draw_radius_cap = base_draw_radius;
-    let initial_render_camera = build_render_camera(
+    let initial_visibility_camera = build_visibility_camera(
         &camera,
         player.position,
         player_config.eye_height,
         camera_view_mode,
-        &is_solid,
     );
-    let mut last_camera_pos = initial_render_camera.position;
-    let mut last_camera_forward = initial_render_camera.forward;
+    let mut last_camera_pos = initial_visibility_camera.position;
+    let mut last_camera_forward = initial_visibility_camera.forward;
     let mut last_visibility_refresh = Instant::now();
 
     let _ = event_loop.run(move |event, elwt| match event {
@@ -1229,18 +1288,33 @@ fn main() {
                     );
                     stream_ms_accum += stream_phase_start.elapsed().as_secs_f32() * 1000.0;
                     stream_calls += 1;
-                    let visibility_camera = build_render_camera(
+                    let visibility_camera = build_visibility_camera(
                         &camera,
                         player.position,
                         player_config.eye_height,
                         camera_view_mode,
-                        &is_solid,
                     );
+                    let (move_threshold_sq, dir_dot_threshold) =
+                        if camera_view_mode == CameraViewMode::FirstPerson {
+                            (0.16f32, 0.9992f32)
+                        } else {
+                            (0.64f32, 0.9970f32)
+                        };
                     let camera_changed =
-                        (visibility_camera.position - last_camera_pos).length_squared() > 0.16
-                            || visibility_camera.forward.dot(last_camera_forward) < 0.9992;
+                        (visibility_camera.position - last_camera_pos).length_squared()
+                            > move_threshold_sq
+                            || visibility_camera.forward.dot(last_camera_forward)
+                                < dir_dot_threshold;
+                    let visibility_interval_ms = if camera_changed {
+                        66
+                    } else if !requested.is_empty() || pregen_active {
+                        140
+                    } else {
+                        220
+                    };
                     let visibility_refresh_due =
-                        last_visibility_refresh.elapsed() >= Duration::from_millis(66);
+                        last_visibility_refresh.elapsed()
+                            >= Duration::from_millis(visibility_interval_ms);
                     if visibility_refresh_due
                         && (camera_changed || !requested.is_empty() || pregen_active)
                     {
@@ -1328,7 +1402,12 @@ fn main() {
                                     if !edit_result.broke.is_empty() {
                                         edits_save_dirty = true;
                                         for (broken_pos, broken_id) in edit_result.broke.iter().copied() {
-                                            spawn_block_drop(&mut dropped_items, broken_pos, broken_id);
+                                            spawn_block_drop_with_item(
+                                                &mut dropped_items,
+                                                broken_pos,
+                                                broken_id,
+                                                active_break_item_id,
+                                            );
                                             let _ = inventory.apply_selected_hotbar_durability_loss(
                                                 selected_hotbar_slot,
                                                 1,
@@ -1355,8 +1434,8 @@ fn main() {
                                                 &mut pregen_chunks_created,
                                                 loaded_chunk_cap,
                                                 mesh_memory_cap_mb,
-                                                32,
-                                                adaptive_max_rebuilds_per_tick.max(5),
+                                                48,
+                                                adaptive_max_rebuilds_per_tick.max(8),
                                                 true,
                                             );
                                         }
@@ -1464,12 +1543,31 @@ fn main() {
                     tps_ticks = 0;
                     tps_last = Instant::now();
 
-                    if tps_value < 18 || fps_value < 45 {
-                        adaptive_request_budget = (adaptive_request_budget * 82 / 100).max(28);
+                    let stats_now = gpu.stats();
+                    let render_heavy = perf.render_cpu_ms > 9.5 || stats_now.visible_indices > 2_400_000;
+                    if render_heavy {
+                        adaptive_request_budget = (adaptive_request_budget * 84 / 100).max(24);
+                        adaptive_pregen_budget = (adaptive_pregen_budget * 78 / 100).max(8);
+                        adaptive_max_apply_per_tick =
+                            adaptive_max_apply_per_tick.saturating_sub(1).max(6);
+                        adaptive_max_rebuilds_per_tick =
+                            adaptive_max_rebuilds_per_tick.saturating_sub(1).max(1);
+                        adaptive_draw_radius_cap = (adaptive_draw_radius_cap - 10).max(20);
+                    } else if tps_value < 14 || fps_value < 30 {
+                        adaptive_request_budget = (adaptive_request_budget * 76 / 100).max(28);
+                        adaptive_pregen_budget = (adaptive_pregen_budget * 70 / 100).max(8);
+                        adaptive_max_apply_per_tick =
+                            adaptive_max_apply_per_tick.saturating_sub(3).max(6);
+                        adaptive_max_rebuilds_per_tick =
+                            adaptive_max_rebuilds_per_tick.saturating_sub(1).max(1);
+                        adaptive_draw_radius_cap = (adaptive_draw_radius_cap - 12).max(22);
+                    } else if tps_value < 18 || fps_value < 45 {
+                        adaptive_request_budget = (adaptive_request_budget * 86 / 100).max(32);
                         adaptive_pregen_budget = (adaptive_pregen_budget * 75 / 100).max(8);
                         adaptive_max_apply_per_tick =
-                            adaptive_max_apply_per_tick.saturating_sub(2).max(6);
-                        adaptive_max_rebuilds_per_tick = adaptive_max_rebuilds_per_tick.saturating_sub(1).max(1);
+                            adaptive_max_apply_per_tick.saturating_sub(2).max(7);
+                        adaptive_max_rebuilds_per_tick =
+                            adaptive_max_rebuilds_per_tick.saturating_sub(1).max(1);
                         adaptive_draw_radius_cap = (adaptive_draw_radius_cap - 8).max(24);
                     } else if tps_value >= 20 && fps_value > 72 {
                         adaptive_request_budget = (adaptive_request_budget + 6).min(request_budget);
@@ -1716,18 +1814,20 @@ fn main() {
                 );
                 let dropped_render_items =
                     build_dropped_item_render_data(&dropped_items, render_time);
+                let emissive_center =
+                    player.position + Vec3::new(0.0, player_config.eye_height, 0.0);
                 let emissive_refresh_due = last_emissive_scan.elapsed() >= EMISSIVE_SCAN_INTERVAL
-                    || (render_camera.position - last_emissive_scan_pos).length_squared()
+                    || (emissive_center - last_emissive_scan_pos).length_squared()
                         >= EMISSIVE_SCAN_MOVE_THRESHOLD_SQ;
                 if emissive_refresh_due {
                     world_emissive_lights = collect_world_emissive_lights(
                         &edited_blocks,
-                        render_camera.position,
+                        emissive_center,
                         EMISSIVE_SCAN_RADIUS_BLOCKS,
                         EMISSIVE_SCAN_MAX_SOURCES,
                     );
                     last_emissive_scan = Instant::now();
-                    last_emissive_scan_pos = render_camera.position;
+                    last_emissive_scan_pos = emissive_center;
                 }
                 let chat_recently_visible = Instant::now() < chat_visible_until;
                 let stats_overlay_visible = debug_ui || pregen_active;
@@ -1743,7 +1843,8 @@ fn main() {
                     player.position,
                     camera.forward,
                     player_config.height,
-                    camera_view_mode.shows_player_model() && draw_world,
+                    draw_world,
+                    camera_view_mode.shows_player_model(),
                     render_time,
                     draw_world,
                     debug_faces,
@@ -2346,8 +2447,14 @@ fn main() {
                 player_config.radius,
                 inventory.selected_hotbar_block(selected_hotbar_slot),
             );
+            let active_break_item_id = inventory.selected_hotbar_item_id(selected_hotbar_slot);
             for (broken_pos, broken_id) in edit_result.broke.iter().copied() {
-                spawn_block_drop(&mut dropped_items, broken_pos, broken_id);
+                spawn_block_drop_with_item(
+                    &mut dropped_items,
+                    broken_pos,
+                    broken_id,
+                    active_break_item_id,
+                );
             }
             for (placed_pos, _placed_id) in edit_result.placed.iter().copied() {
                 let _ = inventory.consume_selected_hotbar(selected_hotbar_slot, 1);
@@ -2380,8 +2487,8 @@ fn main() {
                     &mut pregen_chunks_created,
                     loaded_chunk_cap,
                     mesh_memory_cap_mb,
-                    32,
-                    adaptive_max_rebuilds_per_tick.max(5),
+                    48,
+                    adaptive_max_rebuilds_per_tick.max(8),
                     true,
                 );
             }
