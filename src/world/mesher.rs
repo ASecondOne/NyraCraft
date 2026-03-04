@@ -91,7 +91,8 @@ where
         .filter(|&idx| idx < blocks.len());
 
     let use_texture = if mode == MeshMode::SurfaceOnly { 0 } else { 1 };
-    let use_sky_shading = use_sky_shading && mode == MeshMode::Full && step == 1;
+    // Allow sky shading for nearby/coarse LODs too, so chunk LOD boundaries don't pop in lighting.
+    let use_sky_shading = use_sky_shading && mode != MeshMode::SurfaceOnly && step <= 4;
     let chunk_min_y = origin.y - half;
     let chunk_max_y = origin.y + half;
 
@@ -2175,7 +2176,12 @@ fn emit_cross_plant<F>(
         compute_face_light_with_block(2, wx, wy, wz, 1, 1, 1, use_sky_shading, block_at, None);
     let emissive = (block.light_emission / 15.0).clamp(0.0, 1.0);
     let shade = light.max(emissive);
-    let color = [shade, shade, shade, 1.0];
+    let color = [
+        (shade * block.overlay[0]).clamp(0.0, 1.0),
+        (shade * block.overlay[1]).clamp(0.0, 1.0),
+        (shade * block.overlay[2]).clamp(0.0, 1.0),
+        block.overlay[3].clamp(0.0, 1.0),
+    ];
     let tile = block.tiles[2];
     let rotation = block.rotations[2];
     let transparent_mode = block.transparent_mode[2];
@@ -2323,29 +2329,30 @@ fn emit_face_with_light<F>(
         [1.0; 4]
     };
     let emissive = (block.light_emission / 15.0).clamp(0.0, 1.0);
+    let overlay = block.overlay;
     let color0 = [
-        (light * ao[0]).max(emissive),
-        (light * ao[0]).max(emissive),
-        (light * ao[0]).max(emissive),
-        1.0,
+        ((light * ao[0]).max(emissive) * overlay[0]).clamp(0.0, 1.0),
+        ((light * ao[0]).max(emissive) * overlay[1]).clamp(0.0, 1.0),
+        ((light * ao[0]).max(emissive) * overlay[2]).clamp(0.0, 1.0),
+        overlay[3].clamp(0.0, 1.0),
     ];
     let color1 = [
-        (light * ao[1]).max(emissive),
-        (light * ao[1]).max(emissive),
-        (light * ao[1]).max(emissive),
-        1.0,
+        ((light * ao[1]).max(emissive) * overlay[0]).clamp(0.0, 1.0),
+        ((light * ao[1]).max(emissive) * overlay[1]).clamp(0.0, 1.0),
+        ((light * ao[1]).max(emissive) * overlay[2]).clamp(0.0, 1.0),
+        overlay[3].clamp(0.0, 1.0),
     ];
     let color2 = [
-        (light * ao[2]).max(emissive),
-        (light * ao[2]).max(emissive),
-        (light * ao[2]).max(emissive),
-        1.0,
+        ((light * ao[2]).max(emissive) * overlay[0]).clamp(0.0, 1.0),
+        ((light * ao[2]).max(emissive) * overlay[1]).clamp(0.0, 1.0),
+        ((light * ao[2]).max(emissive) * overlay[2]).clamp(0.0, 1.0),
+        overlay[3].clamp(0.0, 1.0),
     ];
     let color3 = [
-        (light * ao[3]).max(emissive),
-        (light * ao[3]).max(emissive),
-        (light * ao[3]).max(emissive),
-        1.0,
+        ((light * ao[3]).max(emissive) * overlay[0]).clamp(0.0, 1.0),
+        ((light * ao[3]).max(emissive) * overlay[1]).clamp(0.0, 1.0),
+        ((light * ao[3]).max(emissive) * overlay[2]).clamp(0.0, 1.0),
+        overlay[3].clamp(0.0, 1.0),
     ];
     let tile = block.tiles[face as usize];
     let rotation = block.rotations[face as usize];

@@ -7,6 +7,7 @@ pub struct BlockTexture {
     pub tiles: [u32; FACE_COUNT],
     pub rotations: [u32; FACE_COUNT],
     pub transparent_mode: [u32; FACE_COUNT],
+    pub overlay: [f32; 4],
     pub light_emission: f32,
     pub render_shape: u8,
 }

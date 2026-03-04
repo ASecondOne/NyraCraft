@@ -9,8 +9,8 @@ use crate::render::CubeStyle;
 use crate::render::atlas::TextureAtlas;
 use crate::render::mesh::{ChunkVertex, PackedFarVertex};
 use crate::render::texture::{
-    AtlasTexture, create_dummy_texture, load_atlas_texture, load_grass_colormap_texture,
-    load_player_skin_texture,
+    AtlasTexture, UvRect, create_dummy_texture, load_atlas_texture, load_celestial_texture,
+    load_grass_colormap_texture, load_player_skin_texture,
 };
 use crate::world::blocks::{
     DESTROY_STAGE_COUNT, DESTROY_STAGE_TILE_START, block_count, block_light_emission,
@@ -22,7 +22,6 @@ use font8x8::{BASIC_FONTS, UnicodeFonts};
 use glam::{IVec3, Mat3, Mat4, Vec3};
 use self_cell::self_cell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, OnceLock};
 use wgpu::util::DeviceExt;
@@ -144,8 +143,8 @@ const UI_ATLAS_ITEM: f32 = 0.0;
 const UI_ATLAS_BLOCK: f32 = 1.0;
 const SUN_TRANSPARENT_MODE: u32 = 15;
 pub const DAY_CYCLE_SECONDS: f32 = 48.0 * 60.0; // 2 min per in-game hour, 48 min full day.
-const MAX_POINT_LIGHTS: usize = 12;
-const POINT_LIGHT_CULL_DISTANCE: f32 = 84.0;
+const MAX_POINT_LIGHTS: usize = 20;
+const POINT_LIGHT_CULL_DISTANCE: f32 = 128.0;
 const POINT_LIGHT_DROPPED_SAMPLE_CAP: usize = 192;
 const UI_TEXT_PIXEL_SCALE: f32 = 0.62;
 const UI_TEXT_GLYPH_WIDTH: usize = 8;
@@ -167,6 +166,8 @@ struct PointLight {
     radius: f32,
     color: Vec3,
     intensity: f32,
+    // 0.0 = fully omnidirectional priority, 1.0 = strong view-direction priority.
+    view_bias: f32,
 }
 
 struct PointLightCullResult {
@@ -182,8 +183,8 @@ fn sample_day_cycle(elapsed_seconds: f32) -> DayCycleState {
     let sun_height = cycle_angle.cos();
     let day01 = ((sun_height + 1.0) * 0.5).clamp(0.0, 1.0);
     // Keep a small ambient floor so nights stay readable.
-    let daylight = (0.08 + 0.92 * day01.powf(1.35)).clamp(0.08, 1.0);
-    let sky_mix = day01.powf(0.8);
+    let daylight = (0.05 + 0.95 * day01.powf(1.22)).clamp(0.05, 1.0);
+    let sky_mix = day01.powf(0.72);
     DayCycleState {
         day_progress,
         daylight,
@@ -265,6 +266,7 @@ fn build_culled_point_lights(
             radius: 7.5 + 3.0 * night_factor,
             color: Vec3::new(1.0, 0.8, 0.42),
             intensity: 0.35 + 0.9 * night_factor,
+            view_bias: 0.55,
         });
     }
 
@@ -280,6 +282,7 @@ fn build_culled_point_lights(
             radius: 3.2 + 3.2 * night_factor + 6.0 * emissive_factor,
             color: point_light_tint(item.block_id),
             intensity: 0.06 + 0.28 * night_factor + 0.85 * emissive_factor,
+            view_bias: 0.70,
         });
     }
 
@@ -290,19 +293,23 @@ fn build_culled_point_lights(
             radius: 3.0 + 11.0 * emissive_factor,
             color: point_light_tint(block_id),
             intensity: 0.25 + 1.75 * emissive_factor,
+            view_bias: 0.78,
         });
     }
 
     for light in world_emissive_lights {
         let emissive_factor = normalize_light_emission(light.emission);
-        if emissive_factor <= 0.0 {
+        if emissive_factor <= 0.01 {
             continue;
         }
         candidates.push(PointLight {
             position: light.position,
-            radius: 6.0 + 18.0 * emissive_factor,
-            color: point_light_tint(light.block_id),
-            intensity: 1.1 + 4.0 * emissive_factor,
+            radius: 2.5 + 24.0 * emissive_factor,
+            color: light
+                .tint
+                .unwrap_or_else(|| point_light_tint(light.block_id)),
+            intensity: 0.02 + 3.8 * emissive_factor,
+            view_bias: 0.12,
         });
     }
 
@@ -320,7 +327,8 @@ fn build_culled_point_lights(
         };
         let facing = ((camera_forward.dot(dir) + 0.35) * 0.74).clamp(0.0, 1.0);
         let attenuation = 1.0 / (1.0 + dist * 0.18 + dist * dist * 0.018);
-        let score = light.intensity * (0.3 + 0.7 * facing) * attenuation;
+        let view_weight = ((1.0 - light.view_bias) + light.view_bias * facing).clamp(0.05, 1.0);
+        let score = light.intensity * view_weight * attenuation;
         if score <= 0.001 {
             continue;
         }
@@ -394,6 +402,8 @@ struct GpuInner<'a> {
     player_mesh_last_include_head: bool,
     break_overlay_mesh: DynamicMeshBuffer,
     sun_mesh: DynamicMeshBuffer,
+    sun_uv: UvRect,
+    moon_phase_uvs: [UvRect; 8],
     staged_indices: Vec<u32>,
 }
 
@@ -448,6 +458,7 @@ pub struct WorldEmissiveLight {
     pub position: Vec3,
     pub block_id: i8,
     pub emission: f32,
+    pub tint: Option<Vec3>,
 }
 
 impl Gpu {
@@ -580,22 +591,11 @@ impl Gpu {
                     tile_size: 16,
                 },
             );
-            let AtlasTexture {
-                view: sun_texture_view,
-                sampler: sun_sampler,
-                ..
-            } = if Path::new("src/texturing/sun_vv.png").exists() {
-                load_atlas_texture(
-                    &device,
-                    &queue,
-                    &TextureAtlas {
-                        path: "src/texturing/sun_vv.png".to_string(),
-                        tile_size: 32,
-                    },
-                )
-            } else {
-                create_dummy_texture(&device, &queue)
-            };
+            let celestial = load_celestial_texture(&device, &queue);
+            let sun_texture_view = celestial.view;
+            let sun_sampler = celestial.sampler;
+            let sun_uv = celestial.sun_uv;
+            let moon_phase_uvs = celestial.moon_phase_uvs;
 
             let uniform = SceneUniform {
                 mvp: Mat4::IDENTITY.to_cols_array_2d(),
@@ -1088,6 +1088,8 @@ impl Gpu {
                 player_mesh_last_include_head: true,
                 break_overlay_mesh: DynamicMeshBuffer::default(),
                 sun_mesh: DynamicMeshBuffer::default(),
+                sun_uv,
+                moon_phase_uvs,
                 staged_indices: Vec::new(),
             }
         });
@@ -1138,22 +1140,11 @@ impl Gpu {
                     tile_size: 16,
                 },
             );
-            let AtlasTexture {
-                view: sun_texture_view,
-                sampler: sun_sampler,
-                ..
-            } = if Path::new("src/texturing/sun_vv.png").exists() {
-                load_atlas_texture(
-                    &gpu.device,
-                    &gpu.queue,
-                    &TextureAtlas {
-                        path: "src/texturing/sun_vv.png".to_string(),
-                        tile_size: 32,
-                    },
-                )
-            } else {
-                create_dummy_texture(&gpu.device, &gpu.queue)
-            };
+            let celestial = load_celestial_texture(&gpu.device, &gpu.queue);
+            let sun_texture_view = celestial.view;
+            let sun_sampler = celestial.sampler;
+            let sun_uv = celestial.sun_uv;
+            let moon_phase_uvs = celestial.moon_phase_uvs;
 
             let scene_bind_group_layout = gpu.render_pipeline.get_bind_group_layout(0);
             gpu.bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1270,6 +1261,8 @@ impl Gpu {
             gpu.tile_uv_size = tile_uv_size;
             gpu.ui_item_tiles_x = ui_item_tiles_x;
             gpu.ui_item_tile_uv_size = ui_item_tile_uv_size;
+            gpu.sun_uv = sun_uv;
+            gpu.moon_phase_uvs = moon_phase_uvs;
         });
     }
 
@@ -1505,8 +1498,14 @@ impl Gpu {
                     gpu.break_overlay_mesh.index_count = 0;
                 }
 
-                let (sun_vertices, sun_indices) =
-                    build_sun_mesh(camera, day_cycle.day_progress, day_cycle.sun_height);
+                let (sun_vertices, sun_indices) = build_celestial_mesh(
+                    camera,
+                    elapsed_seconds,
+                    day_cycle.day_progress,
+                    day_cycle.sun_height,
+                    gpu.sun_uv,
+                    &gpu.moon_phase_uvs,
+                );
                 upload_dynamic_chunk_mesh(
                     &gpu.device,
                     &gpu.queue,
@@ -1556,6 +1555,16 @@ impl Gpu {
             }
 
             {
+                let sky_mix = day_cycle.sky_mix.clamp(0.0, 1.0);
+                let twilight =
+                    (1.0 - (day_cycle.sun_height.abs() * 1.45).clamp(0.0, 1.0)).powf(1.65);
+                let night = (1.0 - sky_mix).clamp(0.0, 1.0);
+                let sky_r = (0.016 + (0.40 - 0.016) * sky_mix + 0.08 * twilight + 0.03 * night)
+                    .clamp(0.0, 1.0);
+                let sky_g = (0.024 + (0.66 - 0.024) * sky_mix + 0.05 * twilight + 0.02 * night)
+                    .clamp(0.0, 1.0);
+                let sky_b = (0.062 + (0.93 - 0.062) * sky_mix + 0.02 * twilight + 0.07 * night)
+                    .clamp(0.0, 1.0);
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("cube_render_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1563,9 +1572,9 @@ impl Gpu {
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.02 + (0.52 - 0.02) * day_cycle.sky_mix as f64,
-                                g: 0.04 + (0.73 - 0.04) * day_cycle.sky_mix as f64,
-                                b: 0.09 + (0.95 - 0.09) * day_cycle.sky_mix as f64,
+                                r: sky_r as f64,
+                                g: sky_g as f64,
+                                b: sky_b as f64,
                                 a: 1.0,
                             }),
                             store: wgpu::StoreOp::Store,
@@ -4149,7 +4158,7 @@ fn push_block_icon_textured(
         return;
     }
 
-    let (tiles, rotations, _) = dropped_block_face_data(block_id);
+    let (tiles, rotations, _, _) = dropped_block_face_data(block_id);
     let (top_uv_min, top_uv_max) = match tile_uv_bounds(tiles[2], tiles_x, tile_uv_size) {
         Some(v) => v,
         None => {
@@ -4474,7 +4483,7 @@ fn push_block_icon(
 
 fn block_icon_colors(block_id: i8) -> ([f32; 4], [f32; 4], [f32; 4]) {
     let ids = core_block_ids();
-    match block_id {
+    let (mut top, mut left, mut right) = match block_id {
         x if x == ids.stone => (
             [0.76, 0.76, 0.76, 1.0],
             [0.56, 0.56, 0.56, 1.0],
@@ -4525,7 +4534,23 @@ fn block_icon_colors(block_id: i8) -> ([f32; 4], [f32; 4], [f32; 4]) {
             [0.5, 0.5, 0.5, 1.0],
             [0.4, 0.4, 0.4, 1.0],
         ),
+    };
+    if let Some(tex) = block_texture_by_id(block_id) {
+        let tint = tex.overlay;
+        top[0] = (top[0] * tint[0]).clamp(0.0, 1.0);
+        top[1] = (top[1] * tint[1]).clamp(0.0, 1.0);
+        top[2] = (top[2] * tint[2]).clamp(0.0, 1.0);
+        top[3] = (top[3] * tint[3]).clamp(0.0, 1.0);
+        left[0] = (left[0] * tint[0]).clamp(0.0, 1.0);
+        left[1] = (left[1] * tint[1]).clamp(0.0, 1.0);
+        left[2] = (left[2] * tint[2]).clamp(0.0, 1.0);
+        left[3] = (left[3] * tint[3]).clamp(0.0, 1.0);
+        right[0] = (right[0] * tint[0]).clamp(0.0, 1.0);
+        right[1] = (right[1] * tint[1]).clamp(0.0, 1.0);
+        right[2] = (right[2] * tint[2]).clamp(0.0, 1.0);
+        right[3] = (right[3] * tint[3]).clamp(0.0, 1.0);
     }
+    (top, left, right)
 }
 
 fn scale_color(mut color: [f32; 4], scale: f32) -> [f32; 4] {
@@ -4739,58 +4764,127 @@ fn build_break_overlay_mesh(coord: IVec3, stage: u32) -> (Vec<ChunkVertex>, Vec<
     (vertices, indices)
 }
 
-fn build_sun_mesh(
+fn moon_phase_index(elapsed_seconds: f32) -> usize {
+    const MOON_PHASE_COUNT: usize = 8;
+    const MOON_PHASE_DAYS: f32 = 2.0;
+    let day_count = (elapsed_seconds / DAY_CYCLE_SECONDS.max(1.0)).max(0.0);
+    ((day_count / MOON_PHASE_DAYS).floor() as usize) % MOON_PHASE_COUNT
+}
+
+fn build_celestial_mesh(
     camera: &Camera,
+    elapsed_seconds: f32,
     day_progress: f32,
     sun_height: f32,
+    sun_uv: UvRect,
+    moon_phase_uvs: &[UvRect; 8],
 ) -> (Vec<ChunkVertex>, Vec<u32>) {
-    if sun_height < -0.22 {
-        return (Vec::new(), Vec::new());
+    let mut vertices = Vec::with_capacity(16);
+    let mut indices = Vec::with_capacity(24);
+    let sun_dir = sun_direction(day_progress, sun_height);
+
+    if sun_height >= -0.22 {
+        let center = camera.position + sun_dir * 900.0;
+        let half = 76.0f32;
+        let y = center.y;
+        let x0 = center.x - half;
+        let x1 = center.x + half;
+        let z0 = center.z - half;
+        let z1 = center.z + half;
+        let glow = ((sun_height + 0.22) / 1.22).clamp(0.25, 1.0);
+        let color = [
+            glow,
+            (glow * 0.96).clamp(0.0, 1.0),
+            (glow * 0.88).clamp(0.0, 1.0),
+            0.98,
+        ];
+
+        // Draw both sides so the sun is visible regardless of camera height.
+        emit_dropped_item_face_uv(
+            &mut vertices,
+            &mut indices,
+            3,
+            [x0, y, z1],
+            [x0, y, z0],
+            [x1, y, z0],
+            [x1, y, z1],
+            0,
+            0,
+            SUN_TRANSPARENT_MODE,
+            1,
+            color,
+            sun_uv.min,
+            sun_uv.max,
+        );
+        emit_dropped_item_face_uv(
+            &mut vertices,
+            &mut indices,
+            2,
+            [x0, y + 0.01, z0],
+            [x0, y + 0.01, z1],
+            [x1, y + 0.01, z1],
+            [x1, y + 0.01, z0],
+            0,
+            0,
+            SUN_TRANSPARENT_MODE,
+            1,
+            color,
+            sun_uv.min,
+            sun_uv.max,
+        );
     }
 
-    let mut vertices = Vec::with_capacity(8);
-    let mut indices = Vec::with_capacity(12);
+    let moon_strength = ((-sun_height + 0.06) / 1.06).clamp(0.0, 1.0);
+    if moon_strength > 0.03 {
+        let moon_dir = -sun_dir;
+        let center = camera.position + moon_dir * 890.0;
+        let half = 62.0f32;
+        let y = center.y;
+        let x0 = center.x - half;
+        let x1 = center.x + half;
+        let z0 = center.z - half;
+        let z1 = center.z + half;
+        let phase_uv = moon_phase_uvs[moon_phase_index(elapsed_seconds)];
+        let moon_color = [
+            (0.70 + 0.28 * moon_strength).clamp(0.0, 1.0),
+            (0.75 + 0.23 * moon_strength).clamp(0.0, 1.0),
+            (0.88 + 0.12 * moon_strength).clamp(0.0, 1.0),
+            (0.76 + 0.22 * moon_strength).clamp(0.0, 1.0),
+        ];
 
-    let sun_dir = sun_direction(day_progress, sun_height);
-    let center = camera.position + sun_dir * 900.0;
-    let half = 76.0f32;
-    let y = center.y;
-    let x0 = center.x - half;
-    let x1 = center.x + half;
-    let z0 = center.z - half;
-    let z1 = center.z + half;
-    let glow = ((sun_height + 0.22) / 1.22).clamp(0.35, 1.0);
-    let color = [glow, glow, glow, 1.0];
-
-    // Draw both sides so the sun is visible regardless of camera height.
-    emit_dropped_item_face(
-        &mut vertices,
-        &mut indices,
-        3,
-        [x0, y, z1],
-        [x0, y, z0],
-        [x1, y, z0],
-        [x1, y, z1],
-        0,
-        0,
-        SUN_TRANSPARENT_MODE,
-        1,
-        color,
-    );
-    emit_dropped_item_face(
-        &mut vertices,
-        &mut indices,
-        2,
-        [x0, y + 0.01, z0],
-        [x0, y + 0.01, z1],
-        [x1, y + 0.01, z1],
-        [x1, y + 0.01, z0],
-        0,
-        0,
-        SUN_TRANSPARENT_MODE,
-        1,
-        color,
-    );
+        emit_dropped_item_face_uv(
+            &mut vertices,
+            &mut indices,
+            3,
+            [x0, y, z1],
+            [x0, y, z0],
+            [x1, y, z0],
+            [x1, y, z1],
+            0,
+            0,
+            SUN_TRANSPARENT_MODE,
+            1,
+            moon_color,
+            phase_uv.min,
+            phase_uv.max,
+        );
+        emit_dropped_item_face_uv(
+            &mut vertices,
+            &mut indices,
+            2,
+            [x0, y + 0.01, z0],
+            [x0, y + 0.01, z1],
+            [x1, y + 0.01, z1],
+            [x1, y + 0.01, z0],
+            0,
+            0,
+            SUN_TRANSPARENT_MODE,
+            1,
+            moon_color,
+            phase_uv.min,
+            phase_uv.max,
+        );
+    }
 
     (vertices, indices)
 }
@@ -4829,7 +4923,7 @@ fn emit_dropped_item_cube(
     let p110 = to_world(Vec3::new(half, half, -half));
     let p111 = to_world(Vec3::new(half, half, half));
 
-    let (tiles, rotations, transparent_modes) = dropped_block_face_data(item.block_id);
+    let (tiles, rotations, transparent_modes, overlay) = dropped_block_face_data(item.block_id);
     emit_dropped_item_face(
         vertices,
         indices,
@@ -4842,7 +4936,7 @@ fn emit_dropped_item_cube(
         rotations[0],
         transparent_modes[0],
         1,
-        [1.0, 1.0, 1.0, 1.0],
+        overlay,
     );
     emit_dropped_item_face(
         vertices,
@@ -4856,7 +4950,7 @@ fn emit_dropped_item_cube(
         rotations[1],
         transparent_modes[1],
         1,
-        [1.0, 1.0, 1.0, 1.0],
+        overlay,
     );
     emit_dropped_item_face(
         vertices,
@@ -4870,7 +4964,7 @@ fn emit_dropped_item_cube(
         rotations[2],
         transparent_modes[2],
         1,
-        [1.0, 1.0, 1.0, 1.0],
+        overlay,
     );
     emit_dropped_item_face(
         vertices,
@@ -4884,7 +4978,7 @@ fn emit_dropped_item_cube(
         rotations[3],
         transparent_modes[3],
         1,
-        [1.0, 1.0, 1.0, 1.0],
+        overlay,
     );
     emit_dropped_item_face(
         vertices,
@@ -4898,7 +4992,7 @@ fn emit_dropped_item_cube(
         rotations[4],
         transparent_modes[4],
         1,
-        [1.0, 1.0, 1.0, 1.0],
+        overlay,
     );
     emit_dropped_item_face(
         vertices,
@@ -4912,7 +5006,7 @@ fn emit_dropped_item_cube(
         rotations[5],
         transparent_modes[5],
         1,
-        [1.0, 1.0, 1.0, 1.0],
+        overlay,
     );
 }
 
@@ -5301,6 +5395,67 @@ fn emit_dropped_item_face(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn emit_dropped_item_face_uv(
+    vertices: &mut Vec<ChunkVertex>,
+    indices: &mut Vec<u32>,
+    face: u32,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    p3: [f32; 3],
+    tile: u32,
+    rotation: u32,
+    transparent_mode: u32,
+    use_texture: u32,
+    color: [f32; 4],
+    uv_min: [f32; 2],
+    uv_max: [f32; 2],
+) {
+    let base = vertices.len() as u32;
+    vertices.push(ChunkVertex {
+        position: p0,
+        uv: [uv_min[0], uv_max[1]],
+        tile,
+        face,
+        rotation,
+        use_texture,
+        transparent_mode,
+        color,
+    });
+    vertices.push(ChunkVertex {
+        position: p1,
+        uv: [uv_max[0], uv_max[1]],
+        tile,
+        face,
+        rotation,
+        use_texture,
+        transparent_mode,
+        color,
+    });
+    vertices.push(ChunkVertex {
+        position: p2,
+        uv: [uv_max[0], uv_min[1]],
+        tile,
+        face,
+        rotation,
+        use_texture,
+        transparent_mode,
+        color,
+    });
+    vertices.push(ChunkVertex {
+        position: p3,
+        uv: [uv_min[0], uv_min[1]],
+        tile,
+        face,
+        rotation,
+        use_texture,
+        transparent_mode,
+        color,
+    });
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_dropped_item_face_mirror_y(
     vertices: &mut Vec<ChunkVertex>,
     indices: &mut Vec<u32>,
@@ -5359,12 +5514,12 @@ fn emit_dropped_item_face_mirror_y(
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
-fn dropped_block_face_data(item_id: i8) -> ([u32; 6], [u32; 6], [u32; 6]) {
+fn dropped_block_face_data(item_id: i8) -> ([u32; 6], [u32; 6], [u32; 6], [f32; 4]) {
     let block_id = placeable_block_id_for_item(item_id).unwrap_or(item_id);
     if let Some(tex) = block_texture_by_id(block_id) {
-        (tex.tiles, tex.rotations, tex.transparent_mode)
+        (tex.tiles, tex.rotations, tex.transparent_mode, tex.overlay)
     } else {
-        ([0; 6], [0; 6], [0; 6])
+        ([0; 6], [0; 6], [0; 6], [1.0, 1.0, 1.0, 1.0])
     }
 }
 

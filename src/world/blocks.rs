@@ -219,6 +219,7 @@ struct Registry {
     item_name_to_id: HashMap<String, i8>,
     placeable_block_to_item_id: HashMap<i8, i8>,
     block_namespace_to_id: HashMap<u32, i8>,
+    block_variant_namespace_to_id: HashMap<(u32, u32), i8>,
     item_namespace_to_id: HashMap<u32, i8>,
     max_item_tiles: u32,
 }
@@ -275,6 +276,32 @@ struct RawBlockFile {
     rotations: Option<[u32; 6]>,
     #[serde(default)]
     transparent_mode: Option<[u32; 6]>,
+    #[serde(default, alias = "overlay", alias = "tint_rgba", alias = "color_rgba")]
+    overlay_rgba: Option<[f32; 4]>,
+    #[serde(default)]
+    item_id: Option<RawIdValue>,
+    #[serde(default)]
+    item_atlas_slot_1based: Option<u32>,
+    #[serde(default)]
+    icon_texture_slot_1based: Option<u32>,
+    #[serde(default)]
+    drop_item: Option<RawIdValue>,
+    #[serde(default)]
+    drop_items: Vec<RawDropEntry>,
+    #[serde(default)]
+    drop_nothing: Option<bool>,
+    #[serde(default)]
+    variants: Vec<RawBlockVariant>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RawBlockVariant {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    aliases: Vec<String>,
+    #[serde(default, alias = "overlay", alias = "tint_rgba", alias = "color_rgba")]
+    overlay_rgba: Option<[f32; 4]>,
     #[serde(default)]
     item_id: Option<RawIdValue>,
     #[serde(default)]
@@ -432,11 +459,49 @@ fn sanitize_slot_opt_1based(slot_1based: Option<u32>, max_tiles: u32) -> Option<
     sanitize_slot_opt(slot_1based, max_tiles).map(|slot_zero_based| slot_zero_based + 1)
 }
 
+fn sanitize_overlay_rgba(raw: Option<[f32; 4]>) -> [f32; 4] {
+    let base = raw.unwrap_or([1.0, 1.0, 1.0, 1.0]);
+    let mut out = [1.0, 1.0, 1.0, 1.0];
+    for (idx, value) in base.into_iter().enumerate() {
+        out[idx] = if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+    }
+    out
+}
+
+fn sanitize_variant_tag(raw: Option<&str>, variant_index_1based: u32) -> String {
+    let source = raw.unwrap_or_default().trim();
+    if source.is_empty() {
+        return format!("v{variant_index_1based}");
+    }
+
+    let mut out = String::with_capacity(source.len());
+    for ch in source.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if (ch == '_' || ch == '-' || ch == ' ' || ch == '.') && !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        format!("v{variant_index_1based}")
+    } else {
+        out
+    }
+}
+
 fn missing_block_texture() -> BlockTexture {
     BlockTexture {
         tiles: [MISSING_TILE_INDEX; 6],
         rotations: [0; 6],
         transparent_mode: [0; 6],
+        overlay: [1.0, 1.0, 1.0, 1.0],
         light_emission: 0.0,
         render_shape: RENDER_SHAPE_CUBE,
     }
@@ -800,6 +865,14 @@ fn next_free_item_id(
     None
 }
 
+fn next_free_block_id(blocks: &[Option<BlockDef>], start: usize) -> usize {
+    let mut idx = start;
+    while idx < blocks.len() && blocks[idx].is_some() {
+        idx += 1;
+    }
+    idx
+}
+
 fn load_registry(tiles_x: u32) -> Registry {
     let max_block_tiles = atlas_tile_capacity(BLOCK_ATLAS_PATH, tiles_x.max(1));
     let max_item_tiles = atlas_tile_capacity(ITEM_ATLAS_PATH, tiles_x.max(1));
@@ -850,7 +923,14 @@ fn load_registry(tiles_x: u32) -> Registry {
         vec![None; max_block_id + 1];
     let mut used_block_item_ids = HashSet::<i8>::new();
     let mut block_namespace_to_id = HashMap::<u32, i8>::new();
+    let mut block_variant_namespace_to_id = HashMap::<(u32, u32), i8>::new();
+    let mut next_dynamic_block_id = blocks.len();
     for (raw, runtime_block_id, namespace_local) in parsed_blocks {
+        if runtime_block_id >= blocks.len() {
+            let new_len = runtime_block_id + 1;
+            blocks.resize(new_len, None);
+            pending_block_drops.resize(new_len, None);
+        }
         let Ok(item_id_default) = i8::try_from(runtime_block_id) else {
             eprintln!(
                 "skipping block {}: runtime id {} does not fit into i8",
@@ -859,6 +939,7 @@ fn load_registry(tiles_x: u32) -> Registry {
             continue;
         };
 
+        let hardness = raw.hardness.unwrap_or(1.0);
         let light_emission = raw
             .light_emission
             .filter(|v| v.is_finite())
@@ -866,10 +947,12 @@ fn load_registry(tiles_x: u32) -> Registry {
             .clamp(0.0, 64.0);
         let collidable = raw.collidable.unwrap_or(true);
         let render_shape = parse_render_shape(raw.render_shape.as_deref());
+        let base_overlay = sanitize_overlay_rgba(raw.overlay_rgba);
         let texture = BlockTexture {
             tiles: build_face_tiles(&raw, max_block_tiles),
             rotations: raw.rotations.unwrap_or([0; 6]),
             transparent_mode: raw.transparent_mode.unwrap_or([0; 6]),
+            overlay: base_overlay,
             light_emission,
             render_shape,
         };
@@ -906,15 +989,15 @@ fn load_registry(tiles_x: u32) -> Registry {
             requested_item_id
         };
         used_block_item_ids.insert(item_id);
-        let pending_drop_item = raw.drop_item;
-        let pending_drop_items = raw.drop_items;
+        let pending_drop_item = raw.drop_item.clone();
+        let pending_drop_items = raw.drop_items.clone();
         let pending_drop_nothing = raw.drop_nothing.unwrap_or(false);
 
         let block = BlockDef {
             id: runtime_block_id,
-            name: raw.register_name,
-            aliases: raw.aliases,
-            hardness: raw.hardness.unwrap_or(1.0),
+            name: raw.register_name.clone(),
+            aliases: raw.aliases.clone(),
+            hardness,
             required_tool,
             light_emission,
             collidable,
@@ -937,9 +1020,136 @@ fn load_registry(tiles_x: u32) -> Registry {
                 block_namespace_to_id.insert(local, block_id_i8);
             }
         }
-        pending_block_drops[block_id] =
-            Some((pending_drop_item, pending_drop_items, pending_drop_nothing));
+        pending_block_drops[block_id] = Some((
+            pending_drop_item.clone(),
+            pending_drop_items.clone(),
+            pending_drop_nothing,
+        ));
         blocks[block_id] = Some(block);
+
+        let default_namespace_local = (runtime_block_id as u32).saturating_add(1);
+        let base_namespace_local = namespace_local.unwrap_or(default_namespace_local);
+        let short_name = raw
+            .register_name
+            .strip_prefix("block_")
+            .unwrap_or(raw.register_name.as_str())
+            .to_ascii_lowercase();
+        for (variant_idx_zero_based, variant) in raw.variants.into_iter().enumerate() {
+            let variant_number = variant_idx_zero_based as u32 + 1;
+            let variant_block_id = next_free_block_id(&blocks, next_dynamic_block_id);
+            next_dynamic_block_id = variant_block_id.saturating_add(1);
+            if variant_block_id >= blocks.len() {
+                let new_len = variant_block_id + 1;
+                blocks.resize(new_len, None);
+                pending_block_drops.resize(new_len, None);
+            }
+            let Ok(variant_block_id_i8) = i8::try_from(variant_block_id) else {
+                eprintln!(
+                    "skipping block variant {}:{}:{} because runtime id {} exceeds i8 range",
+                    BLOCK_ID_NAMESPACE, base_namespace_local, variant_number, variant_block_id
+                );
+                continue;
+            };
+
+            let variant_tag = sanitize_variant_tag(variant.name.as_deref(), variant_number);
+            let variant_register_name = format!("{}_{}", raw.register_name, variant_tag);
+            let mut variant_aliases = variant.aliases;
+            variant_aliases.push(format!("{short_name}_{variant_tag}"));
+            for base_alias in &raw.aliases {
+                let key = base_alias.trim();
+                if !key.is_empty() {
+                    variant_aliases.push(format!("{}_{}", key, variant_tag));
+                }
+            }
+
+            let variant_requested_item_id = variant
+                .item_id
+                .as_ref()
+                .and_then(|value| {
+                    parse_item_file_id(value, &variant_register_name).map(|(id, _)| id)
+                })
+                .or_else(|| next_free_item_id(&explicit_item_ids, &used_block_item_ids));
+            let Some(variant_requested_item_id) = variant_requested_item_id else {
+                eprintln!(
+                    "skipping block variant {}:{}:{} because no free item id was available",
+                    BLOCK_ID_NAMESPACE, base_namespace_local, variant_number
+                );
+                continue;
+            };
+            let variant_item_id = if explicit_item_ids.contains(&variant_requested_item_id)
+                || used_block_item_ids.contains(&variant_requested_item_id)
+            {
+                let Some(remapped_id) = next_free_item_id(&explicit_item_ids, &used_block_item_ids)
+                else {
+                    eprintln!(
+                        "skipping block variant {}:{}:{} because no free item id was available",
+                        BLOCK_ID_NAMESPACE, base_namespace_local, variant_number
+                    );
+                    continue;
+                };
+                eprintln!(
+                    "block variant {} item_id {} conflicts with existing item id, remapped to {}",
+                    variant_register_name, variant_requested_item_id, remapped_id
+                );
+                remapped_id
+            } else {
+                variant_requested_item_id
+            };
+            used_block_item_ids.insert(variant_item_id);
+
+            let variant_overlay = sanitize_overlay_rgba(variant.overlay_rgba.or(raw.overlay_rgba));
+            let variant_texture = BlockTexture {
+                tiles: texture.tiles,
+                rotations: texture.rotations,
+                transparent_mode: texture.transparent_mode,
+                overlay: variant_overlay,
+                light_emission,
+                render_shape,
+            };
+            let variant_icon_slot = variant
+                .icon_texture_slot_1based
+                .or(raw.icon_texture_slot_1based)
+                .or(raw.texture_slot_1based)
+                .or_else(|| raw.textures_slot_1based.map(|arr| arr[2]))
+                .unwrap_or(1);
+            let variant_icon_tile_index = sanitize_slot_1based(variant_icon_slot, max_block_tiles);
+            let variant_item_atlas_slot_1based = sanitize_slot_opt_1based(
+                variant
+                    .item_atlas_slot_1based
+                    .or(raw.item_atlas_slot_1based),
+                max_item_tiles,
+            );
+            let variant_pending_drop_item = variant.drop_item.or_else(|| pending_drop_item.clone());
+            let variant_pending_drop_items = if variant.drop_items.is_empty() {
+                pending_drop_items.clone()
+            } else {
+                variant.drop_items
+            };
+            let variant_pending_drop_nothing = variant.drop_nothing.unwrap_or(pending_drop_nothing);
+
+            let variant_block = BlockDef {
+                id: variant_block_id,
+                name: variant_register_name,
+                aliases: variant_aliases,
+                hardness,
+                required_tool,
+                light_emission,
+                collidable,
+                texture: variant_texture,
+                item_id: variant_item_id,
+                item_atlas_slot_1based: variant_item_atlas_slot_1based,
+                icon_tile_index: variant_icon_tile_index,
+                drops: Vec::new(),
+            };
+            pending_block_drops[variant_block_id] = Some((
+                variant_pending_drop_item,
+                variant_pending_drop_items,
+                variant_pending_drop_nothing,
+            ));
+            blocks[variant_block_id] = Some(variant_block);
+            block_variant_namespace_to_id
+                .insert((base_namespace_local, variant_number), variant_block_id_i8);
+        }
     }
 
     if block_namespace_to_id.is_empty() {
@@ -1168,6 +1378,7 @@ fn load_registry(tiles_x: u32) -> Registry {
         item_name_to_id,
         placeable_block_to_item_id,
         block_namespace_to_id,
+        block_variant_namespace_to_id,
         item_namespace_to_id,
         max_item_tiles,
     }
@@ -1474,7 +1685,25 @@ fn parse_namespace_local(body: &str) -> Option<u32> {
     Some(local)
 }
 
+fn parse_namespace_local_variant(body: &str) -> Option<(u32, u32)> {
+    let (local_raw, variant_raw) = body.split_once(':')?;
+    let local = parse_namespace_local(local_raw)?;
+    let variant = variant_raw.trim().parse::<u32>().ok()?;
+    if variant == 0 {
+        return None;
+    }
+    Some((local, variant))
+}
+
 fn parse_block_id_namespaced(body: &str) -> Option<i8> {
+    if let Some((local, variant)) = parse_namespace_local_variant(body)
+        && let Some(block_id) = registry()
+            .block_variant_namespace_to_id
+            .get(&(local, variant))
+            .copied()
+    {
+        return Some(block_id);
+    }
     if let Some(local) = parse_namespace_local(body) {
         return registry().block_namespace_to_id.get(&local).copied();
     }
@@ -1570,4 +1799,25 @@ pub fn parse_item_id(name_or_id: &str) -> Option<i8> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_block_id, parse_item_id, placeable_item_id_for_block};
+
+    #[test]
+    fn namespaced_variant_block_and_item_lookup_work() {
+        let base = parse_block_id("1:13").expect("base glass block 1:13 should exist");
+        let red_variant = parse_block_id("1:13:1").expect("red glass variant 1:13:1 should exist");
+        let green_variant =
+            parse_block_id("1:13:2").expect("green glass variant 1:13:2 should exist");
+        assert_ne!(red_variant, base);
+        assert_ne!(green_variant, base);
+        assert_ne!(red_variant, green_variant);
+
+        let red_item = parse_item_id("1:13:1").expect("variant block id should map to item");
+        let expected_item = placeable_item_id_for_block(red_variant)
+            .expect("variant block should be placeable via generated item");
+        assert_eq!(red_item, expected_item);
+    }
 }
