@@ -517,9 +517,7 @@ fn parse_render_shape(raw: Option<&str>) -> u8 {
     };
     match shape.to_ascii_lowercase().as_str() {
         "cube" | "block" => RENDER_SHAPE_CUBE,
-        "cross" | "x" | "x_cross" | "crossed" | "crossed_quads" | "plant" => {
-            RENDER_SHAPE_CROSS
-        }
+        "cross" | "x" | "x_cross" | "crossed" | "crossed_quads" | "plant" => RENDER_SHAPE_CROSS,
         _ => {
             eprintln!("unknown render_shape `{shape}`, defaulting to cube");
             RENDER_SHAPE_CUBE
@@ -1526,7 +1524,6 @@ fn parse_item_id_plain(name_or_id: &str) -> Option<i8> {
     None
 }
 
-#[allow(dead_code)]
 pub fn parse_block_id(name_or_id: &str) -> Option<i8> {
     let raw = name_or_id.trim();
     if raw.is_empty() {

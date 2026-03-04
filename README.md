@@ -295,12 +295,14 @@ Most tuning constants live in:
 - `src/world/mesher.rs` (mesh mode behavior and AO/light work)
 
 Notable current defaults:
-- `CHUNK_SIZE = 18`
+- `CHUNK_SIZE = 16`
 - world width in normal mode: `1000 x 1000` chunks
-- base render radius: `512` (dynamic with altitude)
-- base draw radius: `192`
-- LOD near/mid radii: `16 / 32` chunks
-- mesh memory cap: `4096 MB`
+- base render radius (normal / flat-grid): `224 / 288` (dynamic with altitude)
+- base draw radius (normal / flat-grid): `80 / 96`
+- LOD near/mid radii (normal): `10 / 16` chunks
+- LOD near/mid radii (flat-grid): `10 / 16` chunks
+- adaptive draw radius floor (normal / flat-grid): `40 / 32` chunks
+- mesh memory cap (normal / flat-grid): `3072 / 2560 MB`
 
 ## Texture Atlas Workflow
 

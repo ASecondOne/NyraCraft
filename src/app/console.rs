@@ -133,15 +133,6 @@ where
     submitted
 }
 
-#[allow(dead_code)]
-pub fn execute_console_command(raw: &str, inventory: &mut InventoryState) -> String {
-    fn no_external_command(_: &str) -> Option<String> {
-        None
-    }
-    let mut no_handler = no_external_command;
-    execute_console_command_with_handler(raw, inventory, &mut no_handler)
-}
-
 fn execute_console_command_with_handler<F>(
     raw: &str,
     inventory: &mut InventoryState,

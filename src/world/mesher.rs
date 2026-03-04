@@ -72,7 +72,8 @@ where
     let size = CHUNK_SIZE;
     let half = CHUNK_SIZE / 2;
     let height_cache = build_height_cache(worldgen, origin, size, half);
-    let step = step.max(1);
+    // Clamp coarse LOD step to chunk bounds so far requests never produce empty meshes.
+    let step = step.clamp(1, size);
     let grid = (size / step).max(1);
     let est_faces = match mode {
         MeshMode::Full => (grid * grid * 12).max(1024),
@@ -96,8 +97,16 @@ where
 
     if mode == MeshMode::Full && step == 1 && edited_y_range.is_none() {
         let mut max_feature_top = i32::MIN;
-        let tree_extra = if worldgen.mode == WorldMode::Normal { 10 } else { 0 };
-        let scan_margin = if worldgen.mode == WorldMode::Normal { 3 } else { 0 };
+        let tree_extra = if worldgen.mode == WorldMode::Normal {
+            10
+        } else {
+            0
+        };
+        let scan_margin = if worldgen.mode == WorldMode::Normal {
+            3
+        } else {
+            0
+        };
         let mut z = -scan_margin;
         while z < size + scan_margin {
             let mut x = -scan_margin;
@@ -148,8 +157,8 @@ where
 
     if mode != MeshMode::Full {
         if mode == MeshMode::SurfaceOnly {
-            let cell = step.max(1);
-            let grid = size / cell;
+            let cell = step;
+            let grid = (size / cell).max(1);
             let mut cz = 0;
             while cz < grid {
                 let mut cx = 0;
@@ -214,8 +223,8 @@ where
             };
         }
 
-        let cell = step.max(1);
-        let grid = size / cell;
+        let cell = step;
+        let grid = (size / cell).max(1);
         let grid_usize = grid as usize;
         let mut cells = vec![-1_i32; grid_usize * grid_usize * grid_usize];
         let block_count = blocks.len();
@@ -1337,7 +1346,11 @@ where
     let volume = (size * size * size) as usize;
     let area = (size * size) as usize;
     let halo_span = size + 2;
-    let halo_min = IVec3::new(origin.x - half - 1, origin.y - half - 1, origin.z - half - 1);
+    let halo_min = IVec3::new(
+        origin.x - half - 1,
+        origin.y - half - 1,
+        origin.z - half - 1,
+    );
     let mut halo = vec![-1_i8; (halo_span * halo_span * halo_span) as usize];
     let mut hz = 0;
     while hz < halo_span {
@@ -2158,18 +2171,8 @@ fn emit_cross_plant<F>(
 ) where
     F: Fn(i32, i32, i32) -> i8,
 {
-    let light = compute_face_light_with_block(
-        2,
-        wx,
-        wy,
-        wz,
-        1,
-        1,
-        1,
-        use_sky_shading,
-        block_at,
-        None,
-    );
+    let light =
+        compute_face_light_with_block(2, wx, wy, wz, 1, 1, 1, use_sky_shading, block_at, None);
     let emissive = (block.light_emission / 15.0).clamp(0.0, 1.0);
     let shade = light.max(emissive);
     let color = [shade, shade, shade, 1.0];

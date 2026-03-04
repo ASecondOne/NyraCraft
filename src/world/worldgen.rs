@@ -9,6 +9,7 @@ pub const WORLD_HALF_SIZE_BLOCKS: i32 = WORLD_HALF_SIZE_CHUNKS * CHUNK_SIZE;
 const TREE_CELL_SIZE: i32 = 6;
 const TREE_CELL_MARGIN: i32 = 2;
 const TREE_CELL_SPAWN_CHANCE_PCT: u32 = 92;
+pub const TREE_MAX_LEAF_RADIUS: i32 = 3;
 const FLAT_SURFACE_Y: i32 = 3;
 const DESERT_HUMIDITY_MAX: f64 = 0.34;
 const GRAVEL_DESERT_TEMPERATURE_MAX: f64 = 0.42;
@@ -302,6 +303,42 @@ impl WorldGen {
         true
     }
 
+    #[inline]
+    fn tree_anchor_in_cell(&self, cell_x: i32, cell_z: i32) -> (i32, i32) {
+        let cell_hash = hash2(self.seed ^ 0xB529_7A4D, cell_x, cell_z);
+        let jitter_span = TREE_CELL_SIZE - TREE_CELL_MARGIN * 2;
+        let local_x = TREE_CELL_MARGIN + (cell_hash % jitter_span as u32) as i32;
+        let local_z = TREE_CELL_MARGIN + ((cell_hash >> 8) % jitter_span as u32) as i32;
+        (
+            cell_x * TREE_CELL_SIZE + local_x,
+            cell_z * TREE_CELL_SIZE + local_z,
+        )
+    }
+
+    pub fn tree_candidate_columns_near(&self, x: i32, z: i32) -> ([(i32, i32); 4], usize) {
+        let radius = TREE_MAX_LEAF_RADIUS;
+        let min_cell_x = (x - radius).div_euclid(TREE_CELL_SIZE);
+        let max_cell_x = (x + radius).div_euclid(TREE_CELL_SIZE);
+        let min_cell_z = (z - radius).div_euclid(TREE_CELL_SIZE);
+        let max_cell_z = (z + radius).div_euclid(TREE_CELL_SIZE);
+        let mut out = [(0_i32, 0_i32); 4];
+        let mut count = 0usize;
+        for cell_z in min_cell_z..=max_cell_z {
+            for cell_x in min_cell_x..=max_cell_x {
+                if count >= out.len() {
+                    debug_assert!(
+                        false,
+                        "tree candidate overflow for radius={TREE_MAX_LEAF_RADIUS}"
+                    );
+                    return (out, count);
+                }
+                out[count] = self.tree_anchor_in_cell(cell_x, cell_z);
+                count += 1;
+            }
+        }
+        (out, count)
+    }
+
     pub fn block_id_at(&self, x: i32, y: i32, z: i32, height: i32) -> i8 {
         let ids = core_block_ids();
         if !self.in_world_bounds(x, z) {
@@ -369,12 +406,7 @@ impl WorldGen {
 
         let cell_x = x.div_euclid(TREE_CELL_SIZE);
         let cell_z = z.div_euclid(TREE_CELL_SIZE);
-        let cell_hash = hash2(self.seed ^ 0xB529_7A4D, cell_x, cell_z);
-        let jitter_span = TREE_CELL_SIZE - TREE_CELL_MARGIN * 2;
-        let local_x = TREE_CELL_MARGIN + (cell_hash % jitter_span as u32) as i32;
-        let local_z = TREE_CELL_MARGIN + ((cell_hash >> 8) % jitter_span as u32) as i32;
-        let tree_x = cell_x * TREE_CELL_SIZE + local_x;
-        let tree_z = cell_z * TREE_CELL_SIZE + local_z;
+        let (tree_x, tree_z) = self.tree_anchor_in_cell(cell_x, cell_z);
         if x != tree_x || z != tree_z {
             return None;
         }
@@ -411,33 +443,32 @@ impl WorldGen {
             return -1;
         }
 
-        // Trees are local structures with max leaf radius 3, so scan nearby centers.
-        let max_leaf_r = 3;
-        for tz in (z - max_leaf_r)..=(z + max_leaf_r) {
-            for tx in (x - max_leaf_r)..=(x + max_leaf_r) {
-                let th = self.height_at(tx, tz);
-                let Some(tree) = self.tree_at(tx, tz, th) else {
-                    continue;
-                };
+        // Trees are local structures with max leaf radius 3; each 6x6 tree cell has at most one
+        // candidate center, so only 2x2 nearby cells can influence this voxel.
+        let (tree_candidates, candidate_count) = self.tree_candidate_columns_near(x, z);
+        for &(tx, tz) in tree_candidates[..candidate_count].iter() {
+            let th = self.height_at(tx, tz);
+            let Some(tree) = self.tree_at(tx, tz, th) else {
+                continue;
+            };
 
-                let trunk_end = tree.base_y + tree.trunk_h;
-                if x == tx && z == tz && y >= tree.base_y && y < trunk_end {
-                    return ids.log;
-                }
+            let trunk_end = tree.base_y + tree.trunk_h;
+            if x == tx && z == tz && y >= tree.base_y && y < trunk_end {
+                return ids.log;
+            }
 
-                let dy = y - trunk_end;
-                if dy < -tree.leaf_r || dy > tree.leaf_r {
+            let dy = y - trunk_end;
+            if dy < -tree.leaf_r || dy > tree.leaf_r {
+                continue;
+            }
+            let dx = x - tx;
+            let dz = z - tz;
+            let dist2 = dx * dx + dy * dy + dz * dz;
+            if dist2 <= tree.leaf_r * tree.leaf_r {
+                if dx == 0 && dz == 0 && y >= tree.base_y && y < trunk_end {
                     continue;
                 }
-                let dx = x - tx;
-                let dz = z - tz;
-                let dist2 = dx * dx + dy * dy + dz * dz;
-                if dist2 <= tree.leaf_r * tree.leaf_r {
-                    if dx == 0 && dz == 0 && y >= tree.base_y && y < trunk_end {
-                        continue;
-                    }
-                    return ids.leaves;
-                }
+                return ids.leaves;
             }
         }
         if y == height + 1

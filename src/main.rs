@@ -40,8 +40,8 @@ use app::streaming::{
     ApplyDebugStats, CacheMeshView, CacheWriteMsg, DebugPerfSnapshot, EditedChunkRanges,
     PackedMeshData, SharedRequestQueue, WorkerResult, apply_stream_results, block_id_full_cached,
     build_stats_lines, chunk_coord_from_pos, is_solid_cached, mesh_cache_dir, new_request_queue,
-    pick_block, pop_edit_request, pop_request, request_queue_stats, should_pack_far_lod, stream_tick,
-    try_load_cached_mesh, write_cached_mesh,
+    pick_block, pop_edit_request, pop_request, request_queue_stats, should_pack_far_lod,
+    stream_tick, try_load_cached_mesh, write_cached_mesh,
 };
 use player::crafting::reload_recipes;
 use player::inventory::{
@@ -64,7 +64,7 @@ use world::blocks::{
     block_light_emission, build_block_index, core_block_ids, default_blocks, reload_registry,
 };
 use world::mesher::generate_chunk_mesh;
-use world::worldgen::{TreeSpec, WORLD_HALF_SIZE_BLOCKS, WorldGen};
+use world::worldgen::{TreeSpec, WORLD_HALF_SIZE_BLOCKS, WorldGen, WorldMode};
 
 type CoordKey = (i32, i32, i32);
 type DirtyChunks = Arc<Mutex<HashMap<CoordKey, i64>>>;
@@ -86,7 +86,7 @@ fn ema_ms(previous: f32, sample_ms: f32) -> f32 {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct LodLogSummary {
     full: usize,
     sides: usize,
@@ -97,22 +97,6 @@ struct LodLogSummary {
     step_2_4: usize,
     step_5_16: usize,
     step_17p: usize,
-}
-
-impl Default for LodLogSummary {
-    fn default() -> Self {
-        Self {
-            full: 0,
-            sides: 0,
-            surface: 0,
-            step_min: 0,
-            step_max: 0,
-            step_1: 0,
-            step_2_4: 0,
-            step_5_16: 0,
-            step_17p: 0,
-        }
-    }
 }
 
 fn summarize_lod_map(map: &HashMap<(i32, i32, i32), i32>) -> LodLogSummary {
@@ -147,6 +131,147 @@ fn summarize_lod_map(map: &HashMap<(i32, i32, i32), i32>) -> LodLogSummary {
         out.step_min = 0;
     }
     out
+}
+
+const RUNTIME_PHASE_LABELS: [&str; 9] = [
+    "render", "stream", "apply", "player", "drops", "leaf", "vis", "mining", "other",
+];
+
+#[derive(Clone, Debug)]
+struct RuntimeLogSummary {
+    sample_count: u64,
+    bottleneck_counts: [u64; 9],
+    peak_phase_ms: [f32; 9],
+    peak_tick_ms: f32,
+    peak_bottleneck_ms: f32,
+    peak_bottleneck_pct: f32,
+    peak_bottleneck_idx: usize,
+    peak_loaded_chunks: usize,
+    peak_requested_chunks: usize,
+    peak_dirty_chunks: usize,
+    peak_req_near: usize,
+    peak_req_far: usize,
+    peak_req_inflight: usize,
+    peak_gpu_visible_indices: u64,
+    peak_gpu_visible_draw_calls: u64,
+    peak_gpu_visible_supers: usize,
+    peak_gpu_dirty_supers: usize,
+    peak_gpu_pending_updates: usize,
+    peak_gpu_pending_queue: usize,
+    min_fps: u32,
+    min_tps: u32,
+}
+
+impl Default for RuntimeLogSummary {
+    fn default() -> Self {
+        Self {
+            sample_count: 0,
+            bottleneck_counts: [0; 9],
+            peak_phase_ms: [0.0; 9],
+            peak_tick_ms: 0.0,
+            peak_bottleneck_ms: 0.0,
+            peak_bottleneck_pct: 0.0,
+            peak_bottleneck_idx: 0,
+            peak_loaded_chunks: 0,
+            peak_requested_chunks: 0,
+            peak_dirty_chunks: 0,
+            peak_req_near: 0,
+            peak_req_far: 0,
+            peak_req_inflight: 0,
+            peak_gpu_visible_indices: 0,
+            peak_gpu_visible_draw_calls: 0,
+            peak_gpu_visible_supers: 0,
+            peak_gpu_dirty_supers: 0,
+            peak_gpu_pending_updates: 0,
+            peak_gpu_pending_queue: 0,
+            min_fps: u32::MAX,
+            min_tps: u32::MAX,
+        }
+    }
+}
+
+impl RuntimeLogSummary {
+    #[allow(clippy::too_many_arguments)]
+    fn record_sample(
+        &mut self,
+        fps: u32,
+        tps: u32,
+        tick_ms: f32,
+        phase_ms: [f32; 9],
+        bottleneck_idx: usize,
+        bottleneck_ms: f32,
+        bottleneck_pct: f32,
+        loaded_chunks: usize,
+        requested_chunks: usize,
+        dirty_chunks: usize,
+        req_near: usize,
+        req_far: usize,
+        req_inflight: usize,
+        gpu_visible_supers: usize,
+        gpu_visible_draw_calls: u64,
+        gpu_visible_indices: u64,
+        gpu_dirty_supers: usize,
+        gpu_pending_updates: usize,
+        gpu_pending_queue: usize,
+    ) {
+        self.sample_count = self.sample_count.saturating_add(1);
+        if bottleneck_idx < self.bottleneck_counts.len() {
+            self.bottleneck_counts[bottleneck_idx] =
+                self.bottleneck_counts[bottleneck_idx].saturating_add(1);
+        }
+        for (idx, ms) in phase_ms.into_iter().enumerate() {
+            self.peak_phase_ms[idx] = self.peak_phase_ms[idx].max(ms);
+        }
+        self.peak_tick_ms = self.peak_tick_ms.max(tick_ms);
+        if bottleneck_ms >= self.peak_bottleneck_ms {
+            self.peak_bottleneck_ms = bottleneck_ms;
+            self.peak_bottleneck_pct = bottleneck_pct.max(0.0);
+            self.peak_bottleneck_idx = bottleneck_idx.min(RUNTIME_PHASE_LABELS.len() - 1);
+        }
+        self.peak_loaded_chunks = self.peak_loaded_chunks.max(loaded_chunks);
+        self.peak_requested_chunks = self.peak_requested_chunks.max(requested_chunks);
+        self.peak_dirty_chunks = self.peak_dirty_chunks.max(dirty_chunks);
+        self.peak_req_near = self.peak_req_near.max(req_near);
+        self.peak_req_far = self.peak_req_far.max(req_far);
+        self.peak_req_inflight = self.peak_req_inflight.max(req_inflight);
+        self.peak_gpu_visible_indices = self.peak_gpu_visible_indices.max(gpu_visible_indices);
+        self.peak_gpu_visible_draw_calls =
+            self.peak_gpu_visible_draw_calls.max(gpu_visible_draw_calls);
+        self.peak_gpu_visible_supers = self.peak_gpu_visible_supers.max(gpu_visible_supers);
+        self.peak_gpu_dirty_supers = self.peak_gpu_dirty_supers.max(gpu_dirty_supers);
+        self.peak_gpu_pending_updates = self.peak_gpu_pending_updates.max(gpu_pending_updates);
+        self.peak_gpu_pending_queue = self.peak_gpu_pending_queue.max(gpu_pending_queue);
+        self.min_fps = self.min_fps.min(fps);
+        self.min_tps = self.min_tps.min(tps);
+    }
+
+    fn dominant_bottleneck_idx(&self) -> usize {
+        let mut best_idx = 0usize;
+        let mut best_count = 0u64;
+        for (idx, count) in self.bottleneck_counts.iter().copied().enumerate() {
+            if count > best_count {
+                best_count = count;
+                best_idx = idx;
+            }
+        }
+        best_idx
+    }
+
+    fn min_fps_value(&self) -> u32 {
+        if self.sample_count == 0 {
+            0
+        } else {
+            self.min_fps
+        }
+    }
+
+    fn min_tps_value(&self) -> u32 {
+        if self.sample_count == 0 {
+            0
+        } else {
+            self.min_tps
+        }
+    }
 }
 
 fn collect_world_emissive_lights(
@@ -533,7 +658,7 @@ fn persist_runtime_state(
     inventory_snapshot: &InventorySnapshot,
     edited_entries: Option<&[EditedBlockEntry]>,
 ) -> std::io::Result<usize> {
-    save_io.save_player(&player_state)?;
+    save_io.save_player(player_state)?;
     save_io.save_inventory(inventory_snapshot)?;
     if let Some(edits) = edited_entries {
         let count = edits.len();
@@ -819,6 +944,7 @@ fn main() {
     let mut stats_overlay_lines: Vec<String> = Vec::new();
     let mut chat_visible_until = Instant::now();
     let mut last_runtime_log = Instant::now();
+    let mut runtime_log_summary = RuntimeLogSummary::default();
     let mut last_autosave = Instant::now();
     let mut last_emissive_scan = Instant::now() - EMISSIVE_SCAN_INTERVAL;
     let mut last_emissive_scan_pos = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
@@ -922,7 +1048,11 @@ fn main() {
             .spawn(move || {
                 let _ = tx_thread_report_worker.send(format!(
                     "worker-{worker_idx}(mesh/gen/cache-read{}): tid={:?}",
-                    if edit_only_worker { ",edit-priority" } else { "" },
+                    if edit_only_worker {
+                        ",edit-priority"
+                    } else {
+                        ""
+                    },
                     thread::current().id()
                 ));
                 while let Some(task) = if edit_only_worker {
@@ -1068,20 +1198,34 @@ fn main() {
             });
     }
 
-    let base_render_radius = 288;
-    let max_render_radius = 576;
-    let base_draw_radius = 96;
-    let lod_near_radius = 8;
-    let lod_mid_radius = 16;
-    let request_budget = 48;
-    let max_inflight = 320usize;
-    let surface_depth_chunks = 3;
-    let initial_burst_radius = 2;
-    let loaded_chunk_cap = 32000usize; // trim residency so render doesn't drown in far chunks
-    let mesh_memory_cap_mb = 2560usize; // 2.5 GB cap
+    let (
+        base_render_radius,
+        max_render_radius,
+        base_draw_radius,
+        lod_near_radius,
+        lod_mid_radius,
+        request_budget,
+        max_inflight,
+        surface_depth_chunks,
+        initial_burst_radius,
+        loaded_chunk_cap,
+        mesh_memory_cap_mb,
+    ) = match world_gen.mode {
+        // Terrain defaults are tighter than flat/grid, but still keep enough headroom for running.
+        WorldMode::Normal => (
+            224, 448, 80, 10, 16, 52, 288usize, 4, 2, 18000usize, 3072usize,
+        ),
+        WorldMode::Flat | WorldMode::Grid => (
+            288, 576, 96, 10, 16, 48, 320usize, 3, 2, 32000usize, 2560usize,
+        ),
+    };
+    let min_draw_radius_cap = match world_gen.mode {
+        WorldMode::Normal => 40,
+        WorldMode::Flat | WorldMode::Grid => 32,
+    };
     let mut current_chunk = chunk_coord_from_pos(player.position);
     let pregen_center_chunk = current_chunk;
-    let requested_pregen_span_chunks = 1000;
+    let requested_pregen_span_chunks = 129;
     let pregen_radius_chunks = (requested_pregen_span_chunks / 2).clamp(8, 64);
     if pregen_radius_chunks * 2 + 1 < requested_pregen_span_chunks {
         eprintln!(
@@ -1544,7 +1688,9 @@ fn main() {
                     tps_last = Instant::now();
 
                     let stats_now = gpu.stats();
-                    let render_heavy = perf.render_cpu_ms > 9.5 || stats_now.visible_indices > 2_400_000;
+                    let render_heavy = (stats_now.visible_indices > 1_700_000
+                        && (fps_value < 60 || perf.render_cpu_ms > 15.0))
+                        || (perf.render_cpu_ms > 22.0 && fps_value < 58);
                     if render_heavy {
                         adaptive_request_budget = (adaptive_request_budget * 84 / 100).max(24);
                         adaptive_pregen_budget = (adaptive_pregen_budget * 78 / 100).max(8);
@@ -1552,7 +1698,8 @@ fn main() {
                             adaptive_max_apply_per_tick.saturating_sub(1).max(6);
                         adaptive_max_rebuilds_per_tick =
                             adaptive_max_rebuilds_per_tick.saturating_sub(1).max(1);
-                        adaptive_draw_radius_cap = (adaptive_draw_radius_cap - 10).max(20);
+                        adaptive_draw_radius_cap =
+                            (adaptive_draw_radius_cap - 10).max(min_draw_radius_cap);
                     } else if tps_value < 14 || fps_value < 30 {
                         adaptive_request_budget = (adaptive_request_budget * 76 / 100).max(28);
                         adaptive_pregen_budget = (adaptive_pregen_budget * 70 / 100).max(8);
@@ -1560,7 +1707,8 @@ fn main() {
                             adaptive_max_apply_per_tick.saturating_sub(3).max(6);
                         adaptive_max_rebuilds_per_tick =
                             adaptive_max_rebuilds_per_tick.saturating_sub(1).max(1);
-                        adaptive_draw_radius_cap = (adaptive_draw_radius_cap - 12).max(22);
+                        adaptive_draw_radius_cap =
+                            (adaptive_draw_radius_cap - 12).max(min_draw_radius_cap);
                     } else if tps_value < 18 || fps_value < 45 {
                         adaptive_request_budget = (adaptive_request_budget * 86 / 100).max(32);
                         adaptive_pregen_budget = (adaptive_pregen_budget * 75 / 100).max(8);
@@ -1568,8 +1716,12 @@ fn main() {
                             adaptive_max_apply_per_tick.saturating_sub(2).max(7);
                         adaptive_max_rebuilds_per_tick =
                             adaptive_max_rebuilds_per_tick.saturating_sub(1).max(1);
-                        adaptive_draw_radius_cap = (adaptive_draw_radius_cap - 8).max(24);
-                    } else if tps_value >= 20 && fps_value > 72 {
+                        adaptive_draw_radius_cap =
+                            (adaptive_draw_radius_cap - 8).max(min_draw_radius_cap);
+                    } else if tps_value >= 20
+                        && fps_value >= 58
+                        && stats_now.visible_indices < 1_250_000
+                    {
                         adaptive_request_budget = (adaptive_request_budget + 6).min(request_budget);
                         adaptive_pregen_budget =
                             (adaptive_pregen_budget + 4).min(pregen_budget_per_tick);
@@ -1641,42 +1793,45 @@ fn main() {
                     let loaded_lod = summarize_lod_map(&loaded);
                     let requested_lod = summarize_lod_map(&requested);
                     let tick_ms = perf.tick_cpu_ms.max(0.0001);
-                    let mut bottleneck_label = "render";
-                    let mut bottleneck_ms = perf.render_cpu_ms;
-                    for (label, ms) in [
-                        ("stream", perf.stream_ms),
-                        ("apply", perf.apply_ms),
-                        ("player", perf.player_ms),
-                        ("drops", perf.dropped_ms),
-                        ("leaf", perf.leaf_decay_ms),
-                        ("vis", perf.visibility_ms),
-                        ("mining", perf.mining_ms),
-                        ("other", perf.untracked_ms),
-                    ] {
+                    let phase_ms = [
+                        perf.render_cpu_ms,
+                        perf.stream_ms,
+                        perf.apply_ms,
+                        perf.player_ms,
+                        perf.dropped_ms,
+                        perf.leaf_decay_ms,
+                        perf.visibility_ms,
+                        perf.mining_ms,
+                        perf.untracked_ms,
+                    ];
+                    let mut bottleneck_idx = 0usize;
+                    let mut bottleneck_ms = phase_ms[0];
+                    for (idx, ms) in phase_ms.iter().copied().enumerate().skip(1) {
                         if ms > bottleneck_ms {
-                            bottleneck_label = label;
+                            bottleneck_idx = idx;
                             bottleneck_ms = ms;
                         }
                     }
-                    let render_pct = (perf.render_cpu_ms / tick_ms * 100.0).max(0.0);
-                    let stream_pct = (perf.stream_ms / tick_ms * 100.0).max(0.0);
-                    let apply_pct = (perf.apply_ms / tick_ms * 100.0).max(0.0);
-                    let player_pct = (perf.player_ms / tick_ms * 100.0).max(0.0);
-                    let dropped_pct = (perf.dropped_ms / tick_ms * 100.0).max(0.0);
-                    let leaf_pct = (perf.leaf_decay_ms / tick_ms * 100.0).max(0.0);
-                    let visibility_pct = (perf.visibility_ms / tick_ms * 100.0).max(0.0);
-                    let mining_pct = (perf.mining_ms / tick_ms * 100.0).max(0.0);
-                    let other_pct = (perf.untracked_ms / tick_ms * 100.0).max(0.0);
+                    let bottleneck_label = RUNTIME_PHASE_LABELS[bottleneck_idx];
+                    let render_pct = (phase_ms[0] / tick_ms * 100.0).max(0.0);
+                    let stream_pct = (phase_ms[1] / tick_ms * 100.0).max(0.0);
+                    let apply_pct = (phase_ms[2] / tick_ms * 100.0).max(0.0);
+                    let player_pct = (phase_ms[3] / tick_ms * 100.0).max(0.0);
+                    let dropped_pct = (phase_ms[4] / tick_ms * 100.0).max(0.0);
+                    let leaf_pct = (phase_ms[5] / tick_ms * 100.0).max(0.0);
+                    let visibility_pct = (phase_ms[6] / tick_ms * 100.0).max(0.0);
+                    let mining_pct = (phase_ms[7] / tick_ms * 100.0).max(0.0);
+                    let other_pct = (phase_ms[8] / tick_ms * 100.0).max(0.0);
                     let bottleneck_pct = (bottleneck_ms / tick_ms * 100.0).max(0.0);
-                    let render_ms = perf.render_cpu_ms;
-                    let stream_ms = perf.stream_ms;
-                    let apply_ms = perf.apply_ms;
-                    let player_ms = perf.player_ms;
-                    let dropped_ms = perf.dropped_ms;
-                    let leaf_ms = perf.leaf_decay_ms;
-                    let visibility_ms = perf.visibility_ms;
-                    let mining_ms = perf.mining_ms;
-                    let other_ms = perf.untracked_ms;
+                    let render_ms = phase_ms[0];
+                    let stream_ms = phase_ms[1];
+                    let apply_ms = phase_ms[2];
+                    let player_ms = phase_ms[3];
+                    let dropped_ms = phase_ms[4];
+                    let leaf_ms = phase_ms[5];
+                    let visibility_ms = phase_ms[6];
+                    let mining_ms = phase_ms[7];
+                    let other_ms = phase_ms[8];
                     log_info(format!(
                         "runtime-bottleneck: fps={fps_value} tps={tps_value} bottleneck={bottleneck_label}({bottleneck_ms:.2}ms,{bottleneck_pct:.0}%tick) tick_ms={tick_ms:.2} phases_ms[r/s/a/p/d/l/v/m/o]={render_ms:.2}/{stream_ms:.2}/{apply_ms:.2}/{player_ms:.2}/{dropped_ms:.2}/{leaf_ms:.2}/{visibility_ms:.2}/{mining_ms:.2}/{other_ms:.2} phases_pct[r/s/a/p/d/l/v/m/o]={render_pct:.0}/{stream_pct:.0}/{apply_pct:.0}/{player_pct:.0}/{dropped_pct:.0}/{leaf_pct:.0}/{visibility_pct:.0}/{mining_pct:.0}/{other_pct:.0} chunks[loaded/requested/dirty]={loaded_len}/{requested_len}/{dirty_pending_debug} req[edit/near/far/inflight]={req_edit}/{req_near}/{req_far}/{req_inflight} stream_cursor[r/i]={stream_ring_r}/{stream_ring_i} deferred={deferred_len} lod_loaded[f/s/o]={lod_loaded_full}/{lod_loaded_sides}/{lod_loaded_surface} lod_req[f/s/o]={lod_req_full}/{lod_req_sides}/{lod_req_surface} lod_step_loaded[min/max/1/2_4/5_16/17p]={lod_loaded_step_min}/{lod_loaded_step_max}/{lod_loaded_step_1}/{lod_loaded_step_2_4}/{lod_loaded_step_5_16}/{lod_loaded_step_17p} lod_step_req[min/max/1/2_4/5_16/17p]={lod_req_step_min}/{lod_req_step_max}/{lod_req_step_1}/{lod_req_step_2_4}/{lod_req_step_5_16}/{lod_req_step_17p} apply_dbg[ok/raw/packed/skip_epoch/skip_rev/defer_push/defer_pop/fast_scan/fast_ok/rebuild]={apply_ok}/{apply_raw}/{apply_packed}/{apply_skip_epoch}/{apply_skip_rev}/{apply_defer_push}/{apply_defer_pop}/{apply_fast_scan}/{apply_fast_ok}/{apply_rebuild_budget} leaf_q[check/break/check_p/break_p/tick]={leaf_check}/{leaf_break}/{leaf_check_pending}/{leaf_break_pending}/{leaf_tick} gpu[vis_supers={gpu_vis_supers}/{gpu_total_supers} vis_draw={gpu_vis_draw}/{gpu_total_draw} vis_idx={gpu_vis_idx} raw_idx={gpu_vis_raw_idx} packed_idx={gpu_vis_packed_idx} dirty_supers={gpu_dirty_supers} pending_upd={gpu_pending_updates} pending_q={gpu_pending_queue}] budgets[req/pregen/apply/rebuild/apply_now/rebuild_now/draw_cap]={adaptive_request_budget}/{adaptive_pregen_budget}/{adaptive_max_apply_per_tick}/{adaptive_max_rebuilds_per_tick}/{apply_budget_debug}/{rebuild_budget_debug}/{adaptive_draw_radius_cap} flags[pause_stream/pause_render/pregen]={pause_stream}/{pause_render}/{pregen_active}",
                         loaded_len = loaded.len(),
@@ -1732,6 +1887,27 @@ fn main() {
                         apply_fast_ok = apply_debug_tick.fast_lane_applied,
                         apply_rebuild_budget = apply_debug_tick.rebuild_budget,
                     ));
+                    runtime_log_summary.record_sample(
+                        fps_value,
+                        tps_value,
+                        tick_ms,
+                        phase_ms,
+                        bottleneck_idx,
+                        bottleneck_ms,
+                        bottleneck_pct,
+                        loaded.len(),
+                        requested.len(),
+                        dirty_pending_debug,
+                        req_stats.near,
+                        req_stats.far,
+                        req_stats.inflight_chunks,
+                        gpu_stats.visible_supers,
+                        gpu_stats.visible_draw_calls_est,
+                        gpu_stats.visible_indices,
+                        gpu_stats.dirty_supers,
+                        gpu_stats.pending_updates,
+                        gpu_stats.pending_queue,
+                    );
                     last_runtime_log = Instant::now();
                 }
 
@@ -2643,6 +2819,52 @@ fn main() {
                 Err(err) => {
                     log_warn(format!("save: final flush failed: {err}"));
                 }
+            }
+            if runtime_log_summary.sample_count > 0 {
+                let dominant_idx = runtime_log_summary.dominant_bottleneck_idx();
+                let dominant_samples = runtime_log_summary.bottleneck_counts[dominant_idx];
+                let dominant_pct = (dominant_samples as f32 / runtime_log_summary.sample_count as f32)
+                    * 100.0;
+                let peak_phase = runtime_log_summary.peak_phase_ms;
+                log_info(format!(
+                    "runtime-summary: samples={} uptime_s={:.1} bottleneck[dominant/worst]={}({:.0}%)/{}({:.2}ms,{:.0}%tick) cpu_spike_tick_ms={:.2} fps[min]={} tps[min]={} phase_peaks_ms[r/s/a/p/d/l/v/m/o]={:.2}/{:.2}/{:.2}/{:.2}/{:.2}/{:.2}/{:.2}/{:.2}/{:.2}",
+                    runtime_log_summary.sample_count,
+                    start_time.elapsed().as_secs_f32(),
+                    RUNTIME_PHASE_LABELS[dominant_idx],
+                    dominant_pct,
+                    RUNTIME_PHASE_LABELS[runtime_log_summary.peak_bottleneck_idx],
+                    runtime_log_summary.peak_bottleneck_ms,
+                    runtime_log_summary.peak_bottleneck_pct,
+                    runtime_log_summary.peak_tick_ms,
+                    runtime_log_summary.min_fps_value(),
+                    runtime_log_summary.min_tps_value(),
+                    peak_phase[0],
+                    peak_phase[1],
+                    peak_phase[2],
+                    peak_phase[3],
+                    peak_phase[4],
+                    peak_phase[5],
+                    peak_phase[6],
+                    peak_phase[7],
+                    peak_phase[8],
+                ));
+                log_info(format!(
+                    "runtime-summary-peaks: chunks[loaded/requested/dirty]={}/{}/{} req[near/far/inflight]={}/{}/{} gpu[vis_idx/vis_draw/vis_supers/dirty_supers/pending_upd/pending_q]={}/{}/{}/{}/{}/{}",
+                    runtime_log_summary.peak_loaded_chunks,
+                    runtime_log_summary.peak_requested_chunks,
+                    runtime_log_summary.peak_dirty_chunks,
+                    runtime_log_summary.peak_req_near,
+                    runtime_log_summary.peak_req_far,
+                    runtime_log_summary.peak_req_inflight,
+                    runtime_log_summary.peak_gpu_visible_indices,
+                    runtime_log_summary.peak_gpu_visible_draw_calls,
+                    runtime_log_summary.peak_gpu_visible_supers,
+                    runtime_log_summary.peak_gpu_dirty_supers,
+                    runtime_log_summary.peak_gpu_pending_updates,
+                    runtime_log_summary.peak_gpu_pending_queue,
+                ));
+            } else {
+                log_info("runtime-summary: no runtime-bottleneck samples captured");
             }
             let _ = tx_save_msg.send(SaveWorkerMsg::Shutdown);
         }

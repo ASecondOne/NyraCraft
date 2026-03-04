@@ -14,9 +14,8 @@ use crate::render::texture::{
 };
 use crate::world::blocks::{
     DESTROY_STAGE_COUNT, DESTROY_STAGE_TILE_START, block_count, block_light_emission,
-    block_texture_by_id,
-    core_block_ids, core_item_ids, item_icon_tile_index, item_max_durability, item_name_by_id,
-    parse_block_id, placeable_block_id_for_item,
+    block_texture_by_id, core_block_ids, core_item_ids, item_icon_tile_index, item_max_durability,
+    item_name_by_id, parse_block_id, placeable_block_id_for_item,
 };
 use bytemuck::{Pod, Zeroable};
 use font8x8::{BASIC_FONTS, UnicodeFonts};
@@ -1331,8 +1330,7 @@ impl Gpu {
                 .copied()
                 .flatten()
                 .and_then(|stack| (stack.count > 0).then_some(stack.block_id));
-            let held_light_origin =
-                player_position + Vec3::new(0.0, player_height * 0.86, 0.0);
+            let held_light_origin = player_position + Vec3::new(0.0, player_height * 0.86, 0.0);
             let culled_lights = build_culled_point_lights(
                 camera,
                 held_light_origin,
@@ -1521,7 +1519,8 @@ impl Gpu {
                 if draw_player_model {
                     let forward = player_forward.normalize_or_zero();
                     let pose_changed = gpu.player_mesh.index_count == 0
-                        || (player_position - gpu.player_mesh_last_position).length_squared() > 0.0009
+                        || (player_position - gpu.player_mesh_last_position).length_squared()
+                            > 0.0009
                         || forward.dot(gpu.player_mesh_last_forward) < 0.9993
                         || (player_height - gpu.player_mesh_last_height).abs() > 0.01
                         || draw_player_head != gpu.player_mesh_last_include_head;
@@ -1913,12 +1912,20 @@ impl Gpu {
     pub fn update_visible(&mut self, camera: &Camera, draw_radius: i32) {
         self.cell.with_dependent_mut(|_, gpu| {
             const MAX_VISIBLE_SUPERS: usize = 2400;
-            const MAX_VISIBLE_INDICES_BUDGET: u64 = 2_400_000;
-            const MIN_VISIBLE_SUPERS: usize = 8;
-            let draw_radius = draw_radius as f32 * crate::world::CHUNK_SIZE as f32;
+            const MAX_VISIBLE_INDICES_BUDGET: u64 = 14_000_000;
+            const MIN_VISIBLE_INDICES_BUDGET: u64 = 4_500_000;
+            const BASE_DRAW_RADIUS_CHUNKS: f32 = 72.0;
+            const MIN_VISIBLE_SUPERS: usize = 24;
+            let draw_radius_chunks = draw_radius.max(16) as f32;
+            let draw_radius = draw_radius_chunks * crate::world::CHUNK_SIZE as f32;
             let draw_radius_sq = draw_radius * draw_radius;
             let horizon_cutoff = draw_radius * 0.35;
             let horizon_cutoff_sq = horizon_cutoff * horizon_cutoff;
+            let budget_scale = (draw_radius_chunks / BASE_DRAW_RADIUS_CHUNKS).clamp(0.70, 1.25);
+            let visible_indices_budget =
+                ((MAX_VISIBLE_INDICES_BUDGET as f32) * budget_scale.powf(0.85)).round() as u64;
+            let visible_indices_budget = visible_indices_budget
+                .clamp(MIN_VISIBLE_INDICES_BUDGET, MAX_VISIBLE_INDICES_BUDGET);
             let camera_forward = if camera.forward.length_squared() > 1.0e-8 {
                 camera.forward.normalize()
             } else {
@@ -1969,7 +1976,7 @@ impl Gpu {
                         .map(|chunk| chunk.raw_index_count as u64 + chunk.packed_index_count as u64)
                         .unwrap_or(0);
                     if kept < MIN_VISIBLE_SUPERS
-                        || visible_index_sum.saturating_add(indices) <= MAX_VISIBLE_INDICES_BUDGET
+                        || visible_index_sum.saturating_add(indices) <= visible_indices_budget
                     {
                         visible_index_sum = visible_index_sum.saturating_add(indices);
                         kept += 1;
@@ -1992,9 +1999,7 @@ fn build_mvp(width: u32, height: u32, camera: &Camera, draw_radius_chunks: i32) 
     } else {
         0.08
     };
-    let far = (draw_radius_world + crate::world::CHUNK_SIZE as f32 * 8.0)
-        .max(1200.0)
-        .min(3600.0);
+    let far = (draw_radius_world + crate::world::CHUNK_SIZE as f32 * 8.0).clamp(1200.0, 3600.0);
     let proj = Mat4::perspective_rh_gl(45f32.to_radians(), aspect, near, far);
     let view = camera.view_matrix();
     let model = Mat4::IDENTITY;
@@ -2517,21 +2522,15 @@ fn emit_player_box<F>(
     emit_player_face_uv(
         vertices, indices, 0, p100, p110, p111, p101, uv_right, color,
     );
-    emit_player_face_uv(
-        vertices, indices, 1, p001, p011, p010, p000, uv_left, color,
-    );
-    emit_player_face_uv(
-        vertices, indices, 2, p010, p011, p111, p110, uv_top, color,
-    );
+    emit_player_face_uv(vertices, indices, 1, p001, p011, p010, p000, uv_left, color);
+    emit_player_face_uv(vertices, indices, 2, p010, p011, p111, p110, uv_top, color);
     emit_player_face_uv(
         vertices, indices, 3, p001, p000, p100, p101, uv_bottom, color,
     );
     emit_player_face_uv(
         vertices, indices, 4, p001, p101, p111, p011, uv_front, color,
     );
-    emit_player_face_uv(
-        vertices, indices, 5, p100, p000, p010, p110, uv_back, color,
-    );
+    emit_player_face_uv(vertices, indices, 5, p100, p000, p010, p110, uv_back, color);
 }
 
 fn build_player_mesh(
@@ -3033,7 +3032,8 @@ fn build_inventory_ui_vertices(
         let text = clipped_text(&item_name, max_chars);
         let text_w = text_width_pixel(&text, pixel);
         let text_x = (width_f - text_w) * 0.5;
-        let text_y = (layout.hotbar_y - text_line_height(pixel) - text_render_pixel(pixel)).max(4.0);
+        let text_y =
+            (layout.hotbar_y - text_line_height(pixel) - text_render_pixel(pixel)).max(4.0);
         push_text_pixel_shadow(
             &mut vertices,
             width_f,
@@ -3416,7 +3416,8 @@ fn push_keybind_overlay(
     let pixel = (width_f.min(height_f) * 0.0030).clamp(1.4, 2.4);
     let line_h = text_line_height(pixel);
     let panel_w = (width_f * 0.76).clamp(360.0, 1040.0);
-    let panel_h = (lines.len() as f32 * line_h + text_line_height(pixel)).clamp(120.0, height_f * 0.88);
+    let panel_h =
+        (lines.len() as f32 * line_h + text_line_height(pixel)).clamp(120.0, height_f * 0.88);
     let panel_x = (width_f - panel_w) * 0.5;
     let panel_y = (height_f - panel_h) * 0.16;
     let pad = (pixel * 2.5).clamp(4.0, 9.0);

@@ -217,12 +217,7 @@ pub fn restore_loaded_edit_metadata(
     {
         let mut dirty = dirty_chunks.lock().unwrap();
         for key in ranges.keys() {
-            let next_rev = dirty
-                .get(key)
-                .copied()
-                .unwrap_or(0)
-                .abs()
-                .saturating_add(1);
+            let next_rev = dirty.get(key).copied().unwrap_or(0).abs().saturating_add(1);
             dirty.insert(*key, next_rev);
         }
     }
@@ -434,7 +429,7 @@ pub fn tick_leaf_decay(
 ) -> Option<IVec3> {
     let core_ids = core_block_ids();
     match pop_leaf_decay_action(leaf_decay_queue) {
-        LeafDecayAction::None => return None,
+        LeafDecayAction::None => None,
         LeafDecayAction::Check(candidate) => {
             if block_id_with_edits(
                 world_gen,

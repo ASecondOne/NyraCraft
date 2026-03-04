@@ -5,8 +5,8 @@ use std::io;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use crate::player::inventory::InventorySnapshot;
 use crate::player::EditedBlockEntry;
+use crate::player::inventory::InventorySnapshot;
 use crate::world::worldgen::WorldGen;
 
 const SAVE_ROOT_DIR: &str = "save";
