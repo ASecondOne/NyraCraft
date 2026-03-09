@@ -1867,6 +1867,8 @@ pub fn stream_tick(
     let near_cap = near_inflight_cap(max_inflight);
     let near_full_cap = (near_cap.saturating_mul(3) / 4).max(1);
     let far_cap = far_inflight_cap(max_inflight).max(1);
+    let mut near_inflight_used = count_near_requested(requested);
+    let mut far_inflight_used = requested.len().saturating_sub(near_inflight_used);
 
     if *pregen_active {
         // Keep headroom for near-player requests so far pregen cannot starve them.
@@ -1877,9 +1879,7 @@ pub fn stream_tick(
             && *pregen_ring_r <= pregen_radius_chunks
             && stream_start.elapsed() < STREAM_REQUEST_TIME_BUDGET
         {
-            let near_inflight_now = count_near_requested(requested);
-            let far_inflight_now = requested.len().saturating_sub(near_inflight_now);
-            if far_inflight_now >= pregen_inflight_cap {
+            if far_inflight_used >= pregen_inflight_cap {
                 break;
             }
 
@@ -1903,9 +1903,7 @@ pub fn stream_tick(
             let y_end = surface_chunk_y + 1;
 
             for_each_chunk_y_top_down(y_start, y_end, |cy| {
-                let near_inflight_now = count_near_requested(requested);
-                let far_inflight_now = requested.len().saturating_sub(near_inflight_now);
-                if budget <= 0 || far_inflight_now >= pregen_inflight_cap {
+                if budget <= 0 || far_inflight_used >= pregen_inflight_cap {
                     return false;
                 }
                 let coord = (cx, cy, cz);
@@ -1914,7 +1912,7 @@ pub fn stream_tick(
                 let lod = pregen_lod;
                 if needs_chunk_request(requested, loaded, coord, lod) {
                     let was_requested = requested.contains_key(&coord);
-                    let _ = submit_chunk_request(
+                    let near_delta = submit_chunk_request(
                         req_queue,
                         requested,
                         player_pos,
@@ -1924,6 +1922,8 @@ pub fn stream_tick(
                         mode,
                         RequestClass::Far,
                     );
+                    near_inflight_used = (near_inflight_used as i32 + near_delta).max(0) as usize;
+                    far_inflight_used = requested.len().saturating_sub(near_inflight_used);
                     if !was_requested {
                         *pregen_chunks_requested += 1;
                     }
@@ -1937,9 +1937,6 @@ pub fn stream_tick(
             *pregen_active = false;
         }
     }
-
-    let mut near_inflight_used = count_near_requested(requested);
-    let mut far_inflight_used = requested.len().saturating_sub(near_inflight_used);
     if near_inflight_used >= near_cap && far_inflight_used >= far_cap {
         return;
     }

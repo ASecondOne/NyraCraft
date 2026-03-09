@@ -30,8 +30,9 @@ use app::controls::{
     try_enable_mouse_look,
 };
 use app::dropped_items::{
-    DroppedItem, build_dropped_item_render_data, nudge_items_from_placed_block, spawn_block_drop,
-    spawn_block_drop_with_item, throw_hotbar_item, update_dropped_items,
+    DroppedItem, build_dropped_item_render_data, nudge_items_from_placed_block,
+    restore_dropped_items, snapshot_dropped_items, spawn_block_drop, spawn_block_drop_with_item,
+    throw_hotbar_item, update_dropped_items,
 };
 use app::logger::{init_logger, install_panic_hook, log_info, log_warn};
 use app::menu::{PauseMenuButton, hit_test_pause_menu_button};
@@ -50,19 +51,23 @@ use player::inventory::{
 use player::{
     Camera, CameraViewMode, EditedBlockEntry, EditedBlocks, LeafDecayQueue, PlayerConfig,
     PlayerInput, PlayerState, block_id_with_edits, break_blocks_batch, handle_block_mouse_input,
-    leaf_decay_stats, new_edited_blocks, new_leaf_decay_queue, restore_loaded_edit_metadata,
-    tick_leaf_decay, update_player,
+    leaf_decay_stats, new_edited_blocks, new_leaf_decay_queue, restore_leaf_decay_state,
+    restore_loaded_edit_metadata, snapshot_leaf_decay_state, tick_leaf_decay, update_player,
 };
 use render::Gpu;
 use render::block::BlockTexture;
-use render::gpu::{DAY_CYCLE_SECONDS, WorldEmissiveLight, reload_cpu_item_atlas_cache};
+use render::gpu::reload_cpu_item_atlas_cache;
 use render::mesh::pack_far_vertices;
 use render::{CubeStyle, TextureAtlas};
 use world::CHUNK_SIZE;
 use world::blocks::{
     DEFAULT_TILES_X, block_break_stage, block_break_time_with_item_seconds, block_is_collidable,
-    block_light_emission, block_texture_by_id, build_block_index, core_block_ids, default_blocks,
-    parse_block_id, reload_registry,
+    build_block_index, core_block_ids, default_blocks, reload_registry,
+};
+use world::lightengine::{
+    DAY_CYCLE_SECONDS, EMISSIVE_SCAN_INTERVAL, EMISSIVE_SCAN_MAX_SOURCES,
+    EMISSIVE_SCAN_MOVE_THRESHOLD_SQ, EMISSIVE_SCAN_RADIUS_BLOCKS, WorldEmissiveLight,
+    collect_world_emissive_lights,
 };
 use world::mesher::generate_chunk_mesh;
 use world::worldgen::{TreeSpec, WORLD_HALF_SIZE_BLOCKS, WorldGen, WorldMode};
@@ -74,25 +79,6 @@ const HAND_BREAK_STRENGTH: f32 = 1.0;
 const CHAT_HIDE_DELAY: Duration = Duration::from_secs(10);
 const MULTI_BREAK_MAX_BLOCKS: usize = 12;
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(2);
-const EMISSIVE_SCAN_RADIUS_BLOCKS: i32 = 20;
-const EMISSIVE_SCAN_MAX_SOURCES: usize = 96;
-const EMISSIVE_SCAN_INTERVAL: Duration = Duration::from_millis(120);
-const EMISSIVE_SCAN_MOVE_THRESHOLD_SQ: f32 = 1.25 * 1.25;
-const GLOWSTONE_RAY_MAX_STEPS: i32 = 20;
-const GLOWSTONE_RAY_STEP_STRIDE: i32 = 2;
-const GLOWSTONE_RAY_EMISSION_SCALE: f32 = 0.38;
-const GLOWSTONE_RAY_MIN_TINT: f32 = 0.04;
-const GLOWSTONE_RAY_SCORE_WEIGHT: f32 = 0.55;
-const GLOWSTONE_GLASS_FACE_ESCAPE_WEIGHT: f32 = 0.28;
-const GLOWSTONE_ENCLOSED_GLASS_ESCAPE_SCALE: f32 = 0.16;
-const GLOWSTONE_RAY_DIRECTIONS: [(i32, i32, i32); 6] = [
-    (1, 0, 0),
-    (-1, 0, 0),
-    (0, 1, 0),
-    (0, -1, 0),
-    (0, 0, 1),
-    (0, 0, -1),
-];
 
 fn ema_ms(previous: f32, sample_ms: f32) -> f32 {
     if previous <= 0.001 {
@@ -288,204 +274,6 @@ impl RuntimeLogSummary {
             self.min_tps
         }
     }
-}
-
-fn collect_world_emissive_lights(
-    world_gen: &WorldGen,
-    edited_blocks: &EditedBlocks,
-    center: Vec3,
-    radius_blocks: i32,
-    max_sources: usize,
-) -> Vec<WorldEmissiveLight> {
-    let radius = radius_blocks.max(1);
-    let cx = center.x.floor() as i32;
-    let cy = center.y.floor() as i32;
-    let cz = center.z.floor() as i32;
-    let r2 = (radius * radius) as f32;
-    let store = edited_blocks.read().unwrap();
-    if !store.has_any_edits() {
-        return Vec::new();
-    }
-    let mut scored: Vec<(f32, WorldEmissiveLight)> = Vec::new();
-    let glowstone_id = parse_block_id("glowstone").or_else(|| parse_block_id("1:11"));
-    let glass_tiles = parse_block_id("1:13")
-        .and_then(block_texture_by_id)
-        .map(|texture| texture.tiles);
-    let block_id_at = |x: i32, y: i32, z: i32| -> i8 {
-        store
-            .get(x, y, z)
-            .unwrap_or_else(|| world_gen.block_id_full_at(x, y, z))
-    };
-    let glass_filter_tint = |id: i8| -> Option<Vec3> {
-        if id < 0 || !block_is_collidable(id) {
-            return None;
-        }
-        let Some(expected_tiles) = glass_tiles else {
-            return None;
-        };
-        let texture = block_texture_by_id(id)?;
-        if texture.tiles != expected_tiles || texture.transparent_mode.iter().any(|&mode| mode == 0)
-        {
-            return None;
-        }
-        Some(Vec3::new(
-            texture.overlay[0].clamp(0.0, 1.0),
-            texture.overlay[1].clamp(0.0, 1.0),
-            texture.overlay[2].clamp(0.0, 1.0),
-        ))
-    };
-
-    let mut y = cy - radius;
-    while y <= cy + radius {
-        let mut z = cz - radius;
-        while z <= cz + radius {
-            let mut x = cx - radius;
-            while x <= cx + radius {
-                let dx = x as f32 + 0.5 - center.x;
-                let dy = y as f32 + 0.5 - center.y;
-                let dz = z as f32 + 0.5 - center.z;
-                let dist2 = dx * dx + dy * dy + dz * dz;
-                if dist2 <= r2 {
-                    if let Some(block_id) = store.get(x, y, z)
-                        && block_id >= 0
-                    {
-                        let emission = block_light_emission(block_id);
-                        if emission > 0.0 {
-                            let mut source_emission = emission;
-                            if glowstone_id == Some(block_id) {
-                                let mut open_faces = 0_u32;
-                                let mut glass_faces = 0_u32;
-                                for (nx, ny, nz) in GLOWSTONE_RAY_DIRECTIONS {
-                                    let neighbor_id = block_id_at(x + nx, y + ny, z + nz);
-                                    if neighbor_id < 0 || !block_is_collidable(neighbor_id) {
-                                        open_faces += 1;
-                                        continue;
-                                    }
-                                    if glass_filter_tint(neighbor_id).is_some() {
-                                        glass_faces += 1;
-                                    }
-                                }
-                                let faces_total = GLOWSTONE_RAY_DIRECTIONS.len() as f32;
-                                let open_escape = open_faces as f32 / faces_total;
-                                let glass_escape = (glass_faces as f32 / faces_total)
-                                    * GLOWSTONE_GLASS_FACE_ESCAPE_WEIGHT;
-                                let mut escape = open_escape.max(glass_escape).clamp(0.0, 1.0);
-                                if open_faces == 0 {
-                                    // Fully enclosed glowstone should not emit a central omnidirectional
-                                    // point light through walls; only traced transmission rays may escape.
-                                    source_emission = 0.0;
-                                } else {
-                                    if glass_faces > 0 {
-                                        // Glass-adjacent openings keep a softer core source because
-                                        // directional rays are handling most of the transmitted light.
-                                        escape *= GLOWSTONE_ENCLOSED_GLASS_ESCAPE_SCALE;
-                                    }
-                                    source_emission *= escape;
-                                }
-                            }
-
-                            if source_emission > 0.03 {
-                                let score = (source_emission * source_emission) / (dist2 + 1.0);
-                                scored.push((
-                                    score,
-                                    WorldEmissiveLight {
-                                        position: Vec3::new(
-                                            x as f32 + 0.5,
-                                            y as f32 + 0.5,
-                                            z as f32 + 0.5,
-                                        ),
-                                        block_id,
-                                        emission: source_emission,
-                                        tint: None,
-                                    },
-                                ));
-                            }
-
-                            if glowstone_id == Some(block_id) {
-                                for (step_x, step_y, step_z) in GLOWSTONE_RAY_DIRECTIONS {
-                                    let mut ray_tint = Vec3::new(1.0, 1.0, 1.0);
-                                    let mut filtered_by_glass = false;
-                                    let mut step = 1;
-                                    while step <= GLOWSTONE_RAY_MAX_STEPS {
-                                        let sx = x + step_x * step;
-                                        let sy = y + step_y * step;
-                                        let sz = z + step_z * step;
-                                        let sample_id = block_id_at(sx, sy, sz);
-                                        if sample_id >= 0 && block_is_collidable(sample_id) {
-                                            if let Some(glass_tint) = glass_filter_tint(sample_id) {
-                                                ray_tint *= glass_tint;
-                                                filtered_by_glass = true;
-                                                if ray_tint.max_element() <= GLOWSTONE_RAY_MIN_TINT
-                                                {
-                                                    break;
-                                                }
-                                            } else {
-                                                break;
-                                            }
-                                        }
-                                        if !filtered_by_glass
-                                            || step % GLOWSTONE_RAY_STEP_STRIDE != 0
-                                        {
-                                            step += 1;
-                                            continue;
-                                        }
-
-                                        let ray_dx = sx as f32 + 0.5 - center.x;
-                                        let ray_dy = sy as f32 + 0.5 - center.y;
-                                        let ray_dz = sz as f32 + 0.5 - center.z;
-                                        let ray_dist2 =
-                                            ray_dx * ray_dx + ray_dy * ray_dy + ray_dz * ray_dz;
-                                        if ray_dist2 <= r2 {
-                                            let distance_falloff = 1.0
-                                                - ((step - 1) as f32
-                                                    / GLOWSTONE_RAY_MAX_STEPS as f32);
-                                            let ray_base_emission = emission
-                                                * GLOWSTONE_RAY_EMISSION_SCALE
-                                                * distance_falloff.clamp(0.0, 1.0).powf(1.3);
-                                            let color_strength =
-                                                ((ray_tint.x + ray_tint.y + ray_tint.z) / 3.0)
-                                                    .clamp(0.0, 1.0);
-                                            let ray_emission =
-                                                ray_base_emission * (0.28 + 0.72 * color_strength);
-                                            if ray_emission > 0.05 {
-                                                let ray_score = ((ray_emission * ray_emission)
-                                                    / (ray_dist2 + 1.0))
-                                                    * GLOWSTONE_RAY_SCORE_WEIGHT;
-                                                scored.push((
-                                                    ray_score,
-                                                    WorldEmissiveLight {
-                                                        position: Vec3::new(
-                                                            sx as f32 + 0.5,
-                                                            sy as f32 + 0.5,
-                                                            sz as f32 + 0.5,
-                                                        ),
-                                                        block_id,
-                                                        emission: ray_emission,
-                                                        tint: Some(ray_tint.clamp(
-                                                            Vec3::splat(0.0),
-                                                            Vec3::splat(1.0),
-                                                        )),
-                                                    },
-                                                ));
-                                            }
-                                        }
-                                        step += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                x += 1;
-            }
-            z += 1;
-        }
-        y += 1;
-    }
-
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-    scored.truncate(max_sources.max(1));
-    scored.into_iter().map(|(_, light)| light).collect()
 }
 
 fn collect_break_targets(
@@ -792,27 +580,42 @@ fn collect_runtime_save_payload(
     selected_hotbar_slot: u8,
     fly_mode: bool,
     inventory: &InventoryState,
+    dropped_items: &[DroppedItem],
     edited_blocks: &EditedBlocks,
+    leaf_decay_queue: &LeafDecayQueue,
     include_edits: bool,
 ) -> (
     SavedPlayerState,
     InventorySnapshot,
+    Vec<app::dropped_items::SavedDroppedItem>,
+    player::block_edit::SavedLeafDecayState,
     Option<Vec<EditedBlockEntry>>,
 ) {
     let player_state = current_saved_player_state(player, camera, selected_hotbar_slot, fly_mode);
     let inventory_snapshot = inventory.snapshot();
+    let dropped_items = snapshot_dropped_items(dropped_items);
+    let leaf_decay_state = snapshot_leaf_decay_state(leaf_decay_queue);
     let edited_entries = include_edits.then(|| edited_blocks.read().unwrap().snapshot_entries());
-    (player_state, inventory_snapshot, edited_entries)
+    (
+        player_state,
+        inventory_snapshot,
+        dropped_items,
+        leaf_decay_state,
+        edited_entries,
+    )
 }
 
 fn persist_runtime_state(
     save_io: &SaveIo,
     player_state: &SavedPlayerState,
     inventory_snapshot: &InventorySnapshot,
+    dropped_items: &[app::dropped_items::SavedDroppedItem],
+    leaf_decay_state: &player::block_edit::SavedLeafDecayState,
     edited_entries: Option<&[EditedBlockEntry]>,
 ) -> std::io::Result<usize> {
     save_io.save_player(player_state)?;
     save_io.save_inventory(inventory_snapshot)?;
+    save_io.save_runtime_state(dropped_items, leaf_decay_state)?;
     if let Some(edits) = edited_entries {
         let count = edits.len();
         save_io.save_edited_blocks(edits)?;
@@ -826,11 +629,15 @@ enum SaveWorkerMsg {
     Autosave {
         player: SavedPlayerState,
         inventory: InventorySnapshot,
+        dropped_items: Vec<app::dropped_items::SavedDroppedItem>,
+        leaf_decay: player::block_edit::SavedLeafDecayState,
         edits: Option<Vec<EditedBlockEntry>>,
     },
     FinalFlush {
         player: SavedPlayerState,
         inventory: InventorySnapshot,
+        dropped_items: Vec<app::dropped_items::SavedDroppedItem>,
+        leaf_decay: player::block_edit::SavedLeafDecayState,
         edits: Vec<EditedBlockEntry>,
         done_tx: mpsc::Sender<std::io::Result<usize>>,
     },
@@ -919,6 +726,8 @@ fn main() {
     let loaded_player_state = loaded_save.player;
     let loaded_inventory_snapshot = loaded_save.inventory;
     let loaded_edited_entries: Vec<EditedBlockEntry> = loaded_save.edited_blocks;
+    let loaded_dropped_items = loaded_save.dropped_items;
+    let loaded_leaf_decay = loaded_save.leaf_decay;
     if !loaded_edited_entries.is_empty() {
         edited_blocks
             .write()
@@ -976,6 +785,8 @@ fn main() {
                         SaveWorkerMsg::Autosave {
                             player,
                             inventory,
+                            dropped_items,
+                            leaf_decay,
                             edits,
                         } => {
                             let include_edits = edits.is_some();
@@ -983,6 +794,8 @@ fn main() {
                                 &save_io_worker,
                                 &player,
                                 &inventory,
+                                &dropped_items,
+                                &leaf_decay,
                                 edits.as_deref(),
                             );
                             let _ = tx_save_result_worker.send(SaveWorkerResult {
@@ -993,6 +806,8 @@ fn main() {
                         SaveWorkerMsg::FinalFlush {
                             player,
                             inventory,
+                            dropped_items,
+                            leaf_decay,
                             edits,
                             done_tx,
                         } => {
@@ -1000,6 +815,8 @@ fn main() {
                                 &save_io_worker,
                                 &player,
                                 &inventory,
+                                &dropped_items,
+                                &leaf_decay,
                                 Some(&edits),
                             );
                             let _ = done_tx.send(result);
@@ -1090,7 +907,22 @@ fn main() {
         log_info("save-load: restored inventory");
     }
     camera.position = player.position + Vec3::new(0.0, player_config.eye_height, 0.0);
-    let mut dropped_items: Vec<DroppedItem> = Vec::new();
+    let mut dropped_items = restore_dropped_items(&loaded_dropped_items);
+    if !dropped_items.is_empty() {
+        log_info(format!(
+            "save-load: restored {} dropped items",
+            dropped_items.len()
+        ));
+    }
+    let restored_leaf_stats = restore_leaf_decay_state(&leaf_decay_queue, &loaded_leaf_decay);
+    if restored_leaf_stats.check_queue > 0 || restored_leaf_stats.break_queue > 0 {
+        log_info(format!(
+            "save-load: restored leaf decay state (tick={} check={} break={})",
+            restored_leaf_stats.tick,
+            restored_leaf_stats.check_queue,
+            restored_leaf_stats.break_queue
+        ));
+    }
     let mut command_console = CommandConsoleState::default();
     let keybind_overlay_lines = keybind_lines();
     let mut keybind_overlay_visible = false;
@@ -2066,18 +1898,23 @@ fn main() {
 
                 if last_autosave.elapsed() >= AUTOSAVE_INTERVAL {
                     if !autosave_in_flight {
-                        let (player_state, inventory_snapshot, edits) = collect_runtime_save_payload(
-                            &player,
-                            &camera,
-                            selected_hotbar_slot,
-                            fly_mode,
-                            &inventory,
-                            &edited_blocks,
-                            edits_save_dirty,
-                        );
+                        let (player_state, inventory_snapshot, dropped_items_snapshot, leaf_decay_state, edits) =
+                            collect_runtime_save_payload(
+                                &player,
+                                &camera,
+                                selected_hotbar_slot,
+                                fly_mode,
+                                &inventory,
+                                &dropped_items,
+                                &edited_blocks,
+                                &leaf_decay_queue,
+                                edits_save_dirty,
+                            );
                         match tx_save_msg.send(SaveWorkerMsg::Autosave {
                             player: player_state,
                             inventory: inventory_snapshot,
+                            dropped_items: dropped_items_snapshot,
+                            leaf_decay: leaf_decay_state,
                             edits,
                         }) {
                             Ok(()) => {
@@ -2149,12 +1986,16 @@ fn main() {
                     || (emissive_center - last_emissive_scan_pos).length_squared()
                         >= EMISSIVE_SCAN_MOVE_THRESHOLD_SQ;
                 if emissive_refresh_due {
+                    let store = edited_blocks.read().unwrap();
+                    let emissive_sources =
+                        store.collect_emissive_sources_near(emissive_center, EMISSIVE_SCAN_RADIUS_BLOCKS);
                     world_emissive_lights = collect_world_emissive_lights(
-                        &world_gen,
-                        &edited_blocks,
                         emissive_center,
                         EMISSIVE_SCAN_RADIUS_BLOCKS,
                         EMISSIVE_SCAN_MAX_SOURCES,
+                        &emissive_sources,
+                        |x, y, z| store.get(x, y, z),
+                        |x, y, z| world_gen.block_id_full_at(x, y, z),
                     );
                     last_emissive_scan = Instant::now();
                     last_emissive_scan_pos = emissive_center;
@@ -2934,20 +2775,25 @@ fn main() {
             gpu.resize(size);
         }
         Event::LoopExiting => {
-            let (player_state, inventory_snapshot, edits) = collect_runtime_save_payload(
-                &player,
-                &camera,
-                selected_hotbar_slot,
-                fly_mode,
-                &inventory,
-                &edited_blocks,
-                true,
-            );
+            let (player_state, inventory_snapshot, dropped_items_snapshot, leaf_decay_state, edits) =
+                collect_runtime_save_payload(
+                    &player,
+                    &camera,
+                    selected_hotbar_slot,
+                    fly_mode,
+                    &inventory,
+                    &dropped_items,
+                    &edited_blocks,
+                    &leaf_decay_queue,
+                    true,
+                );
             let edits = edits.unwrap_or_default();
             let (done_tx, done_rx) = mpsc::channel::<std::io::Result<usize>>();
             let flush_result = match tx_save_msg.send(SaveWorkerMsg::FinalFlush {
                 player: player_state,
                 inventory: inventory_snapshot.clone(),
+                dropped_items: dropped_items_snapshot.clone(),
+                leaf_decay: leaf_decay_state.clone(),
                 edits: edits.clone(),
                 done_tx,
             }) {
@@ -2961,7 +2807,14 @@ fn main() {
                     log_warn(format!(
                         "save: final flush enqueue failed ({err}), falling back to direct write"
                     ));
-                    persist_runtime_state(&save_io, &player_state, &inventory_snapshot, Some(&edits))
+                    persist_runtime_state(
+                        &save_io,
+                        &player_state,
+                        &inventory_snapshot,
+                        &dropped_items_snapshot,
+                        &leaf_decay_state,
+                        Some(&edits),
+                    )
                 }
             };
             match flush_result {

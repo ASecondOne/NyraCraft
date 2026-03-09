@@ -177,8 +177,8 @@ fn point_light_add(normal: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
         let dist = sqrt(max(dist_sq, 0.000001));
         let light_dir = to_light / dist;
         let diffuse = max(dot(n, light_dir), 0.0);
-        // Keep a small omnidirectional floor so emissive blocks light nearby faces in caves.
-        let ndotl = 0.18 + 0.82 * diffuse;
+        // A tiny floor keeps caves readable without obvious light leaking through solid walls.
+        let ndotl = 0.03 + 0.97 * diffuse;
         let edge = 1.0 - (dist / radius);
         let falloff = edge * edge;
         let c = uniforms.point_light_color_intensity[i];

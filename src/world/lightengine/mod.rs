@@ -1,4 +1,17 @@
-use crate::world::blocks::{block_is_collidable, core_block_ids};
+mod blocklight;
+mod runtime;
+
+pub use blocklight::{
+    ENABLE_STATIC_BLOCK_LIGHT, build_block_light_field, compute_face_light_with_block,
+};
+pub use runtime::{
+    DAY_CYCLE_SECONDS, EMISSIVE_SCAN_INTERVAL, EMISSIVE_SCAN_MAX_SOURCES,
+    EMISSIVE_SCAN_MOVE_THRESHOLD_SQ, EMISSIVE_SCAN_RADIUS_BLOCKS, MAX_POINT_LIGHTS,
+    WorldEmissiveLight, build_culled_point_lights, collect_world_emissive_lights, sample_day_cycle,
+    sun_direction,
+};
+
+use crate::world::blocks::{block_is_collidable, block_light_emission, core_block_ids};
 
 pub fn compute_face_light<F>(
     face: u32,
@@ -194,6 +207,11 @@ fn sun_visibility_mul_far(id: i8, leaves_id: i8) -> f32 {
     } else {
         0.46
     }
+}
+
+#[inline]
+pub fn is_emissive_block(id: i8) -> bool {
+    id >= 0 && block_light_emission(id) > 0.0
 }
 
 #[cfg(test)]

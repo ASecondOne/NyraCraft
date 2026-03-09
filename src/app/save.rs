@@ -5,7 +5,9 @@ use std::io;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use crate::app::dropped_items::SavedDroppedItem;
 use crate::player::EditedBlockEntry;
+use crate::player::SavedLeafDecayState;
 use crate::player::inventory::InventorySnapshot;
 use crate::world::worldgen::WorldGen;
 
@@ -14,7 +16,8 @@ const META_FILE: &str = "meta.json";
 const PLAYER_FILE: &str = "player.json";
 const INVENTORY_FILE: &str = "inventory.json";
 const EDITS_FILE: &str = "edits.json";
-const SAVE_FORMAT_VERSION: u32 = 1;
+const RUNTIME_STATE_FILE: &str = "runtime_state.json";
+const SAVE_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SavedPlayerState {
@@ -40,11 +43,19 @@ struct SavedEditsFile {
     edits: Vec<EditedBlockEntry>,
 }
 
+#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+struct SavedRuntimeStateFile {
+    dropped_items: Vec<SavedDroppedItem>,
+    leaf_decay: SavedLeafDecayState,
+}
+
 #[derive(Default)]
 pub struct LoadedRuntimeState {
     pub player: Option<SavedPlayerState>,
     pub inventory: Option<InventorySnapshot>,
     pub edited_blocks: Vec<EditedBlockEntry>,
+    pub dropped_items: Vec<SavedDroppedItem>,
+    pub leaf_decay: SavedLeafDecayState,
     pub warnings: Vec<String>,
 }
 
@@ -120,6 +131,17 @@ impl SaveIo {
                 .push(format!("failed to load edits.json: {err}")),
         }
 
+        match read_json_optional::<SavedRuntimeStateFile>(&self.path(RUNTIME_STATE_FILE)) {
+            Ok(Some(runtime_state)) => {
+                out.dropped_items = runtime_state.dropped_items;
+                out.leaf_decay = runtime_state.leaf_decay;
+            }
+            Ok(None) => {}
+            Err(err) => out
+                .warnings
+                .push(format!("failed to load runtime_state.json: {err}")),
+        }
+
         out
     }
 
@@ -142,6 +164,22 @@ impl SaveIo {
             &self.path(EDITS_FILE),
             &SavedEditsFile {
                 edits: edited_blocks.to_vec(),
+            },
+        )
+    }
+
+    pub fn save_runtime_state(
+        &self,
+        dropped_items: &[SavedDroppedItem],
+        leaf_decay: &SavedLeafDecayState,
+    ) -> io::Result<()> {
+        self.ensure_dir()?;
+        self.write_meta()?;
+        write_json_atomic(
+            &self.path(RUNTIME_STATE_FILE),
+            &SavedRuntimeStateFile {
+                dropped_items: dropped_items.to_vec(),
+                leaf_decay: leaf_decay.clone(),
             },
         )
     }
