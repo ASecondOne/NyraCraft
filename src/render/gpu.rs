@@ -1787,6 +1787,41 @@ impl Gpu {
                 gpu.visible_supers
                     .extend(visible_candidates.into_iter().map(|(coord, _, _)| coord));
             }
+            if gpu.visible_supers.len() > MAX_VISIBLE_SUPERS {
+                let split = MAX_VISIBLE_SUPERS;
+                gpu.visible_supers.select_nth_unstable_by(split, |a, b| {
+                    let da = (gpu.super_chunks[a].center - camera.position).length_squared();
+                    let db = (gpu.super_chunks[b].center - camera.position).length_squared();
+                    da.total_cmp(&db)
+                });
+                gpu.visible_supers.truncate(split);
+            }
+
+            if gpu.visible_supers.len() > MIN_VISIBLE_SUPERS {
+                gpu.visible_supers.sort_unstable_by(|a, b| {
+                    let da = (gpu.super_chunks[a].center - camera.position).length_squared();
+                    let db = (gpu.super_chunks[b].center - camera.position).length_squared();
+                    da.total_cmp(&db)
+                });
+                let mut visible_index_sum = 0_u64;
+                let mut kept = 0_usize;
+                gpu.visible_supers.retain(|coord| {
+                    let indices = gpu
+                        .super_chunks
+                        .get(coord)
+                        .map(|chunk| chunk.raw_index_count as u64 + chunk.packed_index_count as u64)
+                        .unwrap_or(0);
+                    if kept < MIN_VISIBLE_SUPERS
+                        || visible_index_sum.saturating_add(indices) <= MAX_VISIBLE_INDICES_BUDGET
+                    {
+                        visible_index_sum = visible_index_sum.saturating_add(indices);
+                        kept += 1;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
         });
     }
 }
