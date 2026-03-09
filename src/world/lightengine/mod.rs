@@ -1,4 +1,17 @@
-use crate::world::blocks::{block_is_collidable, core_block_ids};
+mod blocklight;
+mod runtime;
+
+pub use blocklight::{
+    ENABLE_STATIC_BLOCK_LIGHT, build_block_light_field, compute_face_light_with_block,
+};
+pub use runtime::{
+    DAY_CYCLE_SECONDS, EMISSIVE_SCAN_INTERVAL, EMISSIVE_SCAN_MAX_SOURCES,
+    EMISSIVE_SCAN_MOVE_THRESHOLD_SQ, EMISSIVE_SCAN_RADIUS_BLOCKS, MAX_POINT_LIGHTS,
+    WorldEmissiveLight, build_culled_point_lights, collect_world_emissive_lights, sample_day_cycle,
+    sun_direction,
+};
+
+use crate::world::blocks::{block_is_collidable, block_light_emission, core_block_ids};
 
 pub fn compute_face_light<F>(
     face: u32,
@@ -21,8 +34,27 @@ where
         _ => 0.62f32, // sides
     };
     if !use_sky_shading {
-        // Fallback shading for low-detail passes where full sky probing is skipped.
-        return (0.015f32 + base * 0.34f32).clamp(0.01f32, 0.42f32);
+        // Cheap local approximation for low-detail passes to avoid hard lighting seams
+        // when neighboring chunks are rendered with different LOD steps.
+        let (cx, cy, cz) = face_center_sample(face, wx, wy, wz, sx, sy, sz);
+        let bx = cx.floor() as i32;
+        let by = cy.floor() as i32;
+        let bz = cz.floor() as i32;
+
+        let mut shaft = 0.0f32;
+        shaft += 1.0 - local_cover_weight(block_at(bx, by, bz), leaves_id, 0.18, 0.78);
+        shaft += 1.0 - local_cover_weight(block_at(bx, by + 1, bz), leaves_id, 0.12, 0.58);
+        shaft += 1.0 - local_cover_weight(block_at(bx, by + 2, bz), leaves_id, 0.08, 0.42);
+        shaft = (shaft / 3.0).clamp(0.0, 1.0);
+
+        let mut side_cover = 0.0f32;
+        side_cover += local_cover_weight(block_at(bx + 1, by, bz), leaves_id, 0.08, 0.22);
+        side_cover += local_cover_weight(block_at(bx - 1, by, bz), leaves_id, 0.08, 0.22);
+        side_cover += local_cover_weight(block_at(bx, by, bz + 1), leaves_id, 0.08, 0.22);
+        side_cover += local_cover_weight(block_at(bx, by, bz - 1), leaves_id, 0.08, 0.22);
+        let enclosure = (side_cover / 4.0).clamp(0.0, 0.35);
+        let quick_sky = (shaft * (1.0 - enclosure)).clamp(0.0, 1.0);
+        return (0.012 + base * (0.18 + 0.82 * quick_sky)).clamp(0.01, 0.92);
     }
     let (cx, cy, cz) = face_center_sample(face, wx, wy, wz, sx, sy, sz);
     let mut sky = sample_sky_visibility_fast(face, cx, cy, cz, leaves_id, block_at);
@@ -175,6 +207,11 @@ fn sun_visibility_mul_far(id: i8, leaves_id: i8) -> f32 {
     } else {
         0.46
     }
+}
+
+#[inline]
+pub fn is_emissive_block(id: i8) -> bool {
+    id >= 0 && block_light_emission(id) > 0.0
 }
 
 #[cfg(test)]

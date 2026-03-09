@@ -331,7 +331,11 @@ impl InventoryState {
         for (slot, item) in self.hotbar.iter_mut().zip(snapshot.hotbar.iter().copied()) {
             *slot = normalize_item_stack(item);
         }
-        for (slot, item) in self.storage.iter_mut().zip(snapshot.storage.iter().copied()) {
+        for (slot, item) in self
+            .storage
+            .iter_mut()
+            .zip(snapshot.storage.iter().copied())
+        {
             *slot = normalize_item_stack(item);
         }
         for (slot, item) in self

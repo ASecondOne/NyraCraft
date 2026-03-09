@@ -133,15 +133,6 @@ where
     submitted
 }
 
-#[allow(dead_code)]
-pub fn execute_console_command(raw: &str, inventory: &mut InventoryState) -> String {
-    fn no_external_command(_: &str) -> Option<String> {
-        None
-    }
-    let mut no_handler = no_external_command;
-    execute_console_command_with_handler(raw, inventory, &mut no_handler)
-}
-
 fn execute_console_command_with_handler<F>(
     raw: &str,
     inventory: &mut InventoryState,
@@ -159,7 +150,7 @@ where
     let command = parts.next().unwrap_or_default().to_ascii_lowercase();
     match command.as_str() {
         "help" => {
-            "commands: give <item> [count], items, time set <day|night|morning|none>, tp <x> <y> <z> | ids: 1:<block_id> (block), 2:<item_id> (item), tp supports ~ relative coords".to_string()
+            "commands: give <item> [count], items, time set <day|night|morning|none>, tp <x> <y> <z> | ids: 1:<block_id> (block), 1:<block_id>:<variant> (block variant), 2:<item_id> (item), tp supports ~ relative coords".to_string()
         }
         "items" => all_item_defs()
             .iter()
@@ -172,7 +163,7 @@ where
             };
             let Some(item_id) = parse_item_id(block_text) else {
                 return format!(
-                    "unknown item `{block_text}` (stone, dirt, grass, log, leaves, apple, stick, 1:<block_id>, 2:<item_id>)"
+                    "unknown item `{block_text}` (stone, dirt, grass, log, leaves, apple, stick, 1:<block_id>, 1:<block_id>:<variant>, 2:<item_id>)"
                 );
             };
             let count = if let Some(count_text) = parts.next() {

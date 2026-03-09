@@ -1,0 +1,44 @@
+{
+  "id": "1:13",
+  "register_name": "block_glass",
+  "aliases": ["glass", "clear_glass"],
+  "hardness": 0.4,
+  "required_tool": "hand",
+  "collidable": true,
+  "texture_slot_1based": 28,
+  "rotations": [0, 0, 0, 0, 0, 0],
+  "transparent_mode": [4, 4, 4, 4, 4, 4],
+  "icon_texture_slot_1based": 28,
+  "variants": [
+    {
+      "name": "red",
+      "aliases": ["glass_red", "red_glass"],
+      "overlay_rgba": [1.0, 0.45, 0.45, 1.0]
+    },
+    {
+      "name": "green",
+      "aliases": ["glass_green", "green_glass"],
+      "overlay_rgba": [0.45, 1.0, 0.45, 1.0]
+    },
+    {
+      "name": "blue",
+      "aliases": ["glass_blue", "blue_glass"],
+      "overlay_rgba": [0.45, 0.62, 1.0, 1.0]
+    },
+    {
+      "name": "amber",
+      "aliases": ["glass_amber", "amber_glass"],
+      "overlay_rgba": [1.0, 0.75, 0.42, 1.0]
+    },
+    {
+      "name": "purple",
+      "aliases": ["glass_purple", "purple_glass"],
+      "overlay_rgba": [0.72, 0.52, 1.0, 1.0]
+    },
+    {
+      "name": "cyan",
+      "aliases": ["glass_cyan", "cyan_glass"],
+      "overlay_rgba": [0.45, 0.95, 1.0, 1.0]
+    }
+  ]
+}

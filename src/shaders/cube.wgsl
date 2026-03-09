@@ -8,8 +8,8 @@ struct Uniforms {
     item_misc: vec4<f32>,
     light_misc: vec4<u32>,
     sun_dir: vec4<f32>,
-    point_light_pos_radius: array<vec4<f32>, 12>,
-    point_light_color_intensity: array<vec4<f32>, 12>,
+    point_light_pos_radius: array<vec4<f32>, 20>,
+    point_light_color_intensity: array<vec4<f32>, 20>,
 };
 
 @group(0) @binding(0)
@@ -157,7 +157,7 @@ fn face_normal(face: u32) -> vec3<f32> {
     }
 }
 
-const MAX_POINT_LIGHTS: u32 = 12u;
+const MAX_POINT_LIGHTS: u32 = 20u;
 
 fn point_light_add(normal: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
     let count = min(uniforms.light_misc.x, MAX_POINT_LIGHTS);
@@ -177,8 +177,8 @@ fn point_light_add(normal: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
         let dist = sqrt(max(dist_sq, 0.000001));
         let light_dir = to_light / dist;
         let diffuse = max(dot(n, light_dir), 0.0);
-        // Keep a small omnidirectional floor so emissive blocks light nearby faces in caves.
-        let ndotl = 0.18 + 0.82 * diffuse;
+        // A tiny floor keeps caves readable without obvious light leaking through solid walls.
+        let ndotl = 0.03 + 0.97 * diffuse;
         let edge = 1.0 - (dist / radius);
         let falloff = edge * edge;
         let c = uniforms.point_light_color_intensity[i];
@@ -348,6 +348,15 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             }
             color = vec4<f32>(tex_rgb * vertex_tint, color.a);
             albedo_rgb = tex_rgb;
+        } else if (transparent_mode == 4u) {
+            if (tex_a < 0.02) {
+                discard;
+            }
+            let tinted_rgb = tex_rgb * vertex_tint;
+            // Glass tint mode: keep texture detail but push variant color strongly.
+            let tint_mix = 0.68;
+            color = vec4<f32>(mix(tex_rgb, tinted_rgb, tint_mix), tex_a * color.a);
+            albedo_rgb = mix(tex_rgb, tinted_rgb, 0.72);
         } else {
             color = vec4<f32>(tex_rgb, tex_a) * color;
             albedo_rgb = tex_rgb;

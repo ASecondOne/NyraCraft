@@ -1,12 +1,16 @@
 use glam::{IVec3, Vec3};
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use crate::render::block::{BlockTexture, RENDER_SHAPE_CROSS};
 use crate::render::mesh::ChunkVertex;
 use crate::world::CHUNK_SIZE;
-use crate::world::blocks::{block_is_collidable, block_texture_by_id, core_block_ids};
-use crate::world::lightengine::compute_face_light;
+use crate::world::blocks::{
+    block_is_collidable, block_light_emission, block_texture_by_id, core_block_ids,
+};
+use crate::world::lightengine::{
+    ENABLE_STATIC_BLOCK_LIGHT, build_block_light_field, compute_face_light_with_block,
+};
 use crate::world::worldgen::{WorldGen, WorldMode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,30 +29,6 @@ pub struct MeshData {
     pub radius: f32,
     pub vertices: Vec<ChunkVertex>,
     pub indices: Vec<u32>,
-}
-
-const BLOCK_LIGHT_MAX_LEVEL: u8 = 15;
-const BLOCK_LIGHT_MARGIN: i32 = BLOCK_LIGHT_MAX_LEVEL as i32 + 1;
-const BLOCK_LIGHT_GAMMA: f32 = 0.82;
-const ENABLE_STATIC_BLOCK_LIGHT: bool = false;
-
-struct BlockLightField {
-    min: IVec3,
-    span: i32,
-    levels: Vec<u8>,
-}
-
-impl BlockLightField {
-    #[inline]
-    fn level_at_world(&self, wx: i32, wy: i32, wz: i32) -> u8 {
-        let lx = wx - self.min.x;
-        let ly = wy - self.min.y;
-        let lz = wz - self.min.z;
-        if lx < 0 || ly < 0 || lz < 0 || lx >= self.span || ly >= self.span || lz >= self.span {
-            return 0;
-        }
-        self.levels[local_idx(lx, ly, lz, self.span)]
-    }
 }
 
 pub fn generate_chunk_mesh<F>(
@@ -72,7 +52,8 @@ where
     let size = CHUNK_SIZE;
     let half = CHUNK_SIZE / 2;
     let height_cache = build_height_cache(worldgen, origin, size, half);
-    let step = step.max(1);
+    // Clamp coarse LOD step to chunk bounds so far requests never produce empty meshes.
+    let step = step.clamp(1, size);
     let grid = (size / step).max(1);
     let est_faces = match mode {
         MeshMode::Full => (grid * grid * 12).max(1024),
@@ -90,14 +71,23 @@ where
         .filter(|&idx| idx < blocks.len());
 
     let use_texture = if mode == MeshMode::SurfaceOnly { 0 } else { 1 };
-    let use_sky_shading = use_sky_shading && mode == MeshMode::Full && step == 1;
+    // Allow sky shading for nearby/coarse LODs too, so chunk LOD boundaries don't pop in lighting.
+    let use_sky_shading = use_sky_shading && mode != MeshMode::SurfaceOnly && step <= 4;
     let chunk_min_y = origin.y - half;
     let chunk_max_y = origin.y + half;
 
     if mode == MeshMode::Full && step == 1 && edited_y_range.is_none() {
         let mut max_feature_top = i32::MIN;
-        let tree_extra = if worldgen.mode == WorldMode::Normal { 10 } else { 0 };
-        let scan_margin = if worldgen.mode == WorldMode::Normal { 3 } else { 0 };
+        let tree_extra = if worldgen.mode == WorldMode::Normal {
+            10
+        } else {
+            0
+        };
+        let scan_margin = if worldgen.mode == WorldMode::Normal {
+            3
+        } else {
+            0
+        };
         let mut z = -scan_margin;
         while z < size + scan_margin {
             let mut x = -scan_margin;
@@ -148,8 +138,8 @@ where
 
     if mode != MeshMode::Full {
         if mode == MeshMode::SurfaceOnly {
-            let cell = step.max(1);
-            let grid = size / cell;
+            let cell = step;
+            let grid = (size / cell).max(1);
             let mut cz = 0;
             while cz < grid {
                 let mut cx = 0;
@@ -214,8 +204,8 @@ where
             };
         }
 
-        let cell = step.max(1);
-        let grid = size / cell;
+        let cell = step;
+        let grid = (size / cell).max(1);
         let grid_usize = grid as usize;
         let mut cells = vec![-1_i32; grid_usize * grid_usize * grid_usize];
         let block_count = blocks.len();
@@ -1016,60 +1006,6 @@ fn dequantize_light(light_bin: u8) -> f32 {
 }
 
 #[inline]
-fn light_level_to_factor(level: u8) -> f32 {
-    if level == 0 {
-        0.0
-    } else {
-        (level as f32 / BLOCK_LIGHT_MAX_LEVEL as f32)
-            .powf(BLOCK_LIGHT_GAMMA)
-            .clamp(0.0, 1.0)
-    }
-}
-
-#[inline]
-fn face_light_sample_cell(
-    face: u32,
-    wx: i32,
-    wy: i32,
-    wz: i32,
-    sx: i32,
-    sy: i32,
-    sz: i32,
-) -> (i32, i32, i32) {
-    match face {
-        0 => (wx + sx, wy, wz),
-        1 => (wx - 1, wy, wz),
-        2 => (wx, wy + sy, wz),
-        3 => (wx, wy - 1, wz),
-        4 => (wx, wy, wz + sz),
-        _ => (wx, wy, wz - 1),
-    }
-}
-
-#[inline]
-fn sample_face_block_light(
-    block_light_field: Option<&BlockLightField>,
-    face: u32,
-    wx: i32,
-    wy: i32,
-    wz: i32,
-    sx: i32,
-    sy: i32,
-    sz: i32,
-) -> f32 {
-    let Some(field) = block_light_field else {
-        return 0.0;
-    };
-    let (sx, sy, sz) = face_light_sample_cell(face, wx, wy, wz, sx, sy, sz);
-    light_level_to_factor(field.level_at_world(sx, sy, sz))
-}
-
-#[inline]
-fn combine_sky_and_block_light(sky_light: f32, block_light: f32) -> f32 {
-    sky_light.max(block_light).clamp(0.0, 1.0)
-}
-
-#[inline]
 fn ao_axis_samples(min: i32, span: i32, high: bool) -> (i32, i32) {
     if high {
         (min + span - 1, min + span)
@@ -1212,115 +1148,6 @@ fn local_to_world(origin: IVec3, half: i32, x: i32, y: i32, z: i32) -> (i32, i32
     )
 }
 
-fn build_block_light_field<F>(
-    chunk_min: IVec3,
-    size: i32,
-    blocks: &[BlockTexture],
-    block_at: &F,
-) -> Option<BlockLightField>
-where
-    F: Fn(i32, i32, i32) -> i8,
-{
-    let span = size + BLOCK_LIGHT_MARGIN * 2;
-    if span <= 0 {
-        return None;
-    }
-    let min = chunk_min - IVec3::splat(BLOCK_LIGHT_MARGIN);
-    let volume = (span * span * span) as usize;
-    let mut ids = vec![-1_i8; volume];
-    let mut levels = vec![0_u8; volume];
-    let mut queue = VecDeque::<(i32, i32, i32)>::new();
-
-    let mut z = 0;
-    while z < span {
-        let mut y = 0;
-        while y < span {
-            let mut x = 0;
-            while x < span {
-                let wx = min.x + x;
-                let wy = min.y + y;
-                let wz = min.z + z;
-                let idx = local_idx(x, y, z, span);
-                let id = block_at(wx, wy, wz);
-                ids[idx] = id;
-                if id >= 0
-                    && let Some(block) = blocks.get(id as usize)
-                {
-                    let emission = block
-                        .light_emission
-                        .clamp(0.0, BLOCK_LIGHT_MAX_LEVEL as f32)
-                        .round() as u8;
-                    if emission > 0 {
-                        levels[idx] = emission;
-                        queue.push_back((x, y, z));
-                    }
-                }
-                x += 1;
-            }
-            y += 1;
-        }
-        z += 1;
-    }
-
-    if queue.is_empty() {
-        return None;
-    }
-
-    const DIRS: [(i32, i32, i32); 6] = [
-        (1, 0, 0),
-        (-1, 0, 0),
-        (0, 1, 0),
-        (0, -1, 0),
-        (0, 0, 1),
-        (0, 0, -1),
-    ];
-    while let Some((x, y, z)) = queue.pop_front() {
-        let idx = local_idx(x, y, z, span);
-        let level = levels[idx];
-        if level <= 1 {
-            continue;
-        }
-        let next = level - 1;
-        for &(dx, dy, dz) in &DIRS {
-            let nx = x + dx;
-            let ny = y + dy;
-            let nz = z + dz;
-            if nx < 0 || ny < 0 || nz < 0 || nx >= span || ny >= span || nz >= span {
-                continue;
-            }
-            let nidx = local_idx(nx, ny, nz, span);
-            if block_is_collidable(ids[nidx]) || levels[nidx] >= next {
-                continue;
-            }
-            levels[nidx] = next;
-            queue.push_back((nx, ny, nz));
-        }
-    }
-
-    Some(BlockLightField { min, span, levels })
-}
-
-#[inline]
-fn compute_face_light_with_block<F>(
-    face: u32,
-    wx: i32,
-    wy: i32,
-    wz: i32,
-    sx: i32,
-    sy: i32,
-    sz: i32,
-    use_sky_shading: bool,
-    block_at: &F,
-    block_light_field: Option<&BlockLightField>,
-) -> f32
-where
-    F: Fn(i32, i32, i32) -> i8,
-{
-    let sky_light = compute_face_light(face, wx, wy, wz, sx, sy, sz, use_sky_shading, block_at);
-    let block_light = sample_face_block_light(block_light_field, face, wx, wy, wz, sx, sy, sz);
-    combine_sky_and_block_light(sky_light, block_light)
-}
-
 fn generate_chunk_mesh_greedy<F>(
     coord: IVec3,
     origin: IVec3,
@@ -1337,7 +1164,11 @@ where
     let volume = (size * size * size) as usize;
     let area = (size * size) as usize;
     let halo_span = size + 2;
-    let halo_min = IVec3::new(origin.x - half - 1, origin.y - half - 1, origin.z - half - 1);
+    let halo_min = IVec3::new(
+        origin.x - half - 1,
+        origin.y - half - 1,
+        origin.z - half - 1,
+    );
     let mut halo = vec![-1_i8; (halo_span * halo_span * halo_span) as usize];
     let mut hz = 0;
     while hz < halo_span {
@@ -1375,15 +1206,12 @@ where
     };
     let block_at = &cached_block_at;
     let block_light_field = if ENABLE_STATIC_BLOCK_LIGHT {
-        let has_emissive_in_halo = halo.iter().copied().any(|id| {
-            id >= 0
-                && blocks
-                    .get(id as usize)
-                    .map(|block| block.light_emission > 0.0)
-                    .unwrap_or(false)
-        });
+        let has_emissive_in_halo = halo
+            .iter()
+            .copied()
+            .any(|id| id >= 0 && block_light_emission(id) > 0.0);
         if has_emissive_in_halo {
-            build_block_light_field(chunk_min, size, blocks, block_at)
+            build_block_light_field(chunk_min, size, block_at)
         } else {
             None
         }
@@ -2158,21 +1986,16 @@ fn emit_cross_plant<F>(
 ) where
     F: Fn(i32, i32, i32) -> i8,
 {
-    let light = compute_face_light_with_block(
-        2,
-        wx,
-        wy,
-        wz,
-        1,
-        1,
-        1,
-        use_sky_shading,
-        block_at,
-        None,
-    );
+    let light =
+        compute_face_light_with_block(2, wx, wy, wz, 1, 1, 1, use_sky_shading, block_at, None);
     let emissive = (block.light_emission / 15.0).clamp(0.0, 1.0);
     let shade = light.max(emissive);
-    let color = [shade, shade, shade, 1.0];
+    let color = [
+        (shade * block.overlay[0]).clamp(0.0, 1.0),
+        (shade * block.overlay[1]).clamp(0.0, 1.0),
+        (shade * block.overlay[2]).clamp(0.0, 1.0),
+        block.overlay[3].clamp(0.0, 1.0),
+    ];
     let tile = block.tiles[2];
     let rotation = block.rotations[2];
     let transparent_mode = block.transparent_mode[2];
@@ -2320,29 +2143,30 @@ fn emit_face_with_light<F>(
         [1.0; 4]
     };
     let emissive = (block.light_emission / 15.0).clamp(0.0, 1.0);
+    let overlay = block.overlay;
     let color0 = [
-        (light * ao[0]).max(emissive),
-        (light * ao[0]).max(emissive),
-        (light * ao[0]).max(emissive),
-        1.0,
+        ((light * ao[0]).max(emissive) * overlay[0]).clamp(0.0, 1.0),
+        ((light * ao[0]).max(emissive) * overlay[1]).clamp(0.0, 1.0),
+        ((light * ao[0]).max(emissive) * overlay[2]).clamp(0.0, 1.0),
+        overlay[3].clamp(0.0, 1.0),
     ];
     let color1 = [
-        (light * ao[1]).max(emissive),
-        (light * ao[1]).max(emissive),
-        (light * ao[1]).max(emissive),
-        1.0,
+        ((light * ao[1]).max(emissive) * overlay[0]).clamp(0.0, 1.0),
+        ((light * ao[1]).max(emissive) * overlay[1]).clamp(0.0, 1.0),
+        ((light * ao[1]).max(emissive) * overlay[2]).clamp(0.0, 1.0),
+        overlay[3].clamp(0.0, 1.0),
     ];
     let color2 = [
-        (light * ao[2]).max(emissive),
-        (light * ao[2]).max(emissive),
-        (light * ao[2]).max(emissive),
-        1.0,
+        ((light * ao[2]).max(emissive) * overlay[0]).clamp(0.0, 1.0),
+        ((light * ao[2]).max(emissive) * overlay[1]).clamp(0.0, 1.0),
+        ((light * ao[2]).max(emissive) * overlay[2]).clamp(0.0, 1.0),
+        overlay[3].clamp(0.0, 1.0),
     ];
     let color3 = [
-        (light * ao[3]).max(emissive),
-        (light * ao[3]).max(emissive),
-        (light * ao[3]).max(emissive),
-        1.0,
+        ((light * ao[3]).max(emissive) * overlay[0]).clamp(0.0, 1.0),
+        ((light * ao[3]).max(emissive) * overlay[1]).clamp(0.0, 1.0),
+        ((light * ao[3]).max(emissive) * overlay[2]).clamp(0.0, 1.0),
+        overlay[3].clamp(0.0, 1.0),
     ];
     let tile = block.tiles[face as usize];
     let rotation = block.rotations[face as usize];

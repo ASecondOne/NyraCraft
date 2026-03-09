@@ -3,7 +3,6 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fs;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -287,7 +286,14 @@ pub fn is_solid_cached(
     if world_gen.mode == WorldMode::Normal && !world_gen.in_world_bounds(x, z) {
         return true;
     }
-    block_is_collidable(block_id_full_cached(world_gen, height_cache, tree_cache, x, y, z))
+    block_is_collidable(block_id_full_cached(
+        world_gen,
+        height_cache,
+        tree_cache,
+        x,
+        y,
+        z,
+    ))
 }
 
 pub fn block_id_full_cached(
@@ -311,30 +317,28 @@ pub fn block_id_full_cached(
     }
 
     let ids = core_block_ids();
-    let max_leaf_r = 3;
-    for tz in (z - max_leaf_r)..=(z + max_leaf_r) {
-        for tx in (x - max_leaf_r)..=(x + max_leaf_r) {
-            let Some(tree) = tree_at_cached(world_gen, height_cache, tree_cache, tx, tz) else {
-                continue;
-            };
+    let (tree_candidates, candidate_count) = world_gen.tree_candidate_columns_near(x, z);
+    for &(tx, tz) in tree_candidates[..candidate_count].iter() {
+        let Some(tree) = tree_at_cached(world_gen, height_cache, tree_cache, tx, tz) else {
+            continue;
+        };
 
-            let trunk_end = tree.base_y + tree.trunk_h;
-            if x == tx && z == tz && y >= tree.base_y && y < trunk_end {
-                return ids.log;
-            }
+        let trunk_end = tree.base_y + tree.trunk_h;
+        if x == tx && z == tz && y >= tree.base_y && y < trunk_end {
+            return ids.log;
+        }
 
-            let dy = y - trunk_end;
-            if dy < -tree.leaf_r || dy > tree.leaf_r {
+        let dy = y - trunk_end;
+        if dy < -tree.leaf_r || dy > tree.leaf_r {
+            continue;
+        }
+        let dx = x - tx;
+        let dz = z - tz;
+        if dx * dx + dy * dy + dz * dz <= tree.leaf_r * tree.leaf_r {
+            if dx == 0 && dz == 0 && y >= tree.base_y && y < trunk_end {
                 continue;
             }
-            let dx = x - tx;
-            let dz = z - tz;
-            if dx * dx + dy * dy + dz * dz <= tree.leaf_r * tree.leaf_r {
-                if dx == 0 && dz == 0 && y >= tree.base_y && y < trunk_end {
-                    continue;
-                }
-                return ids.leaves;
-            }
+            return ids.leaves;
         }
     }
 
@@ -371,7 +375,7 @@ pub fn should_pack_far_lod(mode: MeshMode, step: i32) -> bool {
 pub fn mesh_cache_dir(world_id: u64) -> PathBuf {
     Path::new("target")
         .join("mesh_cache")
-        .join(format!("world_{world_id:016x}"))
+        .join(format!("world_{world_id:016x}_c{CHUNK_SIZE}"))
 }
 
 fn mesh_cache_path(dir: &Path, coord: IVec3, step: i32, mode: MeshMode) -> PathBuf {
@@ -666,8 +670,8 @@ fn pop_adaptive(state: &mut RequestQueueState) -> Option<RequestTask> {
             return Some(task);
         }
 
-        let should_take_far = far_len > 0
-            && (near_len == 0 || state.near_pop_streak >= NEAR_TO_FAR_POP_RATIO);
+        let should_take_far =
+            far_len > 0 && (near_len == 0 || state.near_pop_streak >= NEAR_TO_FAR_POP_RATIO);
         if should_take_far
             && let Some(task) =
                 pop_fresh_from_heap(&mut state.far_heap, &mut state.latest_task_by_chunk)
@@ -719,7 +723,10 @@ pub fn pop_edit_request(queue: &SharedRequestQueue) -> Option<RequestTask> {
                 closed,
                 ..
             } = &mut *state;
-            (pop_fresh_from_heap(edit_heap, latest_task_by_chunk), *closed)
+            (
+                pop_fresh_from_heap(edit_heap, latest_task_by_chunk),
+                *closed,
+            )
         };
         if let Some(task) = task_opt {
             state.near_pop_streak = 0;
@@ -804,11 +811,17 @@ fn near_inflight_cap(max_inflight: usize) -> usize {
     max_inflight.saturating_sub(reserve_for_lod).max(1)
 }
 
-fn for_each_chunk_y_top_down(
-    y_start: i32,
-    y_end: i32,
-    mut f: impl FnMut(i32) -> bool,
-) {
+fn far_inflight_cap(max_inflight: usize) -> usize {
+    if max_inflight <= 1 {
+        return max_inflight;
+    }
+    // Keep enough headroom for near chunks while moving.
+    (max_inflight * 2 / 5)
+        .clamp(64, 512)
+        .min(max_inflight.saturating_sub(1))
+}
+
+fn for_each_chunk_y_top_down(y_start: i32, y_end: i32, mut f: impl FnMut(i32) -> bool) {
     if y_start > y_end {
         return;
     }
@@ -957,16 +970,13 @@ pub struct PickHit {
 }
 
 fn lod_div(dist: i32, base: i32) -> i32 {
-    if dist <= base {
+    let base = base.max(1);
+    if dist <= base + (base / 2).max(2) {
         4
     } else if dist <= base * 2 {
         8
-    } else if dist <= base * 4 {
-        16
-    } else if dist <= base * 8 {
-        32
     } else {
-        64
+        16
     }
 }
 
@@ -1124,8 +1134,10 @@ fn submit_chunk_request(
 
 fn depth_for_dist(base_depth: i32, dist: i32) -> i32 {
     let mut depth = base_depth;
-    let tiers = dist / 16;
-    depth -= tiers * 3;
+    // Taper depth more gradually so mid-range columns do not collapse into
+    // a single thin shell while still reducing far-field work.
+    let tiers = dist / 24;
+    depth -= tiers;
     depth.clamp(2, base_depth)
 }
 
@@ -1338,96 +1350,6 @@ pub fn build_stats_lines(
     lines
 }
 
-#[allow(clippy::too_many_arguments, dead_code)]
-pub fn print_stats(
-    stats: &GpuStats,
-    loaded: &HashMap<(i32, i32, i32), i32>,
-    requested: &HashMap<(i32, i32, i32), i32>,
-    tps: u32,
-    fps: u32,
-    cpu_label: &str,
-    gpu_label: &str,
-    current_chunk: IVec3,
-    player_pos: Vec3,
-    world_time: Duration,
-    pause_stream: bool,
-    pause_render: bool,
-    base_render_radius: i32,
-    base_draw_radius: i32,
-    looked_block: Option<(IVec3, i8)>,
-    pregen_active: bool,
-    pregen_ring_r: i32,
-    pregen_radius_chunks: i32,
-    pregen_columns_done: usize,
-    pregen_total_columns: usize,
-    pregen_chunks_requested: usize,
-    pregen_chunks_created: usize,
-    pregen_est_chunks_total: usize,
-    loaded_chunk_cap: usize,
-    mesh_memory_cap_mb: usize,
-    held_item_id: Option<i8>,
-    active_break_strength: f32,
-    mining_target: Option<IVec3>,
-    mining_progress: f32,
-    dirty_pending: usize,
-    request_queue: RequestQueueStats,
-    perf: DebugPerfSnapshot,
-    adaptive_request_budget: i32,
-    adaptive_pregen_budget: i32,
-    adaptive_max_apply_per_tick: usize,
-    adaptive_max_rebuilds_per_tick: usize,
-    adaptive_draw_radius_cap: i32,
-    worker_count: usize,
-    thread_reports: &[String],
-) {
-    let lines = build_stats_lines(
-        stats,
-        loaded,
-        requested,
-        tps,
-        fps,
-        cpu_label,
-        gpu_label,
-        current_chunk,
-        player_pos,
-        world_time,
-        pause_stream,
-        pause_render,
-        base_render_radius,
-        base_draw_radius,
-        looked_block,
-        pregen_active,
-        pregen_ring_r,
-        pregen_radius_chunks,
-        pregen_columns_done,
-        pregen_total_columns,
-        pregen_chunks_requested,
-        pregen_chunks_created,
-        pregen_est_chunks_total,
-        loaded_chunk_cap,
-        mesh_memory_cap_mb,
-        held_item_id,
-        active_break_strength,
-        mining_target,
-        mining_progress,
-        dirty_pending,
-        request_queue,
-        perf,
-        adaptive_request_budget,
-        adaptive_pregen_budget,
-        adaptive_max_apply_per_tick,
-        adaptive_max_rebuilds_per_tick,
-        adaptive_draw_radius_cap,
-        worker_count,
-        thread_reports,
-    );
-    print!("\x1B[2J\x1B[H");
-    for line in lines {
-        println!("{line}");
-    }
-    let _ = io::stdout().flush();
-}
-
 fn progress_bar(fill: f32, width: usize) -> String {
     let fill = fill.clamp(0.0, 1.0);
     let filled = (fill * width as f32).round() as usize;
@@ -1616,7 +1538,10 @@ fn apply_worker_result(
                 mesh.vertices,
                 mesh.indices,
             );
-            (pack_lod(mesh.mode, mesh.step), ApplyWorkerOutcome::AppliedRaw)
+            (
+                pack_lod(mesh.mode, mesh.step),
+                ApplyWorkerOutcome::AppliedRaw,
+            )
         }
         WorkerResult::Packed { packed, .. } => {
             gpu.upsert_chunk_packed(
@@ -1939,16 +1864,22 @@ pub fn stream_tick(
         return;
     }
 
+    let near_cap = near_inflight_cap(max_inflight);
+    let near_full_cap = (near_cap.saturating_mul(3) / 4).max(1);
+    let far_cap = far_inflight_cap(max_inflight).max(1);
+    let mut near_inflight_used = count_near_requested(requested);
+    let mut far_inflight_used = requested.len().saturating_sub(near_inflight_used);
+
     if *pregen_active {
         // Keep headroom for near-player requests so far pregen cannot starve them.
-        let pregen_inflight_cap = near_inflight_cap(max_inflight);
+        let pregen_inflight_cap = far_cap;
         let mut budget = pregen_budget_per_tick.max(0);
         let pregen_lod = pack_lod(MeshMode::SurfaceOnly, 16);
         while budget > 0
             && *pregen_ring_r <= pregen_radius_chunks
             && stream_start.elapsed() < STREAM_REQUEST_TIME_BUDGET
         {
-            if requested.len() >= pregen_inflight_cap {
+            if far_inflight_used >= pregen_inflight_cap {
                 break;
             }
 
@@ -1972,7 +1903,7 @@ pub fn stream_tick(
             let y_end = surface_chunk_y + 1;
 
             for_each_chunk_y_top_down(y_start, y_end, |cy| {
-                if budget <= 0 || requested.len() >= pregen_inflight_cap {
+                if budget <= 0 || far_inflight_used >= pregen_inflight_cap {
                     return false;
                 }
                 let coord = (cx, cy, cz);
@@ -1981,7 +1912,7 @@ pub fn stream_tick(
                 let lod = pregen_lod;
                 if needs_chunk_request(requested, loaded, coord, lod) {
                     let was_requested = requested.contains_key(&coord);
-                    let _ = submit_chunk_request(
+                    let near_delta = submit_chunk_request(
                         req_queue,
                         requested,
                         player_pos,
@@ -1991,6 +1922,8 @@ pub fn stream_tick(
                         mode,
                         RequestClass::Far,
                     );
+                    near_inflight_used = (near_inflight_used as i32 + near_delta).max(0) as usize;
+                    far_inflight_used = requested.len().saturating_sub(near_inflight_used);
                     if !was_requested {
                         *pregen_chunks_requested += 1;
                     }
@@ -2004,20 +1937,16 @@ pub fn stream_tick(
             *pregen_active = false;
         }
     }
-
-    if requested.len() >= max_inflight {
+    if near_inflight_used >= near_cap && far_inflight_used >= far_cap {
         return;
     }
-
-    let near_cap = near_inflight_cap(max_inflight);
-    let mut near_inflight_used = count_near_requested(requested);
 
     let full_lod = pack_lod(MeshMode::Full, 1);
 
     // Safe columns around player are always requested first.
     'safe: for dz in -1..=1 {
         for dx in -1..=1 {
-            if near_inflight_used >= near_cap {
+            if near_inflight_used >= near_full_cap {
                 break 'safe;
             }
             let cx = current_chunk.x + dx;
@@ -2037,7 +1966,7 @@ pub fn stream_tick(
                 column_dist,
             );
             for_each_chunk_y_top_down(y_start, y_end, |dy| {
-                if near_inflight_used >= near_cap {
+                if near_inflight_used >= near_full_cap {
                     return false;
                 }
                 let coord = (cx, dy, cz);
@@ -2057,6 +1986,7 @@ pub fn stream_tick(
                         RequestClass::Near,
                     );
                     near_inflight_used = (near_inflight_used as i32 + near_delta).max(0) as usize;
+                    far_inflight_used = requested.len().saturating_sub(near_inflight_used);
                 }
                 true
             });
@@ -2070,7 +2000,7 @@ pub fn stream_tick(
                 if stream_start.elapsed() >= STREAM_REQUEST_TIME_BUDGET {
                     break 'emergency;
                 }
-                if count <= 0 || near_inflight_used >= near_cap {
+                if count <= 0 || near_inflight_used >= near_full_cap {
                     break 'emergency;
                 }
                 let cx = current_chunk.x + dx;
@@ -2090,7 +2020,7 @@ pub fn stream_tick(
                     column_dist,
                 );
                 for_each_chunk_y_top_down(y_start, y_end, |dy| {
-                    if count <= 0 || near_inflight_used >= near_cap {
+                    if count <= 0 || near_inflight_used >= near_full_cap {
                         return false;
                     }
                     let coord = (cx, dy, cz);
@@ -2111,11 +2041,12 @@ pub fn stream_tick(
                         );
                         near_inflight_used =
                             (near_inflight_used as i32 + near_delta).max(0) as usize;
+                        far_inflight_used = requested.len().saturating_sub(near_inflight_used);
                         count -= 1;
                     }
                     true
                 });
-                if count <= 0 || near_inflight_used >= near_cap {
+                if count <= 0 || near_inflight_used >= near_full_cap {
                     break 'emergency;
                 }
             }
@@ -2128,7 +2059,7 @@ pub fn stream_tick(
             if stream_start.elapsed() >= STREAM_REQUEST_TIME_BUDGET {
                 break;
             }
-            if near_inflight_used >= near_cap {
+            if near_inflight_used >= near_full_cap {
                 break 'burst;
             }
             let cx = current_chunk.x + dx;
@@ -2152,7 +2083,7 @@ pub fn stream_tick(
             );
 
             for_each_chunk_y_top_down(y_start, y_end, |dy| {
-                if near_inflight_used >= near_cap {
+                if near_inflight_used >= near_full_cap {
                     return false;
                 }
                 let coord = (cx, dy, cz);
@@ -2172,21 +2103,23 @@ pub fn stream_tick(
                         RequestClass::Near,
                     );
                     near_inflight_used = (near_inflight_used as i32 + near_delta).max(0) as usize;
+                    far_inflight_used = requested.len().saturating_sub(near_inflight_used);
                 }
                 true
             });
-            if near_inflight_used >= near_cap {
+            if near_inflight_used >= near_full_cap {
                 break 'burst;
             }
         }
     }
 
     let mut budget = budget;
+    let sides_step2_limit = lod_mid_radius.saturating_sub(2).max(lod_near_radius + 1);
     while budget > 0
         && *ring_r <= stream_radius
         && stream_start.elapsed() < STREAM_REQUEST_TIME_BUDGET
     {
-        if requested.len() >= max_inflight {
+        if near_inflight_used >= near_cap && far_inflight_used >= far_cap {
             return;
         }
         let (dx, dz) = ring_coord(*ring_r, *ring_i);
@@ -2207,6 +2140,12 @@ pub fn stream_tick(
         if column_dist > stream_radius {
             continue;
         }
+        // Keep checkerboard thinning as an emergency relief valve only when far
+        // requests are already saturated; always keep full columns in mid-range.
+        let far_checkerboard_pressure = far_inflight_used.saturating_mul(100) >= far_cap * 85;
+        if far_checkerboard_pressure && column_dist > lod_mid_radius * 3 && ((cx + cz) & 1) != 0 {
+            continue;
+        }
         let surface_y = max_height_cached(cx, cz);
         let surface_chunk_y = world_y_to_chunk_y(surface_y);
         let (y_start, y_end) = column_stream_y_range(
@@ -2221,9 +2160,6 @@ pub fn stream_tick(
                 return false;
             }
             let coord = (cx, dy, cz);
-            if column_dist > lod_mid_radius * 2 && ((cx + cz) & 1) != 0 {
-                return true;
-            }
             let mode = if column_dist <= lod_near_radius {
                 MeshMode::Full
             } else if column_dist <= lod_mid_radius {
@@ -2231,20 +2167,30 @@ pub fn stream_tick(
             } else {
                 MeshMode::SurfaceOnly
             };
-            let step = if mode == MeshMode::Full {
-                1
-            } else {
-                lod_div(column_dist, lod_mid_radius)
+            let step = match mode {
+                MeshMode::Full => 1,
+                MeshMode::SurfaceSides => {
+                    if column_dist <= sides_step2_limit {
+                        2
+                    } else {
+                        4
+                    }
+                }
+                MeshMode::SurfaceOnly => lod_div(column_dist, lod_mid_radius),
             };
             let lod = pack_lod(mode, step);
             let key = coord;
             let can_submit = if lod_is_near(mode) {
                 near_inflight_used < near_cap
             } else {
-                requested.len() < max_inflight
+                far_inflight_used < far_cap
             };
             if !can_submit {
-                // Keep scanning rings so cursor can advance into non-full LOD territory.
+                // Skip saturated classes but continue scanning rings so far preview LOD
+                // can still progress while near/full requests are draining.
+                if lod_is_near(mode) {
+                    return false;
+                }
                 return true;
             }
             if needs_chunk_request_with_policy(requested, loaded, key, lod, true) {
@@ -2264,14 +2210,15 @@ pub fn stream_tick(
                     class,
                 );
                 near_inflight_used = (near_inflight_used as i32 + near_delta).max(0) as usize;
+                far_inflight_used = requested.len().saturating_sub(near_inflight_used);
                 budget -= 1;
-                if requested.len() >= max_inflight {
+                if near_inflight_used >= near_cap && far_inflight_used >= far_cap {
                     return false;
                 }
             }
             true
         });
-        if budget <= 0 || requested.len() >= max_inflight {
+        if budget <= 0 || (near_inflight_used >= near_cap && far_inflight_used >= far_cap) {
             return;
         }
 
@@ -2302,4 +2249,37 @@ pub fn stream_tick(
     }
 
     // no super chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CHUNK_SIZE, lod_div};
+
+    #[test]
+    fn surface_only_lod_step_stays_within_chunk_size() {
+        for base in [1, 4, 8, 16, 24, 32] {
+            for dist in 0..=(base * 8) {
+                let step = lod_div(dist, base);
+                assert!(step >= 4, "step should stay coarse in surface-only mode");
+                assert!(
+                    step <= CHUNK_SIZE,
+                    "step={step} must not exceed chunk size={CHUNK_SIZE}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn surface_only_lod_step_is_monotonic() {
+        let base = 24;
+        let mut prev = lod_div(0, base);
+        for dist in 1..=(base * 8) {
+            let step = lod_div(dist, base);
+            assert!(
+                step >= prev,
+                "step regressed at dist={dist}: {step} < {prev}"
+            );
+            prev = step;
+        }
+    }
 }

@@ -1,4 +1,5 @@
 use glam::{IVec3, Vec3};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::player::inventory::{InventoryState, ItemStack};
@@ -23,6 +24,16 @@ pub struct DroppedItem {
     despawn_timer: f32,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct SavedDroppedItem {
+    pub position: [f32; 3],
+    pub velocity: [f32; 3],
+    pub stack: ItemStack,
+    pub pickup_delay: f32,
+    pub spin_phase: f32,
+    pub despawn_timer: f32,
+}
+
 fn spawn_dropped_item(
     dropped_items: &mut Vec<DroppedItem>,
     position: Vec3,
@@ -41,6 +52,39 @@ fn spawn_dropped_item(
         spin_phase: rand::random::<f32>() * std::f32::consts::TAU,
         despawn_timer: DROPPED_ITEM_DESPAWN_SECS,
     });
+}
+
+pub fn snapshot_dropped_items(dropped_items: &[DroppedItem]) -> Vec<SavedDroppedItem> {
+    dropped_items
+        .iter()
+        .take(MAX_ACTIVE_DROPPED_ITEMS)
+        .map(|drop| SavedDroppedItem {
+            position: drop.position.to_array(),
+            velocity: drop.velocity.to_array(),
+            stack: drop.stack,
+            pickup_delay: drop.pickup_delay.max(0.0),
+            spin_phase: drop.spin_phase,
+            despawn_timer: drop.despawn_timer.max(0.0),
+        })
+        .collect()
+}
+
+pub fn restore_dropped_items(saved_items: &[SavedDroppedItem]) -> Vec<DroppedItem> {
+    let mut dropped_items = Vec::with_capacity(saved_items.len().min(MAX_ACTIVE_DROPPED_ITEMS));
+    for saved in saved_items.iter().take(MAX_ACTIVE_DROPPED_ITEMS) {
+        if saved.stack.count == 0 {
+            continue;
+        }
+        dropped_items.push(DroppedItem {
+            position: Vec3::from_array(saved.position),
+            velocity: Vec3::from_array(saved.velocity),
+            stack: saved.stack,
+            pickup_delay: saved.pickup_delay.max(0.0),
+            spin_phase: saved.spin_phase,
+            despawn_timer: saved.despawn_timer.clamp(0.0, DROPPED_ITEM_DESPAWN_SECS),
+        });
+    }
+    dropped_items
 }
 
 fn drop_cell(position: Vec3) -> IVec3 {

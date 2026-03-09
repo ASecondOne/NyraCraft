@@ -10,6 +10,7 @@ use crate::app::streaming::{
 };
 use crate::world::CHUNK_SIZE;
 use crate::world::blocks::{core_block_ids, parse_block_id};
+use crate::world::lightengine::is_emissive_block;
 use crate::world::worldgen::WorldGen;
 
 type CoordKey = (i32, i32, i32);
@@ -51,6 +52,8 @@ enum LeafDecayAction {
 pub struct EditedBlockStore {
     by_block: HashMap<CoordKey, i8>,
     by_chunk: HashMap<ChunkKey, HashMap<CoordKey, i8>>,
+    emissive_by_chunk: HashMap<ChunkKey, usize>,
+    emissive_total: usize,
 }
 
 pub type EditedBlocks = Arc<RwLock<EditedBlockStore>>;
@@ -85,6 +88,28 @@ pub struct LeafDecayStats {
     pub break_pending: usize,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct SavedLeafDecayPos {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct SavedLeafDecayBreak {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub ready_tick: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SavedLeafDecayState {
+    pub tick: u64,
+    pub check_queue: Vec<SavedLeafDecayPos>,
+    pub break_queue: Vec<SavedLeafDecayBreak>,
+}
+
 pub fn new_edited_blocks() -> EditedBlocks {
     Arc::new(RwLock::new(EditedBlockStore::default()))
 }
@@ -95,6 +120,69 @@ pub fn new_leaf_decay_queue() -> LeafDecayQueue {
 
 pub fn leaf_decay_stats(leaf_decay_queue: &LeafDecayQueue) -> LeafDecayStats {
     let state = leaf_decay_queue.lock().unwrap();
+    LeafDecayStats {
+        tick: state.tick,
+        check_queue: state.check_queue.len(),
+        break_queue: state.break_queue.len(),
+        check_pending: state.check_pending.len(),
+        break_pending: state.break_pending.len(),
+    }
+}
+
+pub fn snapshot_leaf_decay_state(leaf_decay_queue: &LeafDecayQueue) -> SavedLeafDecayState {
+    let state = leaf_decay_queue.lock().unwrap();
+    SavedLeafDecayState {
+        tick: state.tick,
+        check_queue: state
+            .check_queue
+            .iter()
+            .map(|pos| SavedLeafDecayPos {
+                x: pos.x,
+                y: pos.y,
+                z: pos.z,
+            })
+            .collect(),
+        break_queue: state
+            .break_queue
+            .iter()
+            .map(|scheduled| SavedLeafDecayBreak {
+                x: scheduled.pos.x,
+                y: scheduled.pos.y,
+                z: scheduled.pos.z,
+                ready_tick: scheduled.ready_tick,
+            })
+            .collect(),
+    }
+}
+
+pub fn restore_leaf_decay_state(
+    leaf_decay_queue: &LeafDecayQueue,
+    saved_state: &SavedLeafDecayState,
+) -> LeafDecayStats {
+    let mut state = leaf_decay_queue.lock().unwrap();
+    state.tick = saved_state.tick;
+    state.check_queue.clear();
+    state.check_pending.clear();
+    state.break_queue.clear();
+    state.break_pending.clear();
+
+    for entry in &saved_state.check_queue {
+        let pos = IVec3::new(entry.x, entry.y, entry.z);
+        let key = (entry.x, entry.y, entry.z);
+        if state.check_pending.insert(key) {
+            state.check_queue.push_back(pos);
+        }
+    }
+    for saved_break in &saved_state.break_queue {
+        let pos = IVec3::new(saved_break.x, saved_break.y, saved_break.z);
+        let key = (saved_break.x, saved_break.y, saved_break.z);
+        if state.break_pending.insert(key) {
+            state.break_queue.push_back(ScheduledLeafBreak {
+                pos,
+                ready_tick: saved_break.ready_tick.max(saved_state.tick),
+            });
+        }
+    }
     LeafDecayStats {
         tick: state.tick,
         check_queue: state.check_queue.len(),
@@ -115,12 +203,14 @@ impl EditedBlockStore {
 
     pub fn set(&mut self, x: i32, y: i32, z: i32, id: i8) {
         let key = (x, y, z);
-        self.by_block.insert(key, id);
         let chunk = world_to_chunk_coord(IVec3::new(x, y, z));
+        let chunk_key = (chunk.x, chunk.y, chunk.z);
+        let prev_id = self.by_block.insert(key, id);
         self.by_chunk
             .entry((chunk.x, chunk.y, chunk.z))
             .or_default()
             .insert(key, id);
+        self.update_emissive_index(chunk_key, prev_id, id);
     }
 
     pub fn collect_chunk_halo(&self, center: IVec3, halo: i32) -> HashMap<CoordKey, i8> {
@@ -156,6 +246,57 @@ impl EditedBlockStore {
         false
     }
 
+    pub fn collect_emissive_sources_near(
+        &self,
+        center: Vec3,
+        radius_blocks: i32,
+    ) -> Vec<(IVec3, i8)> {
+        if self.emissive_total == 0 {
+            return Vec::new();
+        }
+
+        let radius = radius_blocks.max(0);
+        let center_block = IVec3::new(
+            center.x.floor() as i32,
+            center.y.floor() as i32,
+            center.z.floor() as i32,
+        );
+        let min_chunk = world_to_chunk_coord(center_block - IVec3::splat(radius));
+        let max_chunk = world_to_chunk_coord(center_block + IVec3::splat(radius));
+        let radius_sq = (radius * radius) as f32;
+        let mut out = Vec::new();
+
+        for cz in min_chunk.z..=max_chunk.z {
+            for cy in min_chunk.y..=max_chunk.y {
+                for cx in min_chunk.x..=max_chunk.x {
+                    let chunk_key = (cx, cy, cz);
+                    let emissive_in_chunk =
+                        self.emissive_by_chunk.get(&chunk_key).copied().unwrap_or(0);
+                    if emissive_in_chunk == 0 {
+                        continue;
+                    }
+                    let Some(chunk_map) = self.by_chunk.get(&chunk_key) else {
+                        continue;
+                    };
+                    out.reserve(emissive_in_chunk);
+                    for (&(x, y, z), &id) in chunk_map {
+                        if !is_emissive_block(id) {
+                            continue;
+                        }
+                        let dx = x as f32 + 0.5 - center.x;
+                        let dy = y as f32 + 0.5 - center.y;
+                        let dz = z as f32 + 0.5 - center.z;
+                        if dx * dx + dy * dy + dz * dz <= radius_sq {
+                            out.push((IVec3::new(x, y, z), id));
+                        }
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
     pub fn chunk_override_y_range(&self, coord: IVec3) -> Option<(i32, i32)> {
         let chunk = self.by_chunk.get(&(coord.x, coord.y, coord.z))?;
         let mut min_y = i32::MAX;
@@ -183,8 +324,34 @@ impl EditedBlockStore {
     pub fn replace_entries(&mut self, entries: &[EditedBlockEntry]) {
         self.by_block.clear();
         self.by_chunk.clear();
+        self.emissive_by_chunk.clear();
+        self.emissive_total = 0;
         for entry in entries {
             self.set(entry.x, entry.y, entry.z, entry.id);
+        }
+    }
+
+    fn update_emissive_index(&mut self, chunk_key: ChunkKey, prev_id: Option<i8>, new_id: i8) {
+        let prev_emissive = prev_id.is_some_and(is_emissive_block);
+        let new_emissive = is_emissive_block(new_id);
+
+        if prev_emissive == new_emissive {
+            return;
+        }
+
+        if prev_emissive {
+            self.emissive_total = self.emissive_total.saturating_sub(1);
+            if let Some(count) = self.emissive_by_chunk.get_mut(&chunk_key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.emissive_by_chunk.remove(&chunk_key);
+                }
+            }
+        }
+
+        if new_emissive {
+            self.emissive_total = self.emissive_total.saturating_add(1);
+            *self.emissive_by_chunk.entry(chunk_key).or_insert(0) += 1;
         }
     }
 }
@@ -201,12 +368,24 @@ pub fn restore_loaded_edit_metadata(
     }
 
     let mut ranges = HashMap::<ChunkKey, (i32, i32)>::new();
+    let mut dirty_neighbors = HashSet::<ChunkKey>::new();
     for entry in &entries {
         let coord = world_to_chunk_coord(IVec3::new(entry.x, entry.y, entry.z));
         let key = (coord.x, coord.y, coord.z);
         let range = ranges.entry(key).or_insert((entry.y, entry.y));
         range.0 = range.0.min(entry.y);
         range.1 = range.1.max(entry.y);
+        if is_emissive_block(entry.id) {
+            for oy in -1..=1 {
+                for oz in -1..=1 {
+                    for ox in -1..=1 {
+                        dirty_neighbors.insert((coord.x + ox, coord.y + oy, coord.z + oz));
+                    }
+                }
+            }
+        } else {
+            dirty_neighbors.insert(key);
+        }
     }
 
     {
@@ -216,14 +395,14 @@ pub fn restore_loaded_edit_metadata(
     }
     {
         let mut dirty = dirty_chunks.lock().unwrap();
-        for key in ranges.keys() {
+        for key in dirty_neighbors {
             let next_rev = dirty
-                .get(key)
+                .get(&key)
                 .copied()
                 .unwrap_or(0)
                 .abs()
                 .saturating_add(1);
-            dirty.insert(*key, next_rev);
+            dirty.insert(key, next_rev);
         }
     }
 
@@ -308,13 +487,14 @@ pub fn handle_block_mouse_input(
                     place_block_id,
                 );
                 mark_edited_chunk_range(edited_chunk_ranges, place_block);
+                let emissive = is_emissive_block(place_block_id);
                 invalidate_block_edit(
                     dirty_chunks,
                     request_queue,
                     place_block,
                     false,
                     false,
-                    false,
+                    emissive,
                 );
                 result.placed.push((place_block, place_block_id));
                 if place_block_id == core_ids.leaves
@@ -392,8 +572,14 @@ pub fn break_blocks_batch(
 
     mark_edited_chunk_ranges(edited_chunk_ranges, &broken_blocks);
     let mut non_tree_blocks = Vec::<IVec3>::new();
-    for &block in &broken_blocks {
-        if !tree_like_set.contains(&(block.x, block.y, block.z)) {
+    let mut non_tree_emissive_blocks = Vec::<IVec3>::new();
+    for &(block, id) in &result.broke {
+        if tree_like_set.contains(&(block.x, block.y, block.z)) {
+            continue;
+        }
+        if is_emissive_block(id) {
+            non_tree_emissive_blocks.push(block);
+        } else {
             non_tree_blocks.push(block);
         }
     }
@@ -405,6 +591,16 @@ pub fn break_blocks_batch(
             false,
             false,
             false,
+        );
+    }
+    if !non_tree_emissive_blocks.is_empty() {
+        invalidate_block_edits(
+            dirty_chunks,
+            request_queue,
+            &non_tree_emissive_blocks,
+            false,
+            false,
+            true,
         );
     }
     if !tree_like_blocks.is_empty() {
@@ -434,7 +630,7 @@ pub fn tick_leaf_decay(
 ) -> Option<IVec3> {
     let core_ids = core_block_ids();
     match pop_leaf_decay_action(leaf_decay_queue) {
-        LeafDecayAction::None => return None,
+        LeafDecayAction::None => None,
         LeafDecayAction::Check(candidate) => {
             if block_id_with_edits(
                 world_gen,

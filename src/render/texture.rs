@@ -15,6 +15,28 @@ pub struct SampledTexture {
     pub sampler: wgpu::Sampler,
 }
 
+#[derive(Clone, Copy)]
+pub struct UvRect {
+    pub min: [f32; 2],
+    pub max: [f32; 2],
+}
+
+impl UvRect {
+    fn full() -> Self {
+        Self {
+            min: [0.0, 0.0],
+            max: [1.0, 1.0],
+        }
+    }
+}
+
+pub struct CelestialTexture {
+    pub view: wgpu::TextureView,
+    pub sampler: wgpu::Sampler,
+    pub sun_uv: UvRect,
+    pub moon_phase_uvs: [UvRect; 8],
+}
+
 fn aligned_bytes_per_row(width: u32) -> u32 {
     let raw = width * 4;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -174,7 +196,7 @@ pub fn load_grass_colormap_texture(device: &wgpu::Device, queue: &wgpu::Queue) -
 
 pub fn load_player_skin_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> SampledTexture {
     let candidate_paths = [
-        PathBuf::from("src/texturing/steve.png"),
+        PathBuf::from("src/texturing/generel_textures/steve.png"),
         PathBuf::from("src/texturing/player_skin.png"),
     ];
     for path in candidate_paths {
@@ -223,5 +245,99 @@ pub fn create_dummy_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> Atlas
         sampler: sampled.sampler,
         tiles_x: 1,
         tile_uv_size: [1.0, 1.0],
+    }
+}
+
+fn load_first_rgba(paths: &[PathBuf]) -> Option<RgbaImage> {
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        match image::open(path) {
+            Ok(img) => return Some(img.to_rgba8()),
+            Err(e) => eprintln!("failed to open texture {}: {e}", path.display()),
+        }
+    }
+    None
+}
+
+pub fn load_celestial_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> CelestialTexture {
+    let sun_paths = [
+        PathBuf::from("src/texturing/generel_textures/sun.png"),
+        PathBuf::from("src/texturing/generel_textures/sun_vv.png"),
+        PathBuf::from("src/texturing/generel_textures/sun_vv.png.png"),
+    ];
+    let moon_paths = [PathBuf::from(
+        "src/texturing/generel_textures/moon_phases.png",
+    )];
+
+    let sun = load_first_rgba(&sun_paths)
+        .unwrap_or_else(|| image::RgbaImage::from_pixel(32, 32, image::Rgba([255, 255, 255, 255])));
+    let moon = load_first_rgba(&moon_paths);
+
+    let mut sun_uv = UvRect::full();
+    let mut moon_phase_uvs = [UvRect::full(); 8];
+
+    let atlas = if let Some(moon_img) = moon {
+        let sun_w = sun.width().max(1);
+        let sun_h = sun.height().max(1);
+        let moon_w = moon_img.width().max(1);
+        let moon_h = moon_img.height().max(1);
+        let atlas_w = sun_w + moon_w;
+        let atlas_h = sun_h.max(moon_h);
+
+        let mut atlas = image::RgbaImage::from_pixel(atlas_w, atlas_h, image::Rgba([0, 0, 0, 0]));
+        image::imageops::overlay(&mut atlas, &sun, 0, 0);
+        image::imageops::overlay(&mut atlas, &moon_img, sun_w as i64, 0);
+
+        sun_uv = UvRect {
+            min: [0.0, 0.0],
+            max: [sun_w as f32 / atlas_w as f32, sun_h as f32 / atlas_h as f32],
+        };
+
+        let mut tile_size = 32_u32;
+        if moon_w % 4 == 0 && moon_h % 2 == 0 {
+            let tw = moon_w / 4;
+            let th = moon_h / 2;
+            if tw == th && tw > 0 {
+                tile_size = tw;
+            }
+        }
+        tile_size = tile_size.max(1).min(moon_w.max(1)).min(moon_h.max(1));
+        let tiles_x = (moon_w / tile_size).max(1);
+        let tiles_y = (moon_h / tile_size).max(1);
+        let phase_tiles = (tiles_x * tiles_y).max(1) as usize;
+        for phase in 0..8 {
+            let tile_idx = phase % phase_tiles;
+            let tx = (tile_idx as u32) % tiles_x;
+            let ty = (tile_idx as u32) / tiles_x;
+            let x0 = sun_w + tx * tile_size;
+            let y0 = ty * tile_size;
+            let x1 = sun_w + ((tx + 1) * tile_size).min(moon_w);
+            let y1 = ((ty + 1) * tile_size).min(moon_h);
+            moon_phase_uvs[phase] = UvRect {
+                min: [x0 as f32 / atlas_w as f32, y0 as f32 / atlas_h as f32],
+                max: [x1 as f32 / atlas_w as f32, y1 as f32 / atlas_h as f32],
+            };
+        }
+
+        atlas
+    } else {
+        sun
+    };
+
+    let sampled = create_texture_from_rgba(
+        device,
+        queue,
+        "celestial_texture",
+        &atlas,
+        wgpu::FilterMode::Linear,
+    );
+
+    CelestialTexture {
+        view: sampled.view,
+        sampler: sampled.sampler,
+        sun_uv,
+        moon_phase_uvs,
     }
 }
