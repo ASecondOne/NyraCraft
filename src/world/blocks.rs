@@ -1803,7 +1803,7 @@ pub fn parse_item_id(name_or_id: &str) -> Option<i8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_block_id, parse_item_id, placeable_item_id_for_block};
+    use super::{block_texture_by_id, parse_block_id, parse_item_id, placeable_item_id_for_block};
 
     #[test]
     fn namespaced_variant_block_and_item_lookup_work() {
@@ -1819,5 +1819,24 @@ mod tests {
         let expected_item = placeable_item_id_for_block(red_variant)
             .expect("variant block should be placeable via generated item");
         assert_eq!(red_item, expected_item);
+    }
+
+    #[test]
+    fn glass_variants_keep_distinct_overlay_tints() {
+        let clear = block_texture_by_id(parse_block_id("1:13").expect("base glass should exist"))
+            .expect("base glass texture should exist")
+            .overlay;
+        let red = block_texture_by_id(parse_block_id("1:13:1").expect("red glass should exist"))
+            .expect("red glass texture should exist")
+            .overlay;
+        let cyan = block_texture_by_id(parse_block_id("1:13:6").expect("cyan glass should exist"))
+            .expect("cyan glass texture should exist")
+            .overlay;
+
+        assert_eq!(clear, [1.0, 1.0, 1.0, 1.0]);
+        assert!(red[0] > red[1] && red[0] > red[2]);
+        assert!(cyan[2] > cyan[0] && cyan[1] > red[1]);
+        assert_ne!(red, clear);
+        assert_ne!(cyan, clear);
     }
 }

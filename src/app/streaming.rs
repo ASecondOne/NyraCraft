@@ -369,7 +369,7 @@ fn ring_coord(r: i32, i: i32) -> (i32, i32) {
 }
 
 pub fn should_pack_far_lod(mode: MeshMode, step: i32) -> bool {
-    mode == MeshMode::SurfaceOnly || step >= 6
+    mode != MeshMode::Full || step >= 6
 }
 
 pub fn mesh_cache_dir(world_id: u64) -> PathBuf {

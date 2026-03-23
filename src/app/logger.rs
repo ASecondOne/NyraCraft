@@ -45,12 +45,16 @@ fn with_logger_line(level: &str, message: &str) {
     match logger.file.lock() {
         Ok(mut file) => {
             let _ = file.write_all(line.as_bytes());
-            let _ = file.flush();
+            if matches!(level, "WARN" | "CRASH") {
+                let _ = file.flush();
+            }
         }
         Err(poisoned) => {
             let mut file = poisoned.into_inner();
             let _ = file.write_all(line.as_bytes());
-            let _ = file.flush();
+            if matches!(level, "WARN" | "CRASH") {
+                let _ = file.flush();
+            }
         }
     }
 }

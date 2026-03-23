@@ -78,7 +78,8 @@ const DIRTY_EDIT_CHUNK_HALO: i32 = 1;
 const HAND_BREAK_STRENGTH: f32 = 1.0;
 const CHAT_HIDE_DELAY: Duration = Duration::from_secs(10);
 const MULTI_BREAK_MAX_BLOCKS: usize = 12;
-const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(2);
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(10);
+const RUNTIME_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 fn ema_ms(previous: f32, sample_ms: f32) -> f32 {
     if previous <= 0.001 {
@@ -1771,7 +1772,7 @@ fn main() {
                     stats_overlay_lines.clear();
                 }
 
-                if last_runtime_log.elapsed() >= Duration::from_secs(1) {
+                if last_runtime_log.elapsed() >= RUNTIME_LOG_INTERVAL {
                     let req_stats = request_queue_stats(&request_queue);
                     let gpu_stats = gpu.stats();
                     let leaf_stats = leaf_decay_stats(&leaf_decay_queue);
