@@ -1818,18 +1818,27 @@ impl Gpu {
                     let db = (gpu.super_chunks[b].center - camera.position).length_squared();
                     da.total_cmp(&db)
                 });
-                let mut visible_index_sum = 0_u64;
+                let mut visible_geometry_sum = 0_u64;
                 let mut kept = 0_usize;
                 gpu.visible_supers.retain(|coord| {
-                    let indices = gpu
+                    let effective_geometry = gpu
                         .super_chunks
                         .get(coord)
-                        .map(|chunk| chunk.raw_index_count as u64 + chunk.packed_index_count as u64)
+                        .map(|chunk| {
+                            let raw_indices = chunk.raw_index_count as u64;
+                            let packed_indices = chunk.packed_index_count as u64;
+                            raw_indices.saturating_add(
+                                packed_indices.saturating_mul(PACKED_INDEX_COST_NUM)
+                                    / PACKED_INDEX_COST_DEN,
+                            )
+                        })
                         .unwrap_or(0);
                     if kept < MIN_VISIBLE_SUPERS
-                        || visible_index_sum.saturating_add(indices) <= MAX_VISIBLE_INDICES_BUDGET
+                        || visible_geometry_sum.saturating_add(effective_geometry)
+                            <= visible_geometry_budget
                     {
-                        visible_index_sum = visible_index_sum.saturating_add(indices);
+                        visible_geometry_sum =
+                            visible_geometry_sum.saturating_add(effective_geometry);
                         kept += 1;
                         true
                     } else {
