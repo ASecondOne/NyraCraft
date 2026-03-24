@@ -248,17 +248,51 @@ pub fn create_dummy_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> Atlas
     }
 }
 
-fn load_first_rgba(paths: &[PathBuf]) -> Option<RgbaImage> {
+fn rgba_has_transparency(rgba: &RgbaImage) -> bool {
+    rgba.pixels().any(|pixel| pixel[3] < 255)
+}
+
+fn punch_out_dark_background(rgba: &mut RgbaImage) {
+    const FULL_CUT_THRESHOLD: u8 = 10;
+    const SOFT_EDGE_THRESHOLD: u8 = 32;
+
+    for pixel in rgba.pixels_mut() {
+        if pixel[3] == 0 {
+            continue;
+        }
+        let max_rgb = pixel[0].max(pixel[1]).max(pixel[2]);
+        if max_rgb <= FULL_CUT_THRESHOLD {
+            pixel[3] = 0;
+            continue;
+        }
+        if max_rgb < SOFT_EDGE_THRESHOLD {
+            let keep = (max_rgb - FULL_CUT_THRESHOLD) as f32
+                / (SOFT_EDGE_THRESHOLD - FULL_CUT_THRESHOLD) as f32;
+            pixel[3] = ((pixel[3] as f32) * keep.clamp(0.0, 1.0)).round() as u8;
+        }
+    }
+}
+
+fn load_best_rgba(paths: &[PathBuf], prefer_alpha: bool) -> Option<RgbaImage> {
+    let mut fallback = None;
     for path in paths {
         if !path.exists() {
             continue;
         }
         match image::open(path) {
-            Ok(img) => return Some(img.to_rgba8()),
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                if prefer_alpha && rgba_has_transparency(&rgba) {
+                    return Some(rgba);
+                }
+                if fallback.is_none() {
+                    fallback = Some(rgba);
+                }
+            }
             Err(e) => eprintln!("failed to open texture {}: {e}", path.display()),
         }
     }
-    None
+    fallback
 }
 
 pub fn load_celestial_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> CelestialTexture {
@@ -271,9 +305,17 @@ pub fn load_celestial_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> Cel
         "src/texturing/generel_textures/moon_phases.png",
     )];
 
-    let sun = load_first_rgba(&sun_paths)
+    let mut sun = load_best_rgba(&sun_paths, true)
         .unwrap_or_else(|| image::RgbaImage::from_pixel(32, 32, image::Rgba([255, 255, 255, 255])));
-    let moon = load_first_rgba(&moon_paths);
+    if !rgba_has_transparency(&sun) {
+        punch_out_dark_background(&mut sun);
+    }
+    let mut moon = load_best_rgba(&moon_paths, true);
+    if let Some(moon_img) = moon.as_mut()
+        && !rgba_has_transparency(moon_img)
+    {
+        punch_out_dark_background(moon_img);
+    }
 
     let mut sun_uv = UvRect::full();
     let mut moon_phase_uvs = [UvRect::full(); 8];
@@ -339,5 +381,33 @@ pub fn load_celestial_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> Cel
         sampler: sampled.sampler,
         sun_uv,
         moon_phase_uvs,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{punch_out_dark_background, rgba_has_transparency};
+    use image::{Rgba, RgbaImage};
+
+    #[test]
+    fn punch_out_dark_background_removes_black_matte() {
+        let mut rgba = RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 255]));
+        rgba.put_pixel(1, 1, Rgba([255, 225, 96, 255]));
+        rgba.put_pixel(2, 2, Rgba([20, 20, 20, 255]));
+
+        punch_out_dark_background(&mut rgba);
+
+        assert_eq!(rgba.get_pixel(0, 0)[3], 0);
+        assert_eq!(rgba.get_pixel(1, 1)[3], 255);
+        assert!(rgba.get_pixel(2, 2)[3] > 0);
+        assert!(rgba.get_pixel(2, 2)[3] < 255);
+    }
+
+    #[test]
+    fn transparency_detection_finds_existing_alpha() {
+        let mut rgba = RgbaImage::from_pixel(2, 2, Rgba([255, 255, 255, 255]));
+        assert!(!rgba_has_transparency(&rgba));
+        rgba.put_pixel(1, 1, Rgba([255, 255, 255, 0]));
+        assert!(rgba_has_transparency(&rgba));
     }
 }

@@ -221,7 +221,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     })?;
     fs::create_dir_all(parent)?;
 
-    let data = serde_json::to_vec_pretty(value).map_err(|err| {
+    let data = serde_json::to_vec(value).map_err(|err| {
         io::Error::new(
             ErrorKind::InvalidData,
             format!("failed to serialize {}: {err}", path.display()),

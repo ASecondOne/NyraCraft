@@ -1642,6 +1642,7 @@ impl Gpu {
                         if let Some(index_buffer) = super_chunk.packed_index_buffer.as_ref() {
                             clear_chunk_slot(
                                 &gpu.queue,
+                                &mut gpu.staged_indices,
                                 index_buffer,
                                 &mut super_chunk.packed_slots,
                                 coord,
@@ -1653,6 +1654,7 @@ impl Gpu {
                     } else if let Some(index_buffer) = super_chunk.raw_index_buffer.as_ref() {
                         clear_chunk_slot(
                             &gpu.queue,
+                            &mut gpu.staged_indices,
                             index_buffer,
                             &mut super_chunk.raw_slots,
                             coord,
@@ -1714,28 +1716,30 @@ impl Gpu {
     pub fn update_visible(&mut self, camera: &Camera, draw_radius: i32) {
         self.cell.with_dependent_mut(|_, gpu| {
             const MAX_VISIBLE_SUPERS: usize = 2400;
-            const MAX_VISIBLE_INDICES_BUDGET: u64 = 14_000_000;
-            const MIN_VISIBLE_INDICES_BUDGET: u64 = 4_500_000;
+            const MAX_VISIBLE_GEOMETRY_BUDGET: u64 = 7_000_000;
+            const MIN_VISIBLE_GEOMETRY_BUDGET: u64 = 2_000_000;
             const BASE_DRAW_RADIUS_CHUNKS: f32 = 72.0;
-            const MIN_VISIBLE_SUPERS: usize = 24;
+            const MIN_VISIBLE_SUPERS: usize = 16;
+            const PACKED_INDEX_COST_NUM: u64 = 2;
+            const PACKED_INDEX_COST_DEN: u64 = 5;
             let draw_radius_chunks = draw_radius.max(16) as f32;
             let draw_radius = draw_radius_chunks * crate::world::CHUNK_SIZE as f32;
             let draw_radius_sq = draw_radius * draw_radius;
             let horizon_cutoff = draw_radius * 0.35;
             let horizon_cutoff_sq = horizon_cutoff * horizon_cutoff;
             let budget_scale = (draw_radius_chunks / BASE_DRAW_RADIUS_CHUNKS).clamp(0.70, 1.25);
-            let visible_indices_budget =
-                ((MAX_VISIBLE_INDICES_BUDGET as f32) * budget_scale.powf(0.85)).round() as u64;
-            let visible_indices_budget = visible_indices_budget
-                .clamp(MIN_VISIBLE_INDICES_BUDGET, MAX_VISIBLE_INDICES_BUDGET);
+            let visible_geometry_budget =
+                ((MAX_VISIBLE_GEOMETRY_BUDGET as f32) * budget_scale.powf(0.82)).round() as u64;
+            let visible_geometry_budget = visible_geometry_budget
+                .clamp(MIN_VISIBLE_GEOMETRY_BUDGET, MAX_VISIBLE_GEOMETRY_BUDGET);
             let camera_forward = if camera.forward.length_squared() > 1.0e-8 {
                 camera.forward.normalize()
             } else {
                 Vec3::new(0.0, 0.0, -1.0)
             };
-            let mut visible_candidates: Vec<(IVec3, f32, u64)> =
+            let mut visible_candidates: Vec<(IVec3, f32, u64, u64)> =
                 Vec::with_capacity(gpu.super_chunks.len());
-            let mut total_visible_indices = 0_u64;
+            let mut total_visible_geometry = 0_u64;
             for (coord, chunk) in &gpu.super_chunks {
                 let to_center = chunk.center - camera.position;
                 let dist_sq = to_center.length_squared();
@@ -1752,40 +1756,51 @@ impl Gpu {
                 if !chunk_visible(camera.position, camera_forward, chunk) {
                     continue;
                 }
-                let indices = chunk.raw_index_count as u64 + chunk.packed_index_count as u64;
-                total_visible_indices = total_visible_indices.saturating_add(indices);
-                visible_candidates.push((*coord, dist_sq, indices));
+                let raw_indices = chunk.raw_index_count as u64;
+                let packed_indices = chunk.packed_index_count as u64;
+                let effective_geometry = raw_indices.saturating_add(
+                    packed_indices.saturating_mul(PACKED_INDEX_COST_NUM) / PACKED_INDEX_COST_DEN,
+                );
+                total_visible_geometry = total_visible_geometry.saturating_add(effective_geometry);
+                visible_candidates.push((
+                    *coord,
+                    dist_sq,
+                    effective_geometry,
+                    raw_indices + packed_indices,
+                ));
             }
             if visible_candidates.len() > MAX_VISIBLE_SUPERS {
                 visible_candidates
                     .select_nth_unstable_by(MAX_VISIBLE_SUPERS, |a, b| a.1.total_cmp(&b.1));
                 visible_candidates.truncate(MAX_VISIBLE_SUPERS);
-                total_visible_indices = visible_candidates
+                total_visible_geometry = visible_candidates
                     .iter()
-                    .map(|(_, _, indices)| *indices)
+                    .map(|(_, _, effective_geometry, _)| *effective_geometry)
                     .sum();
             }
 
             gpu.visible_supers.clear();
             gpu.visible_supers.reserve(visible_candidates.len());
             if visible_candidates.len() > MIN_VISIBLE_SUPERS
-                && total_visible_indices > visible_indices_budget
+                && total_visible_geometry > visible_geometry_budget
             {
                 visible_candidates.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-                let mut visible_index_sum = 0_u64;
+                let mut visible_geometry_sum = 0_u64;
                 let mut kept = 0_usize;
-                for (coord, _dist_sq, indices) in visible_candidates {
+                for (coord, _dist_sq, effective_geometry, _indices) in visible_candidates {
                     if kept < MIN_VISIBLE_SUPERS
-                        || visible_index_sum.saturating_add(indices) <= visible_indices_budget
+                        || visible_geometry_sum.saturating_add(effective_geometry)
+                            <= visible_geometry_budget
                     {
-                        visible_index_sum = visible_index_sum.saturating_add(indices);
+                        visible_geometry_sum =
+                            visible_geometry_sum.saturating_add(effective_geometry);
                         kept += 1;
                         gpu.visible_supers.push(coord);
                     }
                 }
             } else {
                 gpu.visible_supers
-                    .extend(visible_candidates.into_iter().map(|(coord, _, _)| coord));
+                    .extend(visible_candidates.into_iter().map(|(coord, _, _, _)| coord));
             }
             if gpu.visible_supers.len() > MAX_VISIBLE_SUPERS {
                 let split = MAX_VISIBLE_SUPERS;
@@ -1803,18 +1818,27 @@ impl Gpu {
                     let db = (gpu.super_chunks[b].center - camera.position).length_squared();
                     da.total_cmp(&db)
                 });
-                let mut visible_index_sum = 0_u64;
+                let mut visible_geometry_sum = 0_u64;
                 let mut kept = 0_usize;
                 gpu.visible_supers.retain(|coord| {
-                    let indices = gpu
+                    let effective_geometry = gpu
                         .super_chunks
                         .get(coord)
-                        .map(|chunk| chunk.raw_index_count as u64 + chunk.packed_index_count as u64)
+                        .map(|chunk| {
+                            let raw_indices = chunk.raw_index_count as u64;
+                            let packed_indices = chunk.packed_index_count as u64;
+                            raw_indices.saturating_add(
+                                packed_indices.saturating_mul(PACKED_INDEX_COST_NUM)
+                                    / PACKED_INDEX_COST_DEN,
+                            )
+                        })
                         .unwrap_or(0);
                     if kept < MIN_VISIBLE_SUPERS
-                        || visible_index_sum.saturating_add(indices) <= MAX_VISIBLE_INDICES_BUDGET
+                        || visible_geometry_sum.saturating_add(effective_geometry)
+                            <= visible_geometry_budget
                     {
-                        visible_index_sum = visible_index_sum.saturating_add(indices);
+                        visible_geometry_sum =
+                            visible_geometry_sum.saturating_add(effective_geometry);
                         kept += 1;
                         true
                     } else {
@@ -4031,19 +4055,29 @@ fn push_block_icon_textured(
     let down_right = (center_x + half_w, center_y + depth);
 
     let select_boost = if selected { 1.08 } else { 1.0 };
-    let top_tint = [select_boost, select_boost, select_boost, 1.0];
-    let left_tint = [
-        0.88 * select_boost,
-        0.88 * select_boost,
-        0.88 * select_boost,
-        1.0,
-    ];
-    let right_tint = [
-        0.74 * select_boost,
-        0.74 * select_boost,
-        0.74 * select_boost,
-        1.0,
-    ];
+    let overlay_tint = block_overlay_tint(block_id);
+    let top_tint = modulate_color(
+        [select_boost, select_boost, select_boost, 1.0],
+        overlay_tint,
+    );
+    let left_tint = modulate_color(
+        [
+            0.88 * select_boost,
+            0.88 * select_boost,
+            0.88 * select_boost,
+            1.0,
+        ],
+        overlay_tint,
+    );
+    let right_tint = modulate_color(
+        [
+            0.74 * select_boost,
+            0.74 * select_boost,
+            0.74 * select_boost,
+            1.0,
+        ],
+        overlay_tint,
+    );
 
     push_ui_textured_quad(
         out,
@@ -4362,21 +4396,10 @@ fn block_icon_colors(block_id: i8) -> ([f32; 4], [f32; 4], [f32; 4]) {
             [0.4, 0.4, 0.4, 1.0],
         ),
     };
-    if let Some(tex) = block_texture_by_id(block_id) {
-        let tint = tex.overlay;
-        top[0] = (top[0] * tint[0]).clamp(0.0, 1.0);
-        top[1] = (top[1] * tint[1]).clamp(0.0, 1.0);
-        top[2] = (top[2] * tint[2]).clamp(0.0, 1.0);
-        top[3] = (top[3] * tint[3]).clamp(0.0, 1.0);
-        left[0] = (left[0] * tint[0]).clamp(0.0, 1.0);
-        left[1] = (left[1] * tint[1]).clamp(0.0, 1.0);
-        left[2] = (left[2] * tint[2]).clamp(0.0, 1.0);
-        left[3] = (left[3] * tint[3]).clamp(0.0, 1.0);
-        right[0] = (right[0] * tint[0]).clamp(0.0, 1.0);
-        right[1] = (right[1] * tint[1]).clamp(0.0, 1.0);
-        right[2] = (right[2] * tint[2]).clamp(0.0, 1.0);
-        right[3] = (right[3] * tint[3]).clamp(0.0, 1.0);
-    }
+    let tint = block_overlay_tint(block_id);
+    top = modulate_color(top, tint);
+    left = modulate_color(left, tint);
+    right = modulate_color(right, tint);
     (top, left, right)
 }
 
@@ -4385,6 +4408,21 @@ fn scale_color(mut color: [f32; 4], scale: f32) -> [f32; 4] {
     color[1] = (color[1] * scale).clamp(0.0, 1.0);
     color[2] = (color[2] * scale).clamp(0.0, 1.0);
     color
+}
+
+fn block_overlay_tint(block_id: i8) -> [f32; 4] {
+    block_texture_by_id(block_id)
+        .map(|tex| tex.overlay)
+        .unwrap_or([1.0, 1.0, 1.0, 1.0])
+}
+
+fn modulate_color(color: [f32; 4], tint: [f32; 4]) -> [f32; 4] {
+    [
+        (color[0] * tint[0]).clamp(0.0, 1.0),
+        (color[1] * tint[1]).clamp(0.0, 1.0),
+        (color[2] * tint[2]).clamp(0.0, 1.0),
+        (color[3] * tint[3]).clamp(0.0, 1.0),
+    ]
 }
 
 fn push_ui_quad(
@@ -5451,6 +5489,7 @@ fn schedule_superchunk_update(
             if let Some(index_buffer) = super_chunk.packed_index_buffer.as_ref() {
                 clear_chunk_slot(
                     &gpu.queue,
+                    &mut gpu.staged_indices,
                     index_buffer,
                     &mut super_chunk.packed_slots,
                     coord,
@@ -5462,6 +5501,7 @@ fn schedule_superchunk_update(
         } else if let Some(index_buffer) = super_chunk.raw_index_buffer.as_ref() {
             clear_chunk_slot(
                 &gpu.queue,
+                &mut gpu.staged_indices,
                 index_buffer,
                 &mut super_chunk.raw_slots,
                 coord,
@@ -5490,15 +5530,17 @@ fn schedule_superchunk_update(
 
 fn clear_chunk_slot(
     queue: &wgpu::Queue,
+    scratch_indices: &mut Vec<u32>,
     index_buffer: &wgpu::Buffer,
     slots: &mut HashMap<IVec3, ChunkSlot>,
     coord: IVec3,
     slot: &ChunkSlot,
 ) {
-    let zero_indices = vec![slot.vertex_offset; slot.index_capacity as usize];
+    scratch_indices.clear();
+    scratch_indices.resize(slot.index_capacity as usize, slot.vertex_offset);
     let i_start = slot.index_offset as wgpu::BufferAddress
         * std::mem::size_of::<u32>() as wgpu::BufferAddress;
-    queue.write_buffer(index_buffer, i_start, bytemuck::cast_slice(&zero_indices));
+    queue.write_buffer(index_buffer, i_start, bytemuck::cast_slice(scratch_indices));
     slots.remove(&coord);
 }
 

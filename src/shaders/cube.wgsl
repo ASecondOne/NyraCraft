@@ -352,11 +352,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             if (tex_a < 0.02) {
                 discard;
             }
-            let tinted_rgb = tex_rgb * vertex_tint;
-            // Glass tint mode: keep texture detail but push variant color strongly.
-            let tint_mix = 0.68;
-            color = vec4<f32>(mix(tex_rgb, tinted_rgb, tint_mix), tex_a * color.a);
-            albedo_rgb = mix(tex_rgb, tinted_rgb, 0.72);
+            // Split brightness from hue so colored glass variants stay visibly tinted
+            // without crushing the light/shadow that is already baked into vertex_tint.
+            let tint_strength = max(max(vertex_tint.r, vertex_tint.g), max(vertex_tint.b, 0.0001));
+            let glass_variant = clamp(vertex_tint / tint_strength, vec3<f32>(0.0), vec3<f32>(1.0));
+            let shaded_rgb = tex_rgb * tint_strength;
+            let tinted_rgb = shaded_rgb * mix(vec3<f32>(1.0), glass_variant, 0.94);
+            color = vec4<f32>(mix(shaded_rgb, tinted_rgb, 0.90), tex_a * color.a);
+            albedo_rgb = mix(tex_rgb, tex_rgb * glass_variant, 0.88);
         } else {
             color = vec4<f32>(tex_rgb, tex_a) * color;
             albedo_rgb = tex_rgb;
